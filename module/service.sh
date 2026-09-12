@@ -125,6 +125,9 @@ RCV="$PKG/.WakeReceiver"
 APK="$MODDIR/bin/PenBridge.apk"
 A_WAKE=dev.tb378fc.stylus.WAKE
 A_ATTACH=dev.tb378fc.stylus.ATTACH
+# ⑤ 原生胶囊广播（发给 SecurityCoreAdd）
+A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
+SOC_RCV=com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
 
 # ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
 TELEPHONY_PKGS="com.qti.phone com.qualcomm.qcrilmsgtunnel com.qualcomm.qti.telephonyservice"
@@ -134,6 +137,14 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 # 可选配置项；未知键自然被忽略
 REFRESH_SECONDS=0
 CAPSULE=1
+# 吸附检测的轮询间隔（毫秒）。检测靠轮询 sysfs，间隔越小弹得越快：
+#   200 = 默认，最坏 0.2s 发现吸附；500/1000 更省电但更迟钝
+POLL_MS=200
+# 1 = 守护自己直接发原生 STYLUS_STATE_SOC（省掉 App 一跳，最快）
+# 0 = 只发 ATTACH 给 PenBridge，由 App 组装（多一跳）
+CAPSULE_DIRECT=1
+# 1 = 直发之后，再让 PenBridge 走 GATT 读一次真电量，不同则补一条校正
+CAPSULE_GATT=1
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -147,6 +158,24 @@ capsule_enabled() {
     case "$CAPSULE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
 }
 
+capsule_direct() {
+    case "$CAPSULE_DIRECT" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
+}
+
+capsule_gatt() {
+    case "$CAPSULE_GATT" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+# 轮询间隔：把 POLL_MS 变成 sleep 的参数 + tick 折算（tick 仍按秒，供 REFRESH/日志轮转用）
+case "$POLL_MS" in
+    50)  SLEEP=0.05; PER_SEC=20 ;;
+    100) SLEEP=0.1;  PER_SEC=10 ;;
+    200) SLEEP=0.2;  PER_SEC=5 ;;
+    250) SLEEP=0.25; PER_SEC=4 ;;
+    500) SLEEP=0.5;  PER_SEC=2 ;;
+    *)   SLEEP=1;    PER_SEC=1 ;;
+esac
+
 # 读一个 sysfs 整数，非法时回落到默认值
 read_int() {
     local v
@@ -155,8 +184,10 @@ read_int() {
 }
 
 read_att() {
-    local v
-    v=$(cat "$ATT" 2>/dev/null)
+    local v=""
+    # 用 shell 内建 read，不起 cat 进程 —— 200ms 轮一次也几乎不花钱
+    # （注意别写成 `read ... || v=""`：sysfs 若没有结尾换行，read 会返回非零但值是有效的）
+    read -r v < "$ATT" 2>/dev/null
     case "$v" in 0|1) echo "$v" ;; *) echo "$1" ;; esac
 }
 
@@ -208,19 +239,44 @@ prepare_stylus_settings() {
 # ⑤ 吸附边沿：把线圈读到的笔电量/充电状态交给 PenBridge，由它去发
 #    com.android.settings.stylus.STYLUS_STATE_SOC（参数语义见 docs/native-stylus-capsule.md）。
 #    battery 非法（非 0..100）时传 -1，让 App 自己走 GATT 读。
+# ⑤ 吸附：尽快把原生电量胶囊弹出来。链路越短越快：
+#   1. 读线圈电量（刚吸上可能还没握手，最多重试 4 次 × 0.2s ≈ 0.6s）
+#   2. CAPSULE_DIRECT=1（默认）：守护**自己**发原生 STYLUS_STATE_SOC —— 少一跳（不起 App 进程）
+#      否则只发 ATTACH 给 PenBridge，由 App 组装并弹
+#   3. CAPSULE_GATT=1：再叫 PenBridge 走 GATT 读真值，与已显示的值不同才补一条校正
 send_attach() {
-    local batt state chg
-    batt=$(read_int "$WLS_LEVEL" -1)
-    case "$batt" in ''|*[!0-9]*) batt=-1 ;; esac
-    if [ "$batt" -lt 0 ] || [ "$batt" -gt 100 ]; then batt=-1; fi
-    # 吸附边沿上笔就是在充电线圈上，state=4（图标带闪电）；coil_chg 只写进日志备查
-    state=4
+    local batt=-1 chg i=0
+    while [ "$i" -lt 4 ]; do
+        batt=$(read_int "$WLS_LEVEL" -1)
+        case "$batt" in ''|*[!0-9]*) batt=-1 ;; esac
+        if [ "$batt" -ge 0 ] && [ "$batt" -le 100 ]; then break; fi
+        batt=-1
+        i=$((i+1))
+        [ "$i" -lt 4 ] && sleep 0.2
+    done
     chg=$(read_int "$WLS_CHG" -1)
-    if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
-            --ei battery "$batt" --ei state "$state" >/dev/null 2>&1; then
-        log "attach-capsule sent (battery=$batt state=$state coil_chg=$chg)"
+    # 吸附边沿上笔就在充电线圈上 → state=4（图标带闪电）；coil_chg 只写日志备查
+    if capsule_direct; then
+        if am broadcast --user 0 -a "$A_SOC" -n "$SOC_RCV" \
+                --ei battery "$batt" --ei state 4 --ei connect 5 >/dev/null 2>&1; then
+            log "capsule direct sent (battery=$batt state=4 coil_chg=$chg)"
+        else
+            log "ERROR capsule direct failed"
+        fi
+        if capsule_gatt; then
+            # 首弹已经由守护发过了，这里把 coil 一起带上，App 只在 GATT 真值不同时才补一条
+            if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
+                    --ei battery -1 --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
+                log "attach forwarded for gatt check (coil=$batt)"
+            fi
+        fi
     else
-        log "ERROR attach-capsule failed"
+        if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
+                --ei battery "$batt" --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
+            log "attach-capsule sent (battery=$batt state=4 coil_chg=$chg)"
+        else
+            log "ERROR attach-capsule failed"
+        fi
     fi
 }
 
@@ -354,11 +410,12 @@ case "$1" in
     REFRESH=$(refresh_seconds)
     last_att=$(read_att 1)
     tick=0
+    sub=0
     if capsule_enabled; then
         prepare_stylus_settings
-        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=on"
+        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT"
     else
-        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=off"
+        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=off poll=${POLL_MS}ms"
     fi
 
     if [ "$last_att" = 0 ]; then
@@ -366,17 +423,19 @@ case "$1" in
     fi
 
     while [ ! -e "$DISABLE" ]; do
-        sleep 1
-        tick=$((tick+1))
+        sleep "$SLEEP"
+        sub=$((sub+1))
+        if [ $((sub % PER_SEC)) -eq 0 ]; then
+            tick=$((tick+1))
+        fi
         att=$(read_att "$last_att")
 
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
             send "$A_WAKE" "detach-wake"
             tick=0
         elif [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
-            # ⑤ 吸附：等线圈跟笔握上手（约 1~2 秒）再读 wls_tx/level，然后弹原生胶囊
+            # ⑤ 吸附：立刻读线圈电量并弹原生胶囊（不再有固定 sleep，检测间隔就是 POLL_MS）
             if capsule_enabled; then
-                sleep 2
                 send_attach
             fi
             tick=0

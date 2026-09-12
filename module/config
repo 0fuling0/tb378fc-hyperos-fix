@@ -11,8 +11,23 @@
 REFRESH_SECONDS=0
 
 # CAPSULE=1   吸附时弹 HyperOS 原生电量胶囊（默认开）。
-#             做法：读 /sys/class/power_supply/wls_tx/level 拿到线圈看到的笔电量，
-#             交给 PenBridge 发一条 com.android.settings.stylus.STYLUS_STATE_SOC
-#             给 com.miui.securitycore（参数语义见 docs/native-stylus-capsule.md）。
-#             想单独关掉胶囊（保留唤醒）也可以建一个 disable-capsule 标记文件。
+#             也可以建一个 disable-capsule 标记文件单独关掉（唤醒照常）。
+#             参数语义见 docs/native-stylus-capsule.md。
 CAPSULE=1
+
+# POLL_MS     吸附检测的轮询间隔（毫秒）。检测是轮询 /sys/class/power_supply/wls_tx/attached，
+#             这个值直接决定"吸上去多久才弹"：
+#               200 = 默认（最坏 0.2s 发现，实测总延迟 ~0.5s）
+#               500 / 1000 = 更省电、更迟钝
+#               100 / 50  = 更灵敏（轮询用 shell 内建 read，代价很小）
+POLL_MS=200
+
+# CAPSULE_DIRECT=1  守护**自己**直接发原生 STYLUS_STATE_SOC 广播（默认）。
+#                   少一跳：不用先叫醒 PenBridge 应用进程，实测能省 0.3~1s。
+#                   0 = 只发 ATTACH 给 PenBridge，由应用组装并弹（老路径）
+CAPSULE_DIRECT=1
+
+# CAPSULE_GATT=1    直发之后再让 PenBridge 用 GATT 读一次真电量（0x180F/0x2A19），
+#                   与已显示的数字**不同**才补弹一条校正。读到相同值不会重复弹。
+#                   想要"一次就完、不要第二次弹窗"可以设 0（那就只信任线圈电量）。
+CAPSULE_GATT=1

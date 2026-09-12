@@ -34,13 +34,16 @@ public final class WakeReceiver extends BroadcastReceiver {
         final String mac = intent == null ? null : intent.getStringExtra("mac");
 
         if (ACTION_ATTACH.equals(action)) {
+            // battery：要立刻弹的电量（守护直发模式下传 -1，表示"已经弹过了，别重复弹"）
+            // coil   ：守护已用线圈值弹过的那个数字，用来判断 GATT 真值要不要补一条
             final int battery = intent.getIntExtra("battery", -1);
+            final int coil = intent.getIntExtra("coil", battery);
             final int state = intent.getIntExtra("state", Capsule.STATE_CHARGING);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        attach(app, mac, battery, state);
+                        attach(app, mac, battery, coil, state);
                     } catch (Throwable t) {
                         Log.e(PenBle.TAG, "attach failed", t);
                     } finally {
@@ -72,11 +75,16 @@ public final class WakeReceiver extends BroadcastReceiver {
         }, "penwake-rx").start();
     }
 
-    /** 吸附：先用线圈电量立刻弹，再用 GATT 真值校正。 */
-    static void attach(Context app, String mac, int battery, int state) {
+    /**
+     * 吸附时的胶囊。
+     *
+     * @param battery 立刻要弹的数字；&lt;0 表示"守护已经直发弹过了，别重复弹"
+     * @param coil    守护已用它弹过的线圈电量；GATT 真值等于它就不补弹
+     */
+    static void attach(Context app, String mac, int battery, int coil, int state) {
         int st = (state == Capsule.STATE_CHARGING) ? Capsule.STATE_CHARGING : Capsule.STATE_IDLE;
         boolean shown = Capsule.show(app, battery, st);
-        Log.i(PenBle.TAG, "ATTACH coil battery=" + battery + " state=" + st
+        Log.i(PenBle.TAG, "ATTACH coil=" + coil + " battery=" + battery + " state=" + st
                 + " shown=" + shown);
 
         PenBle.Result r = null;
@@ -87,8 +95,8 @@ public final class WakeReceiver extends BroadcastReceiver {
         }
         if (r == null) return;
         Log.i(PenBle.TAG, "ATTACH gatt " + r);
-        if (r.battery >= 0 && r.battery != battery) {
-            Capsule.show(app, r.battery, st);
+        if (r.battery >= 0 && r.battery != coil && r.battery != battery) {
+            Capsule.show(app, r.battery, st);      // 真值不同，补一条校正
         }
     }
 }

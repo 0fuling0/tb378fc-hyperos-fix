@@ -88,17 +88,33 @@ adb shell su -c 'am broadcast --user 0 \
 # 或者直接把磁吸状态机的边沿走一遍：吸附笔即可（attached 0 -> 1）
 ```
 
-### 3.3 模块自动触发（正常使用）
+### 3.3 模块自动触发（正常使用，v3.1 的快路径）
 
 ```
 /sys/class/power_supply/wls_tx/attached  0 -> 1（吸附）
-  └─ service.sh --monitor：sleep 2 等线圈认出笔
-       └─ 读 wls_tx/level（线圈看到的笔电量）→ am broadcast … ATTACH --ei battery <level> --ei state 4
-            └─ PenBridge/WakeReceiver.attach()
-                 ├─ 立刻 Capsule.show(battery, 4)   → 发 STYLUS_STATE_SOC → 原生胶囊出现
-                 └─ 再 PenBle.readBattery()（GATT 0x180F/0x2A19）
-                       └─ 读到且与线圈值不同 → 再补一条（刷新数字 + 重置 2 秒定时器）
+  └─ service.sh --monitor：POLL_MS=200 轮询（shell 内建 read，几乎零成本）
+       └─ 立刻读 wls_tx/level（最多重试 4×0.2s 等线圈握手）
+            └─ 守护**直接**发原生广播（CAPSULE_DIRECT=1，省掉 App 一跳）：
+                 am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
+                   -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
+                   --ei battery <线圈值> --ei state 4 --ei connect 5
+                 → 原生胶囊立刻出现
+            └─ 再转发 dev.tb378fc.stylus.ATTACH（battery=-1, coil=<线圈值>）给 PenBridge
+                 └─ PenBle.readBattery()（GATT 0x180F/0x2A19）
+                      └─ 真值 != coil 才补一条校正（相同不重复弹）
 ```
+
+### 3.4 延迟都花在哪（为什么第一版要 ~3 秒）
+
+| 环节 | 第一版 | v3.1 |
+|---|---|---|
+| 检测吸附边沿 | 主循环 `sleep 1` 轮询 → 最坏 **1.0 s** | `POLL_MS=200` + 内建 `read` → 最坏 **0.2 s** |
+| 等线圈握手 | 固定 `sleep 2` → **2.0 s** | 读一次就发；读不到才重试 4×0.2 s |
+| 谁来发广播 | 先叫醒 PenBridge 应用（冷启动进程）再转发 → **0.3~1 s** | 守护直发（`CAPSULE_DIRECT=1`），**不起应用进程** |
+| `am` + AMS + SecurityCoreAdd 接收 | 0.2~0.5 s | 同左 |
+| **合计（典型）** | **≈3~4 s** | **≈0.4~0.8 s** |
+
+想再快/更省电可以调 `POLL_MS`（50/100 更灵敏，500/1000 更省电）。
 
 ---
 
@@ -117,9 +133,19 @@ adb shell su -c 'am broadcast --user 0 \
 
 | extra | 类型 | 取值 | 说明 |
 |---|---|---|---|
-| `battery` | int | `0..100` 或 `-1` | `-1` = 线圈值不可用，让 App 自己走 GATT 读 |
+| `battery` | int | `0..100` 或 `-1` | 要立刻弹的数字；`-1` = "别弹"（守护直发模式下已弹过，或线圈值不可用） |
+| `coil` | int | `0..100` 或 `-1` | 守护已用线圈值弹过的数字；GATT 真值等于它就不补弹（避免重复弹窗） |
 | `state` | int | `4` / `2` | 透传给 `STYLUS_STATE_SOC` |
 | `mac`（可选） | string | 笔的蓝牙地址 | 不传则 App 按已配对名含 `Tab Pen` 或 `/data/adb/penwake/mac` 找 |
+
+### 相关 config 开关
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `CAPSULE` | `1` | 吸附是否弹胶囊（也可用 `disable-capsule` 标记单独关） |
+| `POLL_MS` | `200` | 吸附检测轮询间隔；直接决定"吸上去多久才弹" |
+| `CAPSULE_DIRECT` | `1` | 守护直发原生广播（少一跳）；`0` = 只发 ATTACH 交给 App |
+| `CAPSULE_GATT` | `1` | 直发后再用 GATT 读真值，**不同**才补一条校正；`0` = 只信线圈值，不补弹 |
 
 ### 电量从哪来
 
@@ -143,11 +169,11 @@ adb shell su -c 'am broadcast --user 0 \
 
 | 文件 | 作用 |
 |---|---|
-| `module/service.sh` | `--monitor` 里检测 `attached` 0→1 边沿；`send_attach()` 读 `wls_tx/level` 发 `ATTACH` 广播；`prepare_stylus_settings()` 补两个引导标记 |
-| `app/PenBridge/src/…/WakeReceiver.java` | 新增 `ACTION_ATTACH`：先按线圈值弹一次，再用 GATT 真值校正 |
+| `module/service.sh` | `--monitor` 里按 `POLL_MS` 轮询 `attached` 的 0→1 边沿；`send_attach()` 读 `wls_tx/level` 后**直发** `STYLUS_STATE_SOC`（`CAPSULE_DIRECT=1`），再按需转发 `ATTACH` 做 GATT 校正；`prepare_stylus_settings()` 补两个引导标记 |
+| `app/PenBridge/src/…/WakeReceiver.java` | `ACTION_ATTACH`：`coil`/`battery` 两个 extra 决定"要不要立刻弹"，GATT 真值不同才补一条 |
 | `app/PenBridge/src/…/Capsule.java` | 组装并发送 `STYLUS_STATE_SOC`（`battery/state/connect=5`），带范围校验 |
-| `app/PenBridge/src/…/PenBle.java` | 新增 `readBattery()`：GATT 连笔 → 读 `0x180F/0x2A19` → 断开，返回 `-1` 表示读不到 |
-| `module/config` | `CAPSULE=1`（默认开）；也可建 `disable-capsule` 标记只关胶囊、保留唤醒 |
+| `app/PenBridge/src/…/PenBle.java` | `readBattery()`：GATT 连笔 → 读 `0x180F/0x2A19` → 断开，返回 `-1` 表示读不到 |
+| `module/config` | `CAPSULE` / `POLL_MS` / `CAPSULE_DIRECT` / `CAPSULE_GATT`；`disable-capsule` 标记只关胶囊、保留唤醒 |
 
 ---
 

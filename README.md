@@ -105,19 +105,18 @@ out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 
 
 ### ⑤ 胶囊：触发方法与参数（详版见 docs/native-stylus-capsule.md）
 
-触发链：
+触发链（v3.1 快路径，实测总延迟 ~0.5s）：
 
 ```
 wls_tx/attached 0->1（吸附）
-  └─ service.sh --monitor：sleep 2 等线圈认出笔，读 wls_tx/level
-       └─ am broadcast … dev.tb378fc.stylus.ATTACH --ei battery <level> --ei state 4
-            └─ PenBridge/WakeReceiver：先 Capsule.show() 立刻弹，再 GATT(0x180F/0x2A19) 读真值补一条
-                 └─ com.android.settings.stylus.STYLUS_STATE_SOC
-                      → com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
-                        → MiuiStylusBatteryManager → 浮窗 "StylusBattery"
+  └─ service.sh --monitor：POLL_MS=200 轮询（内建 read），立刻读 wls_tx/level
+       └─ 守护直发 am broadcast … STYLUS_STATE_SOC（battery=<线圈值> state=4 connect=5）
+            → com.miui.securitycore/…MiuiStylusReceiver → 原生胶囊立刻出现
+       └─ 再转发 ATTACH(battery=-1, coil=<线圈值>) 给 PenBridge
+            └─ GATT(0x180F/0x2A19) 读真值，不同才补一条校正
 ```
 
-发给 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：
+发往 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：
 
 | extra | 取值 | 说明 |
 |---|---|---|
@@ -127,6 +126,14 @@ wls_tx/attached 0->1（吸附）
 
 前置条件：`settings put secure stylus_first_connect 1`（否则只走"首次连接引导"不弹胶囊）——
 `service.sh` 的 `prepare_stylus_settings()` 会自动补写；`setting_stylus_version` 需非 0（本机为 1）。
+
+响应速度相关的 config（都在 `module/config`）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `POLL_MS` | `200` | 吸附检测轮询间隔，决定"吸上去多久才弹"（第一版 `sleep 1`+`sleep 2` ≈ 3s，现在 ~0.5s） |
+| `CAPSULE_DIRECT` | `1` | 守护直发原生广播，省掉"叫醒 App 进程"一跳 |
+| `CAPSULE_GATT` | `1` | 直发后再用 GATT 读真值，**不同**才补弹一条校正 |
 
 手动验证（绕过守护直接弹）：
 
