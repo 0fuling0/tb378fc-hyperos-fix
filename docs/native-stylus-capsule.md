@@ -123,6 +123,19 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 
 **从线圈侦测到笔 → 胶囊出现 ≈ 0.3 秒**（`am` 广播占大头）；**笔放上去 → 线圈侦测到**那 ~2 秒是硬件。
 
+### 为什么不用 inotify / sysfs_notify / uevent（实测否掉了）
+
+三种"零 CPU 事件"机制都在真机上试过（探针 `penpolld` / `penwatchd`，源码在 `/tmp` 的临时目录，未入库）：
+
+| 机制 | 结果 | 原因 |
+|---|---|---|
+| `inotify`（`inotifyd` 监听 `attached/level/charge_state` 的 c/e） | **0 事件** | kernfs/sysfs 在属性内容变化时不调用 `fsnotify_modify()`，inotify 看不到 |
+| `sysfs_notify` → `poll(POLLPRI)`（udev/ueventd 那套） | **0 事件**（属性文件和 `uevent` 属性都没有） | Lenovo Qi 驱动改这些属性时**不调用** `sysfs_notify()` / `power_supply_changed()` |
+| 内核 netlink uevent（`NETLINK_KOBJECT_UEVENT`，`UEventObserver` 那套） | **有事件，但是不规则心跳**：84 条里间隔 min 0.70s / avg 1.39s / **max 25.5s**，和笔有没有动无关 | 驱动自己周期性广播 `change@…/power_supply/wls_tx`；用作触发最坏要等 25 秒 |
+
+结论：**这个节点只能轮询**。200ms 轮询的成本可以忽略（每轮 = 1 个 `sleep` 进程 + 3 次 shell 内建 `read`），
+延迟上限 200ms（占那 2 秒硬件握手的 10%）。要更灵敏就把 `POLL_MS` 调到 `100`/`50`。
+
 ### 3.4 延迟都花在哪（实测分解）
 
 | 环节 | 第一版 | v3.1 | 能不能再省 |

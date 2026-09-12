@@ -147,7 +147,7 @@ CAPSULE_DIRECT=1
 CAPSULE_GATT=1
 # 1（默认）= 边沿一到就先用**上一次的线圈电量**弹一条（~0.2s 出胶囊），1~2 秒后拿新值刷新；
 # 0 = 不抢跑，等线圈报出新值再弹（慢 1~2 秒，但第一眼就是本次的电量）
-CAPSULE_FAST=1
+CAPSULE_FAST=0
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -422,6 +422,7 @@ case "$1" in
     sub=0
     now_sec=0
     refresh_at=0
+    refresh_deadline=0
     if capsule_enabled; then
         prepare_stylus_settings
         log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT fast=$CAPSULE_FAST"
@@ -444,40 +445,57 @@ case "$1" in
         lvl=$(read_level)
         if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
 
-        # 取下：发唤醒，并把胶囊调度清掉
+        # 取下：发唤醒，并把胶囊调度清掉。
+        # **必须同时清空 shown** —— 否则下一次吸附时"新电量 == 上次显示过的值"（比如笔一直是 100%），
+        # 刷新逻辑会以为"这条已经弹过了"而整次都不弹（实测：连吸 3 次只有第 1 次出胶囊）。
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
             send "$A_WAKE" "detach-wake"
             tick=0
             refresh_at=0
+            refresh_deadline=0
+            shown=""
         fi
 
         if capsule_enabled; then
-            # 边沿 A：线圈刚启动（level 1..100 -> 0）—— 实测比 attached 早约 2 秒。
-            # 此时真值还没有，先用缓存值弹一条，2 秒后拿新值刷新。
+            # 边沿 A：线圈刚启动（level 1..100 -> 0）—— 实测比 attached 早约 2 秒
             if [ "$last_att" = 0 ] && [ "$att" = 0 ] && [ "$last_lvl" -ge 1 ] && [ "$lvl" = 0 ] \
-                    && [ "$refresh_at" = 0 ]; then
+                    && [ "$refresh_deadline" = 0 ]; then
                 log "coil-start edge (cached=$last_good)"
                 if capsule_fast && [ "$last_good" -ge 1 ]; then
-                    sensor_capsule "$last_good"
+                    sensor_capsule "$last_good"      # 抢跑：先用上次的值弹一条
                 fi
-                refresh_at=$((now_sec + 2))
+                refresh_at=$now_sec                  # 真值一到就补/刷新
+                refresh_deadline=$((now_sec + 8))    # 最多等 8 秒
             fi
             # 边沿 B：attached 0 -> 1（硬件握手完成）
             if [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
-                if [ "$refresh_at" = 0 ]; then
+                if [ "$refresh_deadline" = 0 ]; then
                     if capsule_fast && [ "$last_good" -ge 1 ]; then
                         sensor_capsule "$last_good"
                     fi
-                    refresh_at=$((now_sec + 2))
+                    refresh_at=$now_sec
+                    refresh_deadline=$((now_sec + 8))
                 fi
                 tick=0
             fi
-            # 刷新：等线圈报出新值，与已显示的不同才补一条
-            if [ "$refresh_at" -gt 0 ] && [ "$now_sec" -ge "$refresh_at" ] && [ "$att" = 1 ]; then
-                if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ] && [ "$lvl" != "$shown" ]; then
-                    sensor_capsule "$lvl"
+            # 等线圈报出本次真值：每轮（POLL_MS）重试，拿到就发；超时放弃
+            if [ "$refresh_deadline" -gt 0 ] && [ "$att" = 1 ] && [ "$now_sec" -ge "$refresh_at" ]; then
+                if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then
+                    if [ "$lvl" != "$shown" ]; then
+                        sensor_capsule "$lvl"
+                    fi
+                    refresh_at=0
+                    refresh_deadline=0
+                elif [ "$now_sec" -ge "$refresh_deadline" ]; then
+                    log "capsule give up (level still '$lvl' after 8s)"
+                    refresh_at=0
+                    refresh_deadline=0
                 fi
+            fi
+            # 笔取下来了就别再等
+            if [ "$att" = 0 ] && [ "$refresh_deadline" -gt 0 ]; then
                 refresh_at=0
+                refresh_deadline=0
             fi
         fi
 
