@@ -66,6 +66,41 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     private static final String ACTION_AON = "config_supported_aon_devices";
     private static final String SYS_PKG = "android";
 
+    /** AON 服务的包名（覆盖层里 config_defaultAttentionService 的值就是它） */
+    private static final String AON_PKG = "com.xiaomi.aon";
+
+    /**
+     * 直接接管 system_server 里"注视服务配好了没"的最终判断：
+     *   PackageManagerServiceImpl.getSupportAonServicePackageName()  ← 上游开关不满足时返回 ""
+     *   PackageManagerService.getAttentionServicePackageName()       ← AOSP 侧读的就是它
+     * 哪个存在钩哪个：直接返回 com.xiaomi.aon（其余逻辑不影响）。
+     */
+    private void hookAonPackageName(String pkg) {
+        String[] classes = {
+                "com.android.server.pm.PackageManagerServiceImpl",
+                "com.android.server.pm.PackageManagerService",
+        };
+        String[] methods = {"getSupportAonServicePackageName", "getAttentionServicePackageName"};
+        for (String cn : classes) {
+            Class<?> c = XposedHelpers.findClassIfExists(cn, ClassLoader.getSystemClassLoader());
+            if (c == null) continue;
+            for (String mn : methods) {
+                try {
+                    XposedHelpers.findAndHookMethod(c, mn, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            Object r = p.getResult();
+                            if (r == null || String.valueOf(r).isEmpty()) {
+                                p.setResult(AON_PKG);
+                                Log.i(TAG, "AON pkg -> " + AON_PKG + " (" + p.method.getName() + ")");
+                            }
+                        }
+                    });
+                    Log.i(TAG, "hook " + cn + "." + mn + " ok");
+                } catch (Throwable ignored) { }
+            }
+        }
+    }
+
     private void hookCustFeature(String pkg) {
         try {
             Class<?> c = XposedHelpers.findClassIfExists("miui.os.HyperOSCustFeatureResolve",
@@ -92,8 +127,9 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         final String pkg = lpparam.packageName;
-        if (SYS_PKG.equals(pkg)) {          // system_server：注视感知的开关门
+        if (SYS_PKG.equals(pkg)) {          // system_server：注视感知的两道门
             hookCustFeature(pkg);
+            hookAonPackageName(pkg);
             return;
         }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
