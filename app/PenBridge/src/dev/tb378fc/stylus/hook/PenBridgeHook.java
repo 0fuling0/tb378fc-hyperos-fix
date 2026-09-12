@@ -60,9 +60,42 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     private static volatile boolean sReceiverReady = false;
     private static BroadcastReceiver sTailReceiver;
 
+    /** 注视感知（AON）：这个移植包没注册 HyperOSCustFeatureResolve 服务，
+     *  所有 getBoolean 都会抛异常→返回默认 false→PMS 的 config_supported_aon_devices 门永远过不去。
+     *  这里在 system_server（作用域 "android"）里把这个 key 短路成 true。 */
+    private static final String ACTION_AON = "config_supported_aon_devices";
+    private static final String SYS_PKG = "android";
+
+    private void hookCustFeature(String pkg) {
+        try {
+            Class<?> c = XposedHelpers.findClassIfExists("miui.os.HyperOSCustFeatureResolve",
+                    ClassLoader.getSystemClassLoader());
+            if (c == null) { Log.i(TAG, "HyperOSCustFeatureResolve 不存在"); return; }
+            XposedHelpers.findAndHookMethod(c, "getBoolean", String.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            try {
+                                Object k = p.args == null || p.args.length < 1 ? null : p.args[0];
+                                if (ACTION_AON.equals(k) && Boolean.FALSE.equals(p.getResult())) {
+                                    p.setResult(Boolean.TRUE);
+                                    Log.i(TAG, "cust " + ACTION_AON + " -> true (served locally)");
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            Log.i(TAG, "hook HyperOSCustFeatureResolve.getBoolean ok (" + pkg + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "hook cust feature failed", t);
+        }
+    }
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         final String pkg = lpparam.packageName;
+        if (SYS_PKG.equals(pkg)) {          // system_server：注视感知的开关门
+            hookCustFeature(pkg);
+            return;
+        }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
         hookToolType(lpparam);
