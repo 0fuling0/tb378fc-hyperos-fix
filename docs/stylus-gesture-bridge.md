@@ -277,3 +277,35 @@ awk '/^processes/{print $2}' /proc/stat        # 前后各读一次，差值 / �
 
 **不要用"逐个 `/proc/<pid>/cmdline` 去 tr+grep"判活**：300+ 进程时每次调用要 600+ 次 fork，
 两秒一轮就能把 pid 耗尽（实测 pid 从 30000 绕回到 663、load 12）—— 必须用一次 `ps` 全表 + `awk`。
+
+### 8.1 第四个坑：开机太早 → 监听挂不上，看护"活着但瞎"
+
+改完上面三条后，重启仍表现为"没反应"，但这次 `ps` 里看护明明在跑。看 `brush.log` 才发现：
+
+```
+06:53:16 watch: inotify_add_watch(/data/data/com.miui.notes/files) 失败: No such file or directory
+06:53:16 watch: inotify_add_watch(/data/data/com.miui.creation/files) 失败: No such file or directory
+```
+
+**KernelSU 的 `service.sh` 在 CE 存储解锁挂载之前就跑了**（这次开机 20 秒），
+`/data/data/<pkg>` 还不存在 → `inotify_add_watch` 全部失败，而老实现失败后**永不重试**：
+进程活着、poll 循环照跑，但一个事件都收不到。上层 `brush_watch_loop` 因为收不到 `FILE ...`
+自然也不发波形 —— 现象和"看护没启动"完全一样，所以前三次都猜错了方向。
+
+两层修复：
+
+1. `penring --watch`：失败的目录记在 `wds[i] = -1`，poll 的 1 秒超时分支里每 ~3 秒补挂一次
+   （日志出现 `watch: 补挂 <dir>`）；触控节点 `open` 失败也一起补开。
+2. `brushwatch_ensure`：等 `BRUSH_APPS` 里任一 `/data/data/<pkg>` 出现才启动看护（省掉一轮无效工作）。
+   实测现在开机能看到 5 个目录全部 `watch: 盯住 ...`。
+
+顺带清掉一个日志噪声：`penring` 的 `logf_` 既写 stderr 又写 `--log` 指定的文件，而看护进程的
+stderr 也重定向到同一个 `brush.log` → 每条日志重复两遍。现在管道里给 `penring --watch` 加了
+`2>/dev/null`。
+
+### 8.2 排障时最容易看错的地方
+
+- `penring.log` 是**旧版**的日志名，现在手势桥写的是 `$MODDIR/wake.log.ring`。
+- `action.sh`（KernelSU「操作」）里的 ① 是 **supervisor** 的 pid，不反映 brushwatch。
+- 判断看护是否"真活着"要看两处：`ps` 里有 `service.sh --brushwatch` + `penring --watch`，
+  并且 `brush.log` 里有 `watch: 盯住 /data/data/com.miui.creation/files`（挂上了监听才算活）。

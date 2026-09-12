@@ -506,7 +506,9 @@ brush_watch_loop() {
     # 每轮先对齐一次现状（App 可能已经在前台且选好了笔刷）
     brush_scan_apps
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
-        "$PENRING_BIN" --watch \
+        # 2>/dev/null：penring 的 logf_ 已经自己写 --log 指定的文件，而 stderr 也会被本进程
+        # （其 stderr 已经指向同一个 brush.log）接住 → 不屏蔽的话每条日志都出现两遍。
+        "$PENRING_BIN" --watch 2>/dev/null \
             --prefs /data/data/com.miui.notes/shared_prefs \
             --prefs /data/data/com.miui.creation/shared_prefs \
             --prefs /data/data/dev.tb378fc.stylus/files \
@@ -586,6 +588,12 @@ brushwatch_ensure() {
     [ -e "$DISABLE" ] && return 0
     [ -e "$DISABLE_BRUSH" ] && return 0
     case "$BRUSH" in 0|false|no|off) return 0 ;; esac
+    # 等 CE 存储解锁挂载：开机早期 /data/data/<pkg> 还不存在，此时起的看护挂不上 inotify，
+    # 进程活着却收不到任何事件（"mon 没活"的真身之一）。penring 现在会自己补挂，
+    # 但这里也等一等，省掉一轮无效工作 + 日志噪声。
+    _ce_ok=0
+    for _p in $BRUSH_APPS; do [ -d "/data/data/$_p" ] && _ce_ok=1; done
+    [ "$_ce_ok" = 1 ] || return 0
     brushwatch_alive && return 0
     # 陈旧锁（上次会话留下的 brush.lock/brush.pid）由 --brushwatch 自己清理
     setsid /system/bin/sh "$0" --brushwatch >>"$BRUSH_LOG" 2>&1 </dev/null &

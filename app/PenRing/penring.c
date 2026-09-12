@@ -393,6 +393,7 @@ static int watch_mode(int argc, char **argv, int start)
     char dirs[8][512];
     int wds[8];
     int npref = 0;
+    int retry_tick = 0;
     int ifd, i, tail_state = -1, touch_fd = -1;
     const char *match = "creation_shpref.xml";
     const char *match2 = "penstate";
@@ -412,6 +413,7 @@ static int watch_mode(int argc, char **argv, int start)
         return 2;
     }
 
+    for (i = 0; i < 8; i++) wds[i] = -1;
     setvbuf(stdout, NULL, _IOLBF, 0);
     ifd = inotify_init1(IN_NONBLOCK);
     if (ifd < 0) { fprintf(stderr, "inotify_init1: %s\n", strerror(errno)); return 1; }
@@ -434,7 +436,24 @@ static int watch_mode(int argc, char **argv, int start)
         if (ifd >= 0) { wi = n; pfd[n].fd = ifd; pfd[n].events = POLLIN; n++; }
         if (touch_fd >= 0) { ti = n; pfd[n].fd = touch_fd; pfd[n].events = POLLIN; n++; }
         if (n == 0) break;
-        if (poll(pfd, n, 1000) <= 0) continue;
+        if (poll(pfd, n, 1000) <= 0) {
+            /* 开机早期 /data/data/<pkg>（CE 存储）还没解锁挂载，add_watch 会失败；
+             * 老实现失败后永不重试 → 看护进程活着却收不到任何事件（"mon 没活"的真身之一）。
+             * 这里每 ~3 秒补挂一次失败的目录，触控节点开失败也一起补。 */
+            if (++retry_tick >= 3) {
+                retry_tick = 0;
+                for (i = 0; i < npref; i++) {
+                    if (wds[i] >= 0) continue;
+                    int wd = inotify_add_watch(ifd, dirs[i], IN_CLOSE_WRITE | IN_MOVED_TO);
+                    if (wd >= 0) { wds[i] = wd; logf_("watch: 补挂 %s", dirs[i]); }
+                }
+                if (g_touch_path[0] != '\0' && touch_fd < 0) {
+                    touch_fd = open(g_touch_path, O_RDONLY | O_NONBLOCK);
+                    if (touch_fd >= 0) logf_("watch: 补开触控节点 %s fd=%d", g_touch_path, touch_fd);
+                }
+            }
+            continue;
+        }
 
         if (wi >= 0 && (pfd[wi].revents & POLLIN)) {
             char buf[4096];
