@@ -67,6 +67,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
 
         hookToolType(lpparam);
         hookStylusState(lpparam);
+        hookPostureFacade(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
@@ -82,9 +83,12 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             int orig = (Integer) param.getResult();
-                            // 原始值不是"手写笔/橡皮"时打一次日志：用来判断框架到底报了什么工具类型
-                            // （2=STYLUS 4=ERASER 1=FINGER 0=UNKNOWN）
-                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 20) {
+                            // 前 10 次无条件记（判断 App 到底调不调 Java 层 getToolType），
+                            // 之后只在"不是 STYLUS"时记（2=STYLUS 4=ERASER 1=FINGER 0=UNKNOWN）
+                            if (sToolLogs < 10) {
+                                sToolLogs++;
+                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
+                            } else if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 30) {
                                 sToolLogs++;
                                 Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
                             }
@@ -157,6 +161,39 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
             }
         }
         Log.i(TAG, "hook fc.I11lii ok");
+    }
+
+    /**
+     * 1c) App 的"姿态门面"：`l1Ilili.I11IIil` 有三个方法（getDegree / setPreviewBrush /
+     *     Iiliill(MotionEvent)），姿态桥 p240lii1II.I11lii 就是通过它拿姿态/判断是否橡皮。
+     *     这里只**记录**：进来的 MotionEvent 工具类型 + 返回值，用来看 App 自己怎么算的。
+     */
+    private static int sFacadeLogs = 0;
+    private void hookPostureFacade(XC_LoadPackage.LoadPackageParam lp) {
+        final Class<?> cls = XposedHelpers.findClassIfExists("l1Ilili.I11IIil", lp.classLoader);
+        if (cls == null) { Log.i(TAG, "l1Ilili.I11IIil 不存在"); return; }
+        for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+            if (m.getParameterTypes().length != 1) continue;
+            if (!m.getParameterTypes()[0].getName().equals("android.view.MotionEvent")) continue;
+            try {
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            if (sFacadeLogs >= 20) return;
+                            sFacadeLogs++;
+                            MotionEvent ev = (MotionEvent) p.args[0];
+                            int tool = ev == null ? -1 : ev.getToolType(0);
+                            Log.i(TAG, "posture facade " + p.method.getName()
+                                    + " tool=" + tool + " action=" + (ev == null ? -1 : ev.getAction())
+                                    + " -> " + p.getResult() + " tail=" + sTailDown);
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                Log.i(TAG, "hook posture facade " + m.getName() + " ok");
+            } catch (Throwable t) {
+                Log.w(TAG, "hook posture facade failed", t);
+            }
+        }
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */
