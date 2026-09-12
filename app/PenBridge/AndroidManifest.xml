@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.tb378fc.stylus"
+    android:versionCode="10"
+    android:versionName="3.0">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="30" />
+
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+
+    <application
+        android:label="联想笔桥接"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:hasCode="true">
+
+        <receiver
+            android:name=".WakeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.tb378fc.stylus.WAKE" />
+            </intent-filter>
+        </receiver>
+
+
+        <activity
+            android:name=".WakeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+</manifest>

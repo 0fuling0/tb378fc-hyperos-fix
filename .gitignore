@@ -1,0 +1,14 @@
+# 构建中间产物
+out/
+app/PenBridge/build/
+app/PenBridge/PenBridge.apk
+extras/PenStylusHook/build/
+extras/PenStylusHook/PenStylusHook.apk
+payload-src/PowerKeeper-patched.apk
+payload-src/classes-patched*.dex
+payload-src/payload.apk
+**/__pycache__/
+*.pyc
+
+# 构建产物（设备上那份的等价物由 build.sh 重建）
+module/bin/PenBridge.apk

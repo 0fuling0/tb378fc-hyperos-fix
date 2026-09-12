@@ -1,0 +1,6 @@
+id=tb378fc_hyperos_fix
+name=TB378FC HyperOS 修复
+version=v3.0
+versionCode=30000
+author=ACLaniakea
+description=联想小新 Pad Pro GT 13 (TB378FC) 刷 HyperOS 移植包的四项修复：①手写笔休眠唤醒——按磁吸状态经 BLE 发 FE41 {05,05} 叫醒睡死的笔；②PowerKeeper 修复——修补移植包改坏的两处字节码，恢复 MIUI 省电管理；③停 BPF 监视器——避免开 DroidSpaces 容器后 hyper_bpfloader 写 recovery 引导块重启进 recovery；④停死电话栈——本机 ro.baseband=apq 无 modem，移植包自带的 persistent 电话组件每秒崩数百次白烧 zygote/system_server，停掉这三个包。
