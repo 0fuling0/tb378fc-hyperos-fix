@@ -33,6 +33,7 @@ public final class WakeReceiver extends BroadcastReceiver {
         final PendingResult pending = goAsync();
         final Context app = context.getApplicationContext();
         final String action = intent == null ? "" : String.valueOf(intent.getAction());
+        Log.i(PenBle.TAG, "rx " + action + " t=" + System.currentTimeMillis());
         final String mac = intent == null ? null : intent.getStringExtra("mac");
 
         if (ACTION_ATTACH.equals(action)) {

@@ -391,14 +391,18 @@ static void print_line(const char *fmt, ...)
 static int watch_mode(int argc, char **argv, int start)
 {
     char dirs[8][512];
+    int wds[8];
     int npref = 0;
     int ifd, i, tail_state = -1, touch_fd = -1;
+    const char *match = "creation_shpref.xml";
 
     for (i = start; i < argc; i++) {
         if (!strcmp(argv[i], "--prefs") && i + 1 < argc && npref < 8)
             snprintf(dirs[npref++], sizeof(dirs[0]), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--touch") && i + 1 < argc)
             snprintf(g_touch_path, sizeof(g_touch_path), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--match") && i + 1 < argc)
+            match = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc)
             g_log = argv[++i];
     }
@@ -411,10 +415,11 @@ static int watch_mode(int argc, char **argv, int start)
     ifd = inotify_init1(IN_NONBLOCK);
     if (ifd < 0) { fprintf(stderr, "inotify_init1: %s\n", strerror(errno)); return 1; }
     for (i = 0; i < npref; i++) {
-        int wd = inotify_add_watch(ifd, dirs[i],
-                                   IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
+        /* 只要"真正写完了"的那一下：CLOSE_WRITE（直接写）/ MOVED_TO（临时文件改名）。
+         * CREATE/DELETE 会带来 .bak / 临时文件的事件风暴，直接不订阅。 */
+        int wd = inotify_add_watch(ifd, dirs[i], IN_CLOSE_WRITE | IN_MOVED_TO);
         if (wd < 0) logf_("watch: inotify_add_watch(%s) 失败: %s", dirs[i], strerror(errno));
-        else logf_("watch: 盯住 %s", dirs[i]);
+        else { wds[i] = wd; logf_("watch: 盯住 %s", dirs[i]); }
     }
     if (g_touch_path[0] != '\0') {
         touch_fd = open(g_touch_path, O_RDONLY | O_NONBLOCK);
@@ -436,8 +441,13 @@ static int watch_mode(int argc, char **argv, int start)
             ssize_t off = 0;
             while (got > 0 && off + (ssize_t)sizeof(struct inotify_event) <= got) {
                 struct inotify_event *ev = (struct inotify_event *)(buf + off);
-                if (ev->len > 0 && ev->name[0] != '.')
-                    print_line("FILE %s", ev->name);
+                if (ev->len > 0 && ev->name[0] != '.' && !strcmp(ev->name, match)) {
+                    const char *d = "?";
+                    int k;
+                    for (k = 0; k < npref; k++)
+                        if (wds[k] == ev->wd) d = dirs[k];
+                    print_line("FILE %s %s", d, ev->name);
+                }
                 off += sizeof(struct inotify_event) + ev->len;
             }
         }

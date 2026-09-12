@@ -277,7 +277,8 @@ sync_pen_settings() {
 #     （getevent 走管道会全缓冲，慢半拍，所以用 penring --watch 自己读）
 # 波形基准（base）记在 brush.base：切笔刷时更新它；笔尾进范围发橡皮波形，
 # 笔尾离开就恢复 base。
-brush_log() { echo "$(date '+%F %T') $*" >> "$BRUSH_LOG"; }
+# 日志带毫秒（date +%s%3N 是可用的），方便量"谁慢"：inotify 收到的时间 vs prefs 的 mtime
+brush_log() { echo "$(date '+%F %T.%3N' | cut -c1-23) $*" >> "$BRUSH_LOG"; }
 
 # 当前前台包（本 ROM 打的是 topResumedActivity）
 pen_fg() {
@@ -304,11 +305,10 @@ brush_wave_of() {
 
 # 读工具状态串：current_brush / select_state_save / ai_type / current_ai_brush
 brush_tool_sig() {
-    local f="$1" k out=""
-    for k in $BRUSH_STATE_KEYS; do
-        out="$out$k=$(sed -n "s/.*name=\"$k\" value=\"\([^\"]*\)\".*/\1/p" "$f" 2>/dev/null | head -1) "
-    done
-    echo "$out"
+    local f="$1"
+    # 一次 grep 读完所有键（原来是每个键一个 sed，事件多的时候会排队）
+    grep -oE 'name="(current_brush|select_state_save|ai_type|current_ai_brush)" value="[^"]*"' "$f" 2>/dev/null \
+        | sed 's/name="//; s/" value="/=/; s/"$//' | tr '\n' ' '
 }
 
 brush_tool_val() {
@@ -389,6 +389,19 @@ brush_exit_check() {
     fi
 }
 
+# 只扫一个 App
+brush_scan_one() {
+    local pkg="$1" f sig lastf last
+    f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
+    [ -r "$f" ] || return 0
+    sig=$(brush_tool_sig "$f")
+    lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
+    last=$(cat "$lastf" 2>/dev/null)
+    [ "$sig" = "$last" ] && return 0
+    echo "$sig" > "$lastf"
+    brush_on_tool_change "$pkg" "$sig"
+}
+
 # 扫描一遍两个 App 的工具状态，变了就处理
 brush_scan_apps() {
     local pkg f sig lastf last
@@ -417,7 +430,14 @@ brush_watch_loop() {
             if IFS= read -r -t 2 line; then
                 case "$line" in
                     FILE*)
-                        brush_scan_apps ;;
+                        # FILE <dir> <name>：只读事件所属的那个 App
+                        set -- $line
+                        case "$2" in
+                            */com.miui.notes/*)    pkg=com.miui.notes ;;
+                            */com.miui.creation/*) pkg=com.miui.creation ;;
+                            *) pkg="" ;;
+                        esac
+                        [ -n "$pkg" ] && brush_scan_one "$pkg" ;;
                     "TAIL down")
                         echo 1 > "$BRUSH_TAIL"
                         if [ -n "$(brush_base)" ]; then
@@ -510,9 +530,11 @@ send() {
 
 # 带 extra 的广播（例如 --ei touchfilm 63）
 send_extra() {
-    local action="$1" what="$2"; shift 2
+    local action="$1" what="$2" t0 t1; shift 2
+    t0=$(date +%s%3N)
     if am broadcast --user 0 -n "$RCV" -a "$action" "$@" >/dev/null 2>&1; then
-        log "$what sent ($*)"
+        t1=$(date +%s%3N)
+        log "$what sent ($*) dispatch=$((t1-t0))ms"
     else
         log "ERROR $what failed ($*)"
     fi

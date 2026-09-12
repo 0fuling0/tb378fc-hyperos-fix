@@ -89,6 +89,8 @@ public final class PenBle {
      * 每次振动都重新 connect+discover 要 0.3~1s，振感就迟了；所以第一次连上之后
      * 把连接与两个特征缓存住，后面的手势直接写（~20ms），空闲 12 秒才断开。 */
     private static final long HAPTIC_IDLE_MS = 12000;
+    /** 停止帧之后多久断开（波形在响的时候连接一直留着，避免每次切换都重连 0.3~1s） */
+    private static final long HAPTIC_IDLE_AFTER_STOP_MS = 800;
     private static BluetoothGatt sHGatt;
     private static BluetoothGattCharacteristic sHCon;
     private static BluetoothGattCharacteristic sHImp;
@@ -172,7 +174,10 @@ public final class PenBle {
             if (hapticWriteFrame(log, sHGatt, type, wave, level, friction)) {
                 res.hapticSent = true;
                 res.detail = "cached " + log;
-                sHIdleAt = now + HAPTIC_IDLE_MS;
+                /* 波形还在响（wave != 0）就一直留着连接，只有停了才准备断 */
+                sHIdleAt = (type == 1 && wave != 0)
+                        ? Long.MAX_VALUE / 2
+                        : now + HAPTIC_IDLE_AFTER_STOP_MS;
                 scheduleHapticStop(type, ms);
                 scheduleIdleClose();
                 return res;
@@ -199,7 +204,7 @@ public final class PenBle {
                     try { sHGatt.disconnect(); } catch (Throwable ignored) { }
                 }
             }
-        }, HAPTIC_IDLE_MS + 500);
+        }, Math.max(HAPTIC_IDLE_MS, HAPTIC_IDLE_AFTER_STOP_MS) + 500);
     }
 
     private static void scheduleHapticStop(int type, int ms) {
@@ -318,7 +323,9 @@ public final class PenBle {
                                 sHCon = hs.getCharacteristic(CH_HAPTIC_CON);
                                 sHImp = hs.getCharacteristic(CH_HAPTIC_IMP);
                             }
-                            sHIdleAt = SystemClock.uptimeMillis() + HAPTIC_IDLE_MS;
+                            sHIdleAt = (haptic.type == 1 && haptic.wave != 0)
+                                    ? Long.MAX_VALUE / 2
+                                    : SystemClock.uptimeMillis() + HAPTIC_IDLE_AFTER_STOP_MS;
                             scheduleHapticStop(haptic.type, haptic.ms);
                             scheduleIdleClose();
                             done.countDown();
