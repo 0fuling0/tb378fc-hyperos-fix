@@ -53,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -109,6 +110,7 @@ static struct cfg g_cfg = {194, 195, 196, 197, 92};
 static const char *g_moddir = DEF_MODDIR;
 static const char *g_log = NULL;
 static const char *g_dev = NULL;   /* --dev：强制读某个 event 节点（自检/排障用） */
+static char g_touch_path[256];     /* --watch --touch 的触控节点 */
 static int g_ui = -1;
 static volatile sig_atomic_t g_stop = 0;
 static long g_tail_down_ms = 0;   /* 笔尾按下的时刻，用来过滤误触 */
@@ -365,12 +367,106 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
+/* ------------------------------------------------------------ --watch 模式 */
+/*
+ * penring --watch [--prefs DIR]... [--touch NODE]
+ *
+ * 给根侧 shell 用的**逐行、不缓冲**事件流：
+ *     FILE <name>      prefs 被写（inotify：CLOSE_WRITE / MOVED_TO / CREATE）
+ *     TAIL down|up     笔尾（橡皮端）进/出感应范围（BTN_TOOL_RUBBER）
+ *
+ * 为什么不用 getevent：它是 stdio 全缓冲，输出接管道时会攒到 4KB 才吐，
+ * 切换手感就慢半拍；inotify 是内核直接通知，毫秒级。
+ */
+static void print_line(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static int watch_mode(int argc, char **argv, int start)
+{
+    char dirs[8][512];
+    int npref = 0;
+    int ifd, i, tail_state = -1, touch_fd = -1;
+
+    for (i = start; i < argc; i++) {
+        if (!strcmp(argv[i], "--prefs") && i + 1 < argc && npref < 8)
+            snprintf(dirs[npref++], sizeof(dirs[0]), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--touch") && i + 1 < argc)
+            snprintf(g_touch_path, sizeof(g_touch_path), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--log") && i + 1 < argc)
+            g_log = argv[++i];
+    }
+    if (npref == 0 && g_touch_path[0] == '\0') {
+        fprintf(stderr, "watch: 需要 --prefs 或 --touch\n");
+        return 2;
+    }
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    ifd = inotify_init1(IN_NONBLOCK);
+    if (ifd < 0) { fprintf(stderr, "inotify_init1: %s\n", strerror(errno)); return 1; }
+    for (i = 0; i < npref; i++) {
+        int wd = inotify_add_watch(ifd, dirs[i],
+                                   IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
+        if (wd < 0) logf_("watch: inotify_add_watch(%s) 失败: %s", dirs[i], strerror(errno));
+        else logf_("watch: 盯住 %s", dirs[i]);
+    }
+    if (g_touch_path[0] != '\0') {
+        touch_fd = open(g_touch_path, O_RDONLY | O_NONBLOCK);
+        logf_("watch: 触控节点 %s fd=%d", g_touch_path, touch_fd);
+    }
+
+    while (!g_stop) {
+        struct pollfd pfd[2];
+        int n = 0, wi = -1, ti = -1;
+
+        if (ifd >= 0) { wi = n; pfd[n].fd = ifd; pfd[n].events = POLLIN; n++; }
+        if (touch_fd >= 0) { ti = n; pfd[n].fd = touch_fd; pfd[n].events = POLLIN; n++; }
+        if (n == 0) break;
+        if (poll(pfd, n, 1000) <= 0) continue;
+
+        if (wi >= 0 && (pfd[wi].revents & POLLIN)) {
+            char buf[4096];
+            ssize_t got = read(ifd, buf, sizeof(buf));
+            ssize_t off = 0;
+            while (got > 0 && off + (ssize_t)sizeof(struct inotify_event) <= got) {
+                struct inotify_event *ev = (struct inotify_event *)(buf + off);
+                if (ev->len > 0 && ev->name[0] != '.')
+                    print_line("FILE %s", ev->name);
+                off += sizeof(struct inotify_event) + ev->len;
+            }
+        }
+
+        if (ti >= 0 && (pfd[ti].revents & (POLLIN | POLLERR | POLLHUP))) {
+            struct input_event ev;
+            while (read(touch_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+                int now;
+                if (ev.type != EV_KEY || ev.code != BTN_TOOL_RUBBER) continue;
+                now = ev.value ? 1 : 0;
+                if (now != tail_state) {
+                    tail_state = now;
+                    print_line("TAIL %s", now ? "down" : "up");
+                }
+            }
+        }
+    }
+
+    if (ifd >= 0) close(ifd);
+    return 0;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--moddir DIR] [--config FILE] [--log FILE] [--dev /dev/input/eventN] [--once]\n"
+            "       %s --watch [--prefs DIR]... [--touch NODE]\n"
             "  把联想 Tab Pen Pro 2 的捏/双击/上滑/下滑/笔尾桥成小米焦点触控笔的键。\n",
-            argv0);
+            argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -380,6 +476,9 @@ int main(int argc, char **argv)
     const char *cfg_override = NULL;
     int once = 0;
     int i;
+
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--watch")) return watch_mode(argc, argv, i + 1);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--moddir") && i + 1 < argc)       g_moddir = argv[++i];

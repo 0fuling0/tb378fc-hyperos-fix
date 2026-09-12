@@ -119,7 +119,9 @@ DISABLE_GESTURE="$MODDIR/disable-gesture"
 DISABLE_ROMPEN="$MODDIR/disable-rompen"
 DISABLE_BRUSH="$MODDIR/disable-brush"
 PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在这个节点上）
-BRUSH_STATE="$MODDIR/brush.state"       # "<波形id> <包名>"，两个子循环共享
+BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
+BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
+BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
@@ -267,10 +269,14 @@ sync_pen_settings() {
 # ---------------------------------------------------------------- ⑦ 笔刷触感
 # 联想笔的 CON（连续振动）波形 id：
 #   32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 同上的"无音效"版
-# 笔记/小米创作把当前笔刷写在 /data/data/<pkg>/shared_prefs/creation_shpref.xml 的
-#   <int name="current_brush" value="N" />，每个笔刷条目里还有 penType
-#   （BALL 圆珠笔 / PENCIL 铅笔 / MARK 马克笔 / INK 墨水笔 / WATER_COLOR 水彩）
-# 所以 root 直接读文件就知道用户切到哪支笔，切一次发一次 CON 帧，笔会自己持续振。
+#
+# 事件来源全部是"内核级、毫秒级"的，不用轮询：
+#   * 笔记/小米创作把当前工具写在 /data/data/<pkg>/shared_prefs/creation_shpref.xml
+#     （current_brush / select_state_save / ai_type / current_ai_brush）→ inotify 盯目录
+#   * 笔尾（橡皮端）进/出感应范围 → 直接读 /dev/input/event5 的 BTN_TOOL_RUBBER
+#     （getevent 走管道会全缓冲，慢半拍，所以用 penring --watch 自己读）
+# 波形基准（base）记在 brush.base：切笔刷时更新它；笔尾进范围发橡皮波形，
+# 笔尾离开就恢复 base。
 brush_log() { echo "$(date '+%F %T') $*" >> "$BRUSH_LOG"; }
 
 # 当前前台包（本 ROM 打的是 topResumedActivity）
@@ -286,8 +292,8 @@ brush_is_fg() {
 }
 
 brush_wave_of() {
-    # $1 = current_brush 值；查 BRUSH_MAP（形如 "0:32,1:33,2:34"）
     local v="$1" pair
+    [ -n "$v" ] || return 0
     for pair in $(echo "$BRUSH_MAP" | tr ',' ' '); do
         case "$pair" in
             "$v":*) echo "${pair#*:}"; return 0 ;;
@@ -296,50 +302,7 @@ brush_wave_of() {
     echo ""
 }
 
-brush_state_get() { cat "$BRUSH_STATE" 2>/dev/null; }
-
-brush_send() {
-    # $1 = 波形 id（0 = 停） $2 = 原因
-    local wave="$1" why="$2" cur
-    [ -n "$wave" ] || return 0
-    cur=$(brush_state_get)
-    set -- $cur
-    if [ "$wave" = "0" ]; then
-        [ -z "$cur" ] && return 0
-        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0             --ei friction "$BRUSH_FRICTION" --ei ms 80
-        : > "$BRUSH_STATE"
-        brush_log "stop ($why)"
-        return 0
-    fi
-    if [ -n "$cur" ] && [ "$1" = "$2" ]; then
-        return 0                      # 已经就是这个波形，不用重发
-    fi
-    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave"         --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
-    echo "$wave ${3:-}" > "$BRUSH_STATE"
-    brush_log "wave=$wave ($why)"
-}
-
-# 每个笔刷条目的短指纹（用来判断"这次切换到底切到了哪支笔"——切换时 App 会回写旧笔刷状态）
-brush_snapshot() {
-    local f="$1" k out=""
-    for k in brush_ballpoint brush_pencil brush_markpen brush_ink brush_watercolor current_ai_brush eraser_delete; do
-        out="$out$k=$(grep -o "name=\"$k\">[^<]*" "$f" 2>/dev/null | head -c 200 | md5sum | cut -c1-6) "
-    done
-    echo "$out"
-}
-
-# $1 旧指纹 $2 新指纹 -> 变化的键（通常正好是刚离开的那支笔刷）
-brush_diff() {
-    local k o n out=""
-    for k in brush_ballpoint brush_pencil brush_markpen brush_ink brush_watercolor current_ai_brush eraser_delete; do
-        o=$(echo "$1" | tr ' ' '\n' | grep "^$k=" )
-        n=$(echo "$2" | tr ' ' '\n' | grep "^$k=" )
-        [ "$o" = "$n" ] || out="$out${k#brush_} "
-    done
-    echo "$out"
-}
-
-# 读工具状态：current_brush / select_state_save / ai_type / current_ai_brush
+# 读工具状态串：current_brush / select_state_save / ai_type / current_ai_brush
 brush_tool_sig() {
     local f="$1" k out=""
     for k in $BRUSH_STATE_KEYS; do
@@ -352,108 +315,126 @@ brush_tool_val() {
     echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
 }
 
-# 判断该发哪个波形：橡皮状态 > current_brush > select_state_save
+# 该发哪个波形：橡皮状态 > current_brush > select_state_save
 brush_decide_wave() {
-    local sig="$1" cur sel st
+    local sig="$1" cur sel w
     cur=$(brush_tool_val "$sig" current_brush)
     sel=$(brush_tool_val "$sig" select_state_save)
-    for st in $BRUSH_ERASER_STATES; do
-        [ "$sel" = "$st" ] && { echo "$BRUSH_ERASER"; return 0; }
+    for w in $BRUSH_ERASER_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
+        [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
     done
-    if [ -n "$cur" ]; then
-        st=$(brush_wave_of "$cur")
-        [ -n "$st" ] && { echo "$st"; return 0; }
-    fi
-    for st in $BRUSH_ERASER_STATES; do
-        [ "$cur" = "$st" ] && { echo "$BRUSH_ERASER"; return 0; }
-    done
-    if [ -n "$sel" ]; then
-        st=$(brush_wave_of "$sel")
-        [ -n "$st" ] && { echo "$st"; return 0; }
-    fi
+    w=$(brush_wave_of "$cur")
+    [ -n "$w" ] && { echo "$w"; return 0; }
+    w=$(brush_wave_of "$sel")
+    [ -n "$w" ] && { echo "$w"; return 0; }
     echo ""
 }
 
-brush_poll_loop() {
-    local pkg f v wave sent="" fg miss=0 sig="" last_sig lastflast
+brush_now()  { cat "$BRUSH_STATE" 2>/dev/null; }
+brush_base() { cat "$BRUSH_BASE" 2>/dev/null; }
+brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
+
+brush_send() {
+    # $1 = 波形 id（0 = 停）；$2 = 原因；$3 = 非空表示"这是笔刷基准值"
+    local wave="$1" why="$2" setbase="$3" now
+    [ -n "$wave" ] || return 0
+    now=$(brush_now)
+    if [ "$wave" = "0" ]; then
+        [ -z "$now" ] && return 0
+        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0 \
+            --ei friction "$BRUSH_FRICTION" --ei ms 80
+        : > "$BRUSH_STATE"
+        brush_log "stop ($why)"
+        return 0
+    fi
+    [ -n "$setbase" ] && echo "$wave" > "$BRUSH_BASE"
+    [ "$wave" = "$now" ] && return 0
+    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave" \
+        --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
+    echo "$wave" > "$BRUSH_STATE"
+    brush_log "wave=$wave ($why)"
+}
+
+# 应用里的工具换了：更新基准；不在橡皮态就立刻切过去
+brush_on_tool_change() {
+    local pkg="$1" sig="$2" wave
+    wave=$(brush_decide_wave "$sig")
+    brush_log "$pkg 工具 [$sig] -> ${wave:-未映射}"
+    [ -n "$wave" ] || return 0
+    echo "$wave" > "$BRUSH_BASE"
+    if brush_tail_in; then
+        brush_log "（笔尾在感应范围内，先不切）"
+    else
+        brush_send "$wave" "$pkg 工具切换" base
+    fi
+}
+
+# 应用退到后台/退出：停波形（只在有波形时查前台，避免白烧 dumpsys）
+BRUSH_MISS=0
+brush_exit_check() {
+    local fg
+    [ -n "$(brush_now)" ] || return 0
+    case "$BRUSH_EXIT_CHECK" in 0|false|no|off) return 0 ;; esac
+    fg=$(pen_fg)
+    if brush_is_fg "$fg"; then
+        BRUSH_MISS=0
+        return 0
+    fi
+    BRUSH_MISS=$((BRUSH_MISS+1))
+    if [ "$BRUSH_MISS" -ge 2 ]; then
+        brush_send 0 "app left (${fg:-?})"
+        BRUSH_MISS=0
+        : > "$BRUSH_BASE"
+    fi
+}
+
+# 扫描一遍两个 App 的工具状态，变了就处理
+brush_scan_apps() {
+    local pkg f sig lastf last
+    for pkg in $BRUSH_APPS; do
+        f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
+        [ -r "$f" ] || continue
+        sig=$(brush_tool_sig "$f")
+        lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
+        last=$(cat "$lastf" 2>/dev/null)
+        [ "$sig" = "$last" ] && continue
+        echo "$sig" > "$lastf"
+        brush_on_tool_change "$pkg" "$sig"
+    done
+}
+
+brush_watch_loop() {
+    local line pkg
+    # 每轮先对齐一次现状（App 可能已经在前台且选好了笔刷）
+    brush_scan_apps
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
-        for pkg in $BRUSH_APPS; do
-            f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
-            [ -r "$f" ] || continue
-            sig=$(brush_tool_sig "$f")
-            lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
-            last_sig=$(cat "$lastf" 2>/dev/null)
-            if [ "$sig" != "$last_sig" ]; then
-                wave=$(brush_decide_wave "$sig")
-                echo "$sig" > "$lastf"
-                fg=$(pen_fg)
-                if ! brush_is_fg "$fg"; then
-                    brush_log "$pkg 工具状态变了 [$sig] -> wave=${wave:-未映射} 但前台是 ${fg:-?}，先不发"
-                    continue
-                fi
-                brush_log "$pkg 工具状态 [$sig] -> wave=${wave:-未映射} fg=$fg"
-                if [ -n "$wave" ] && [ "$sent" != "$wave" ]; then
-                    sent="$wave"
-                    brush_send "$wave" "$pkg $sig"
-                fi
+        "$PENRING_BIN" --watch \
+            --prefs /data/data/com.miui.notes/shared_prefs \
+            --prefs /data/data/com.miui.creation/shared_prefs \
+            --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
+        | while :; do
+            if IFS= read -r -t 2 line; then
+                case "$line" in
+                    FILE*)
+                        brush_scan_apps ;;
+                    "TAIL down")
+                        echo 1 > "$BRUSH_TAIL"
+                        if [ -n "$(brush_base)" ]; then
+                            brush_send "$BRUSH_ERASER" "tail(eraser) in range"
+                        fi ;;
+                    "TAIL up")
+                        echo 0 > "$BRUSH_TAIL"
+                        if [ -n "$(brush_base)" ]; then
+                            brush_send "$(brush_base)" "tip back"
+                        fi ;;
+                esac
+            else
+                brush_exit_check
             fi
         done
-
-        # 退出应用就停：只有在有波形时才查前台（每 3 秒最多一次 dumpsys）
-        if [ -n "$(brush_state_get)" ]; then
-            if [ "$BRUSH_EXIT_CHECK" != "0" ]; then
-                fg=$(pen_fg)
-                if brush_is_fg "$fg"; then
-                    miss=0
-                else
-                    miss=$((miss+1))
-                fi
-                if [ "$miss" -ge 2 ]; then
-                    brush_send 0 "app left ($fg)"
-                    miss=0
-                    sent=""
-                    rm -f "$MODDIR"/brush.last.* 2>/dev/null
-                fi
-            fi
-        fi
-        sleep 0.5
+        sleep 1
     done
-}
-
-brush_node_loop() {
-    # BTN_TOOL_RUBBER 只有"橡皮端"在感应范围内才按下 → 笔尾靠近/离开的边沿
-    [ -e "$PEN_TOUCH_NODE" ] || { sleep 5; return 0; }
-    getevent -lt "$PEN_TOUCH_NODE" 2>/dev/null | while read -r line; do
-        [ -e "$DISABLE_BRUSH" ] && break
-        case "$line" in
-            *BTN_TOOL_RUBBER*DOWN*)
-                brush_send "$BRUSH_ERASER" "tail(eraser) in range" ;;
-            *BTN_TOOL_RUBBER*UP*)
-                state=$(brush_state_get)
-                case "$state" in
-                    "$BRUSH_ERASER "*) ;;                     # 本来就在橡皮态
-                    *) [ -n "$state" ] && brush_send "$(echo $state | awk '{print $1}')" "tip back" ;;
-                esac ;;
-        esac
-    done
-}
-
-brushwatch_alive() {
-    local p
-    p=$(cat "$MODDIR/brush.pid" 2>/dev/null)
-    [ -n "$p" ] || return 1
-    kill -0 "$p" 2>/dev/null || return 1
-    grep -qa "brushwatch" "/proc/$p/cmdline" 2>/dev/null
-}
-
-brushwatch_ensure() {
-    [ -e "$DISABLE" ] && return 0
-    [ -e "$DISABLE_BRUSH" ] && return 0
-    case "$BRUSH" in 0|false|no|off) return 0 ;; esac
-    brushwatch_alive && return 0
-    setsid /system/bin/sh "$0" --brushwatch >>"$BRUSH_LOG" 2>&1 </dev/null &
-    sleep 1
-    log "brushwatch started pid=$(cat "$MODDIR/brush.pid" 2>/dev/null)"
 }
 
 penring_ensure() {
@@ -674,10 +655,9 @@ case "$1" in
     case "$BRUSH" in 0|false|no|off) exit 0 ;; esac
     log "brushwatch up (apps=$BRUSH_APPS level=$BRUSH_LEVEL map=$BRUSH_MAP eraser=$BRUSH_ERASER)"
     : > "$BRUSH_STATE"
+    : > "$BRUSH_BASE"
 
-    brush_poll_loop &
-    brush_node_loop &
-    wait
+    brush_watch_loop
     exit 0
     ;;
 
