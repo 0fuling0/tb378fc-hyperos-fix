@@ -71,3 +71,24 @@ else
 fi
 
 exit 0
+
+# ---------------------------------------------------------------- ⑧ AON / 注视感知
+# HyperOS 的客户特性解析器写死了 /mi_ext/product/etc/cust_features/device_features.xml
+# （CustFeatureResolveHelper.DEFAULT_CUST_FEATURE_PATH），而移植包把它放到了
+# /product/etc/cust_features/，Lenovo 机型又没有 mi_ext 分区（/mi_ext 是个空目录）
+# → config_supported_aon_devices 取默认 false → PMS 不返回 com.xiaomi.aon
+# → AttentionManagerService 起不来 → "注视感知"被 removePreference（设置里没这一项）。
+# 这里在 post-fs-data（SystemServer 起来之前）把那份目录 bind mount 过去。
+# 关掉：建 marker 文件 disable-aon。
+AON_SRC=/product/etc/cust_features
+AON_DST=/mi_ext/product/etc/cust_features
+# 注意：/ 是 erofs 只读，/mi_ext 也在上面 → 直接 mkdir 会 "Read-only file system"。
+# 先拿 tmpfs 盖住 /mi_ext（挂载点在已有目录上是允许的），再建目录 + bind mount。
+if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
+    mount -t tmpfs tmpfs /mi_ext 2>/dev/null
+    if mkdir -p "$AON_DST" 2>/dev/null && mount --bind "$AON_SRC" "$AON_DST" 2>/dev/null; then
+        log "⑧ mi_ext cust_features ok: $AON_SRC -> $AON_DST (tmpfs+bind)"
+    else
+        log "⑧ ERROR mi_ext cust_features 挂载失败"
+    fi
+fi

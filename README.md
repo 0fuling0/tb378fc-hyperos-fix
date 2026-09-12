@@ -24,6 +24,8 @@
 
 | ⑦ | **笔刷触感跟着 App 走** | 读笔记/小米创作的 `creation_shpref.xml` 里 `current_brush`（根可读），切换笔刷就发一次 CON 波形（32 圆珠笔/33 铅笔/34 马克笔/35 橡皮/36 联想笔刷…），笔自己按这个手感持续振；笔尾（`BTN_TOOL_RUBBER`）靠近自动切 35、回笔尖再切回当前笔刷；退出应用（`topResumedActivity`）自动停 | `config` 里 `BRUSH=0` 或标记文件 `disable-brush` |
 
+| ⑧ | **注视感知（AON）** | 把 `/product/etc/cust_features` 用 tmpfs+bind mount 盖到 HyperOS 写死的 `/mi_ext/product/etc/cust_features`（`/` 是 erofs 只读，必须先用 tmpfs），让 `config_supported_aon_devices=true` → PMS 返回 `com.xiaomi.aon` → AttentionManagerService 能起来 | 标记文件 `disable-aon` |
+
 原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
 ⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，
 ⑥ 的完整说明（手势表、键位映射、配置项、自检方法）见 **`docs/stylus-gesture-bridge.md`**，
