@@ -190,7 +190,12 @@ BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
 BRUSH_ERASER_STATES=""
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
-# 这一版 App 里已经没有 AI 笔/框选笔了；认不出的编号统一用这个波形
+# AI 笔：它不改 current_brush（用 current_ai_brush=true 标识）
+BRUSH_AI_WAVE=36
+# 框选笔：同样不改 current_brush，用 select_state_save 的值标识（看日志填，逗号分隔）
+BRUSH_LASSO_STATES=""
+BRUSH_LASSO_WAVE=36
+# 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
@@ -324,15 +329,29 @@ brush_decide_wave() {
     local sig="$1" cur sel w
     cur=$(brush_tool_val "$sig" current_brush)
     sel=$(brush_tool_val "$sig" select_state_save)
+
+    # 1) AI 笔：它不改 current_brush（实测 current_ai_brush=true 时 current_brush 还是上一支），
+    #    所以必须最先判，否则会沿用上一支笔的波形
+    if [ "$(brush_tool_val "$sig" current_ai_brush)" = "true" ]; then
+        echo "$BRUSH_AI_WAVE"; return 0
+    fi
+    # 2) 橡皮（UI 里选橡皮时 current_brush 不变，只有 select_state_save 变）
     for w in $BRUSH_ERASER_STATES; do
         [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
         [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
     done
+    # 3) 正常笔刷
     w=$(brush_wave_of "$cur")
     [ -n "$w" ] && { echo "$w"; return 0; }
     w=$(brush_wave_of "$sel")
     [ -n "$w" ] && { echo "$w"; return 0; }
-    # 这一版没有 AI 笔/框选笔，认不出的编号一律回落到联想笔刷(36)，别再"未映射"
+    # 4) 框选笔（也是不改 current_brush 的一类；值看日志填）
+    for w in $BRUSH_LASSO_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
+    done
+    w=$(brush_tool_val "$sig" ai_type)
+    [ -n "$w" ] && [ "$w" != "0" ] && { echo "$BRUSH_AI_WAVE"; return 0; }
+    # 5) 兜底：认不出的编号一律联想笔刷
     echo "$BRUSH_DEFAULT_WAVE"
 }
 
@@ -342,8 +361,15 @@ brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
 
 # 画布是否可写（hook 写的 penstate；文件不存在时按"可写"处理，保持旧行为）
 brush_canvas() {
-    local f v
-    for f in $PENSTATE_LIST; do
+    local f v fg order
+    fg=$(cat "$MODDIR/brush.fg" 2>/dev/null)
+    # 优先读前台那个 App 的 penstate（两个 App 都会写，读错了会用到旧状态）
+    order="$PENSTATE_LIST"
+    case "$fg" in
+        com.miui.notes)    order="/data/data/com.miui.notes/files/penstate $PENSTATE_LIST" ;;
+        com.miui.creation) order="/data/data/com.miui.creation/files/penstate $PENSTATE_LIST" ;;
+    esac
+    for f in $order; do
         v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
         [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
     done
@@ -384,6 +410,7 @@ brush_send() {
 # 应用里的工具换了：更新基准；不在橡皮态就立刻切过去
 brush_on_tool_change() {
     local pkg="$1" sig="$2" wave
+    echo "$pkg" > "$MODDIR/brush.fg"
     wave=$(brush_decide_wave "$sig")
     brush_log "$pkg 工具 [$sig] -> ${wave:-未映射}"
     [ -n "$wave" ] || return 0
