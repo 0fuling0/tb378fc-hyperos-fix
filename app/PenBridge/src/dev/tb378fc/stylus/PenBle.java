@@ -54,22 +54,6 @@ public final class PenBle {
     public static final UUID CH_BATTERY = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb");
     public static final String DEFAULT_MAC = "DC:EB:4D:06:E0:95";
 
-    /** 马达服务：IMP 冲击（…0008）/ CON 连续（…0006）/ SWITCH 总开关（…000e） */
-    public static final UUID SVC_HAPTIC = UUID.fromString("00000000-000f-11e1-9ab4-0002a5d5c51b");
-    public static final UUID CH_HAPTIC_CON = UUID.fromString("00000006-000f-11e1-9ab4-0002a5d5c51b");
-    public static final UUID CH_HAPTIC_IMP = UUID.fromString("00000008-000f-11e1-9ab4-0002a5d5c51b");
-
-    /**
-     * 波形 id（ZUX `ZuiPenHapticConstants`）：
-     *   0 停 / 1 CLICK / 2 CONNECTED / 3 HAPTIC_ENABLED / 4 BRUSH_CHANGE / 5 TEXT_INPUT_FOCUS /
-     *   6 RECOG_FINISHED / 7 PRESS / 32 BALLPEN / 33 PENCIL / 34 CHISEL_MARKER / 35 ERASER /
-     *   36 LENOVO_BRUSH / 37..41 同上的无音效版本 / 42 EDGE_WARNING
-     */
-    public static final int WAVE_CLICK = 1;
-    public static final int WAVE_HAPTIC_ENABLED = 3;
-    public static final int WAVE_PRESS = 7;
-    public static final int WAVE_BRUSH_NS = 41;   // 联想笔刷（无音效），连续振动的书写摩擦感
-
     /**
      * `{8,6,mask}` 触控膜功能位：笔上报哪些手势的总开关（ZUX `buildTouchfilmEnable`）。
      *   0x01 双击 / 0x02 三击 / 0x04 上滑 / 0x08 下滑 / 0x10 捏合 / 0x20 笔尾
@@ -83,31 +67,6 @@ public final class PenBle {
     /** 一次 GATT 会话的目的 */
     static final int MODE_WAKE = 0;
     static final int MODE_BATTERY = 1;
-    static final int MODE_HAPTIC = 2;
-
-    /* ---- 手势触感：连接缓存 ----
-     * 每次振动都重新 connect+discover 要 0.3~1s，振感就迟了；所以第一次连上之后
-     * 把连接与两个特征缓存住，后面的手势直接写（~20ms），空闲 12 秒才断开。 */
-    private static final long HAPTIC_IDLE_MS = 12000;
-    private static BluetoothGatt sHGatt;
-    private static BluetoothGattCharacteristic sHCon;
-    private static BluetoothGattCharacteristic sHImp;
-    private static long sHIdleAt;
-    private static HandlerThread sHThread;
-    private static Handler sHHandler;
-
-    /** 一次振动请求：type 0 = IMP 冲击，1 = CON 连续（连续振动在 ms 后自动写停止帧） */
-    static final class Haptic {
-        final int type, wave, level, friction, ms;
-        Haptic(int type, int wave, int level, int friction, int ms) {
-            this.type = type; this.wave = wave; this.level = level;
-            this.friction = friction; this.ms = ms;
-        }
-        @Override public String toString() {
-            return (type == 1 ? "CON" : "IMP") + " wave=" + wave + " level=" + level
-                    + " friction=" + friction + " ms=" + ms;
-        }
-    }
 
     public static final class Result {
         public boolean wakeSent;
@@ -116,8 +75,6 @@ public final class PenBle {
         public boolean touchfilmSent;
         /** `{8,5,level}` 捏合力度是否写成功 */
         public boolean squeezeSent;
-        /** 振动帧是否写成功 */
-        public boolean hapticSent;
         /** GATT 读到的电量；-1 = 没读到（无电池服务 / 读失败 / 超时） */
         public int battery = -1;
         public String detail = "";
@@ -152,86 +109,6 @@ public final class PenBle {
         return session(ctx, wantMac, MODE_WAKE, wake, touchfilmMask, squeezeLevel);
     }
 
-    /**
-     * 让笔振一下：type 0 = IMP 冲击式，1 = CON 连续式（ms 后自动补一条停止帧）。
-     * 根侧守护把手势（捏/双击/滑动/笔尾）映射成这里的波形 id。
-     */
-    public static Result haptic(Context ctx, String wantMac, int type, int wave, int level,
-                                int friction, int ms) {
-        return session(ctx, wantMac, MODE_HAPTIC, false, -1, -1,
-                new Haptic(type, wave, level, friction, ms), true);
-    }
-
-    /** 优先走缓存连接：命中就立刻写（~20ms），否则老老实实连一次并缓存下来。 */
-    public static Result quickHaptic(Context ctx, String wantMac, int type, int wave, int level,
-                                     int friction, int ms) {
-        final Result res = new Result();
-        long now = SystemClock.uptimeMillis();
-        if (sHGatt != null && now < sHIdleAt && sHImp != null && sHCon != null) {
-            StringBuilder log = new StringBuilder();
-            if (hapticWriteFrame(log, sHGatt, type, wave, level, friction)) {
-                res.hapticSent = true;
-                res.detail = "cached " + log;
-                sHIdleAt = now + HAPTIC_IDLE_MS;
-                scheduleHapticStop(type, ms);
-                scheduleIdleClose();
-                return res;
-            }
-            clearHapticCache();
-        }
-        return session(ctx, wantMac, MODE_HAPTIC, false, -1, -1,
-                new Haptic(type, wave, level, friction, ms), true);
-    }
-
-    static void clearHapticCache() {
-        sHGatt = null;
-        sHCon = null;
-        sHImp = null;
-        sHIdleAt = 0;
-    }
-
-    private static void scheduleIdleClose() {
-        if (sHHandler == null) return;
-        sHHandler.removeCallbacksAndMessages(null);
-        sHHandler.postDelayed(new Runnable() {
-            @Override public void run() {
-                if (sHGatt != null && SystemClock.uptimeMillis() >= sHIdleAt) {
-                    try { sHGatt.disconnect(); } catch (Throwable ignored) { }
-                }
-            }
-        }, HAPTIC_IDLE_MS + 500);
-    }
-
-    private static void scheduleHapticStop(int type, int ms) {
-        if (type != 1 || sHHandler == null) return;
-        sHHandler.postDelayed(new Runnable() {
-            @Override public void run() {
-                if (sHGatt != null && sHCon != null) {
-                    StringBuilder log = new StringBuilder();
-                    writeCmd(log, sHGatt, sHCon, new byte[]{0, 0, 0, 0});
-                }
-            }
-        }, Math.max(60, Math.min(2000, ms)));
-    }
-
-    /** 写一帧振动（IMP 或 CON 起始帧）；返回是否成功。 */
-    static boolean hapticWriteFrame(StringBuilder log, BluetoothGatt g, int type, int wave,
-                                    int level, int friction) {
-        BluetoothGattService svc = g.getService(SVC_HAPTIC);
-        if (svc == null) { say(log, "no haptic service"); return false; }
-        if (type == 1) {
-            BluetoothGattCharacteristic c = svc.getCharacteristic(CH_HAPTIC_CON);
-            if (c == null) { say(log, "no CON char"); return false; }
-            /* 连续式 4 字节 {id, level, b2, friction}；停 = {0,0,0,0} */
-            return writeCmd(log, g, c,
-                    new byte[]{(byte) wave, (byte) level, (byte) level, (byte) friction});
-        }
-        BluetoothGattCharacteristic c = svc.getCharacteristic(CH_HAPTIC_IMP);
-        if (c == null) { say(log, "no IMP char"); return false; }
-        /* 冲击式 6 字节 {id, level, repeatLo, repeatHi, 0, 0} */
-        return writeCmd(log, g, c, new byte[]{(byte) wave, (byte) level, 1, 0, 0, 0});
-    }
-
     /** 连上笔 → 读标准电池服务的电量 → 断开。最长阻塞 12 秒；读不到时 battery = -1。 */
     public static Result readBattery(Context ctx, String wantMac) {
         return session(ctx, wantMac, MODE_BATTERY, false, -1, -1);
@@ -247,17 +124,6 @@ public final class PenBle {
 
     static Result session(Context ctx, String wantMac, final int mode, final boolean wake,
                           final int touchfilmMask, final int squeezeLevel) {
-        return session(ctx, wantMac, mode, wake, touchfilmMask, squeezeLevel, null);
-    }
-
-    static Result session(Context ctx, String wantMac, final int mode, final boolean wake,
-                          final int touchfilmMask, final int squeezeLevel, final Haptic haptic) {
-        return session(ctx, wantMac, mode, wake, touchfilmMask, squeezeLevel, haptic, false);
-    }
-
-    static Result session(Context ctx, String wantMac, final int mode, final boolean wake,
-                          final int touchfilmMask, final int squeezeLevel, final Haptic haptic,
-                          final boolean keepAlive) {
         final Result res = new Result();
         final StringBuilder log = new StringBuilder();
         HandlerThread ht = null;
@@ -281,7 +147,6 @@ public final class PenBle {
                     if (newState == BluetoothProfile.STATE_CONNECTED) {
                         g.discoverServices();
                     } else {
-                        if (sHGatt == g) clearHapticCache();
                         try { g.close(); } catch (Throwable ignored) { }
                         done.countDown();
                     }
@@ -296,39 +161,6 @@ public final class PenBle {
                             g.disconnect();
                         }
                         /* 有电池服务就等 onCharacteristicRead 回来再断 */
-                        return;
-                    }
-                    if (mode == MODE_HAPTIC) {
-                        res.hapticSent = hapticWriteFrame(log, g, haptic.type, haptic.wave,
-                                haptic.level, haptic.friction);
-                        say(log, "haptic " + haptic + " -> " + res.hapticSent);
-                        if (res.hapticSent && keepAlive) {
-                            /* 把连接留下来给下一条手势用：不 disconnect，直接返回 */
-                            if (sHThread == null) {
-                                sHThread = new HandlerThread("penhaptic");
-                                sHThread.start();
-                                sHHandler = new Handler(sHThread.getLooper());
-                            }
-                            sHGatt = g;
-                            sHCon = null;
-                            sHImp = null;
-                            BluetoothGattService hs = g.getService(SVC_HAPTIC);
-                            if (hs != null) {
-                                sHCon = hs.getCharacteristic(CH_HAPTIC_CON);
-                                sHImp = hs.getCharacteristic(CH_HAPTIC_IMP);
-                            }
-                            sHIdleAt = SystemClock.uptimeMillis() + HAPTIC_IDLE_MS;
-                            scheduleHapticStop(haptic.type, haptic.ms);
-                            scheduleIdleClose();
-                            done.countDown();
-                            return;
-                        }
-                        SystemClock.sleep(Math.max(60, Math.min(2000, haptic.ms)));
-                        if (haptic.type == 1) {
-                            hapticWriteFrame(log, g, 1, 0, 0, 0);   // 停
-                        }
-                        SystemClock.sleep(100);
-                        g.disconnect();
                         return;
                     }
                     BluetoothGattService s = g.getService(SVC_FE40);
@@ -385,11 +217,9 @@ public final class PenBle {
             say(log, "fatal " + t);
             Log.e(TAG, "fatal", t);
         } finally {
-            try {
-                if (gatt != null && gatt != sHGatt) gatt.close();
-            } catch (Throwable ignored) { }
+            try { if (gatt != null) gatt.close(); } catch (Throwable ignored) { }
             if (ht != null) ht.quitSafely();
-            res.detail = log.toString().replace('\n', '|') + (res.detail.isEmpty() ? "" : " " + res.detail);
+            res.detail = log.toString().replace('\n', '|');
         }
         return res;
     }

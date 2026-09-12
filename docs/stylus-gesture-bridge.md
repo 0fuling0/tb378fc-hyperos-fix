@@ -113,77 +113,7 @@ settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
 "双击功能选择"（橡皮擦/截图/…）**没法路由**：那是 MIUI 对自家触控膜下发的功能码
 （`bundle 3001`），联想笔没有这个概念 —— 那个功能只能在 App 侧实现（App 收到 195 自己切橡皮擦）。
 
-## 5. 手势触感（马达）：小米的"触感优化"接到了联想笔上
-
-**小米那边有什么**：框架里没有"随书写压力/速度连续变化的笔刷摩擦触感"，它的触控膜笔触感
-就是 `/product/etc/device_features/<机型>.xml` 里这几个调校值（本机 `piano.xml`）：
-
-```xml
-<double  name="double_tap_haptic_feedback">128</double>       <!-- 0~255 -->
-<double  name="sliding_up_haptic_feedback">128</double>
-<double  name="sliding_down_haptic_feedback">128</double>
-<integer-array name="pinch_trigger_pressure_medium">
-    <item>600</item> <item>300</item>   <!-- 捏合触发/释放阈值（克） -->
-    <item>172</item> <item>172</item>   <!-- 按下/松开触感强度（0~255） -->
-</integer-array>
-```
-
-它把这四个事件丢给自己的 BLE 服务，协议是 Messenger（不是 AIDL）：
-
-```
-MiuiStylusBleHelper → com.xiaomi.bluetooth
-                        com.android.bluetooth.ble.app.oobhelper.MiuiBleOobHelperService
-   3000 (trigger, release)   捏合阈值        3001 (doubleTap, 0)  双击开关
-   3002 (type, amplitude)    振动 ← 就是它   3005 (3, 0)          捏合马达
-   3006 bundle               初始化
-   type: 1 捏下 / 2 捏松 / 3 双击 / 4 滑动
-```
-
-这个服务是给**小米笔**的私有协议用的，联想笔听不懂（实测 logcat 里 `Prepare to send cmd to
-ble service, cmd:3002, value:4, extend value:128` 一直在发，但没有任何效果）。
-
-**联想笔那边有什么**（ZUX 马达通道 `00000000-000f-11e1-…`）：
-
-| 特征 | 帧 | 含义 |
-|---|---|---|
-| IMP `…0008` | `{id, level, repeatLo, repeatHi, 0, 0}` | 冲击式（离散） |
-| CON `…0006` | `{id, level, b2, friction}` / 停 `{0,0,0,0}` | **连续式（连续振动，带摩擦感字节）** |
-| SWITCH `…000e` | `{0|1}` | 马达总开关 |
-
-波形：`1 CLICK / 3 HAPTIC_ENABLED / 6 RECOG_FINISHED / 7 PRESS / 32 圆珠笔 / 33 铅笔 /
-34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 同上的无音效版`。
-
-**模块怎么接的**：penring 读到手势 → 按下面的表发 `dev.tb378fc.stylus.HAPTIC` 广播 →
-PenBridge 用 GATT 写马达帧；**强度直接用小米那份 xml 换算**（`level = round(amp/255*5)`，
-128→3、172→3），所以振感跟小米的调校一致。
-
-| 手势 | 波形 | 类型 |
-|---|---|---|
-| 捏下 | `HAPTIC_PINCH=3`（HAPTIC_ENABLED） | IMP |
-| 捏松 | `HAPTIC_PINCH_UP=0`（默认不振） | IMP |
-| 双击 | `HAPTIC_DOUBLE=1`（CLICK） | IMP |
-| **上滑/下滑** | `HAPTIC_SLIDE=41`（联想笔刷·无音效） | **CON 连续振动**，`HAPTIC_SLIDE_MS=120` 后自动停 |
-| 笔尾按住 | `HAPTIC_TAIL=6`（RECOG_FINISHED） | IMP |
-
-`HAPTIC=0` 关掉全部；某一条设 0 就是那条不振；`HAPTIC_LEVEL=1..5` 可以固定强度
-（默认 -1 = 按小米 xml 换算）。
-
-**延迟**：空口 connect+discover 要 0.3~1s，所以 PenBridge 把连接**缓存**住（空闲 12 秒才断），
-第一条手势慢一点，后面每条都在 20ms 内写出去（日志里能看到 `cached write …`）。
-实测（用户现场手势）：
-
-```
-05:05:00.888 haptic CON wave=41 level=3 friction=1 ms=120 -> true
-             write 29 03 03 01 rc=0            ← 下滑：连续振动
-05:05:01.753 HAPTIC … {cached write 01 03 01 00 00 00 rc=0   ← 双击：CLICK
-```
-
-**想要"完全跟随 MIUI"**（含它未来调校）：可以再挂一个 LSPosed hook 到
-`MiuiStylusBleHelper.sendCmdToBleServiceAsync(int,int,int)`，把 `cmd==3002` 的
-`(type, amplitude)` 直接转成同一套 `HAPTIC` 广播（`extras/stylus-pen-hook` 已有架子）。
-现在这一版不依赖 LSPosed。
-
-## 6. 移植 ROM 自带的老笔桥要停掉
+## 5. 移植 ROM 自带的老笔桥要停掉
 
 `/system/etc/init/init.lwky.rc` 里有一个 `lwky_pen` 服务（`/system/lwky/penbridge_hyperos`），
 在 `sys.boot_completed=1` 时启动，是移植 ROM 作者写的旧桥：
@@ -197,7 +127,7 @@ PenBridge 用 GATT 写马达帧；**强度直接用小米那份 xml 换算**（`
 
 （`lwky_touchfeature` 那个假 HAL **不要停**：MIUI 的 `ITouchFeature.setTouchMode()` 需要它返回成功。）
 
-## 7. 构建 / 安装 / 自检
+## 6. 构建 / 安装 / 自检
 
 ```bash
 ./build.sh                 # 会同时构建 PenBridge.apk 与 bin/penring
