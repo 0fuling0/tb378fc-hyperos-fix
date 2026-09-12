@@ -148,6 +148,28 @@ TELEPHONY_PKGS="com.qti.phone com.qualcomm.qcrilmsgtunnel com.qualcomm.qti.telep
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
+# 进程表匹配（排除自己）：$1 是 awk 正则。
+# 为什么不用 pid 文件：看护是 setsid 出来的，supervisor 被重启/杀掉后它们变成孤儿继续活着，
+# 此时 pid 文件已被覆盖/删除，只看 pid 文件会误判成"没有实例"→ 再拉一个 → 两个实例各发一份波形。
+# 为什么不用逐个读 /proc/<pid>/cmdline：300+ 进程时每次调用要 600+ 次 fork，几秒一轮就把 pid 耗尽。
+# 只认"shell 直接跑本脚本 --brushwatch"的进程：排除 timeout/setsid 这类包装进程
+# （它们的 cmdline 里也含同样的字符串，曾因此把自己人误判成"已有实例"）
+brushwatch_pids() {
+    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh --brushwatch" '
+        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { print $1 }'
+}
+
+penring_pids() {
+    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" '
+        NR>1 && $1+0 != me+0 && ($2 == "penring" || $2 ~ /\/penring$/) { print $1 }'
+}
+
+# penring --watch（笔刷看护的 inotify 子进程）
+penring_watch_pids() {
+    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" '
+        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)penring$/ && $0 ~ /--watch/ { print $1 }'
+}
+
 # 可选配置项；未知键自然被忽略
 REFRESH_SECONDS=0
 CAPSULE=1
@@ -221,12 +243,8 @@ gesture_enabled() {
 }
 
 penring_alive() {
-    local p
-    p=$(cat "$PENRING_PID" 2>/dev/null)
-    [ -n "$p" ] || return 1
-    kill -0 "$p" 2>/dev/null || return 1
-    # 只认 cmdline 里确实是我们的二进制，防止 pid 复用
-    grep -qa "penring" "/proc/$p/cmdline" 2>/dev/null
+    # 手势守护：/proc 扫描（pid 文件会被孤儿进程/pid 复用骗到）
+    [ -n "$(penring_pids)" ]
 }
 
 # ⑥ 把"设置 → 手写笔"里的开关/力度翻译成笔端命令：
@@ -484,7 +502,7 @@ brush_scan_apps() {
 }
 
 brush_watch_loop() {
-    local line pkg
+    local line pkg miss=0
     # 每轮先对齐一次现状（App 可能已经在前台且选好了笔刷）
     brush_scan_apps
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
@@ -497,6 +515,7 @@ brush_watch_loop() {
             --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
         | while :; do
             if IFS= read -r -t 2 line; then
+                miss=0
                 case "$line" in
                     FILE*)
                         # FILE <dir> <name>：只读事件所属的那个 App
@@ -535,6 +554,15 @@ brush_watch_loop() {
                         fi ;;
                 esac
             else
+                # read 超时或管道断了。若 penring --watch 已经没了，必须立刻跳出内层让外层重建：
+                # 否则 read 会立刻返回失败 → 空转，而且每轮都跑 brush_exit_check（里面有 dumpsys）
+                # → 几秒内几千次 fork（实测把 pid 都耗到绕回）。
+                # 每 3 次超时才做一次进程表扫描（守卫本身也要花 fork，别每 2 秒都扫）
+                miss=$((miss+1))
+                if [ $((miss % 3)) -eq 0 ] && [ -z "$(penring_watch_pids)" ]; then
+                    brush_log "watch: penring --watch 已退出，重建看护"
+                    break
+                fi
                 brush_exit_check
             fi
         done
@@ -549,6 +577,20 @@ penring_ensure() {
     setsid "$PENRING_BIN" --moddir "$MODDIR" >>"$LOG.ring" 2>&1 </dev/null &
     sleep 1
     log "penring started pid=$(cat "$PENRING_PID" 2>/dev/null)"
+}
+
+# 单实例判定：直接扫 /proc（pid 文件在孤儿进程场景下不可靠，见 pids_of 注释）
+brushwatch_alive() { [ -n "$(brushwatch_pids)" ]; }
+
+brushwatch_ensure() {
+    [ -e "$DISABLE" ] && return 0
+    [ -e "$DISABLE_BRUSH" ] && return 0
+    case "$BRUSH" in 0|false|no|off) return 0 ;; esac
+    brushwatch_alive && return 0
+    # 陈旧锁（上次会话留下的 brush.lock/brush.pid）由 --brushwatch 自己清理
+    setsid /system/bin/sh "$0" --brushwatch >>"$BRUSH_LOG" 2>&1 </dev/null &
+    sleep 1
+    log "brushwatch started pid=$(cat "$MODDIR/brush.pid" 2>/dev/null)"
 }
 
 capsule_direct() {
@@ -754,17 +796,25 @@ case "$1" in
 
 --brushwatch)
     # 单实例：已有活着的实例就直接退出（否则会有多个实例各发一份波形、还各按自己那份代码判定）
-    if [ -d "$BRUSH_LOCK" ]; then
-        old=$(cat "$MODDIR/brush.pid" 2>/dev/null)
-        # 必须再核对 /proc/<pid>/cmdline：重启后 pid 会被复用，只 kill -0 会误判成"已有实例"
-        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null \
-                && grep -qa "brushwatch" "/proc/$old/cmdline" 2>/dev/null; then
-            log "brushwatch already running pid=$old, exit"
+    # 原子抢锁：mkdir 成功者才是实例。
+    # 不能用"先扫描全表、发现有别人就退出"——两个并发的 ensure（supervisor 和 monitor 都会拉）
+    # 会互相谦让，结果两个都退出，看护静默消失（实测：mon 一直不启动的真身）。
+    tries=0
+    while :; do
+        if mkdir "$BRUSH_LOCK" 2>/dev/null; then break; fi
+        other=$(brushwatch_pids | tr '\n' ' ')
+        tries=$((tries+1))
+        if [ -n "$other" ]; then
+            log "brushwatch already running pid=$other, exit"
             exit 0
         fi
-        rm -rf "$BRUSH_LOCK"
-    fi
-    mkdir "$BRUSH_LOCK" 2>/dev/null || exit 0
+        if [ "$tries" -ge 5 ]; then
+            log "brushwatch lock busy but no live instance (stale?), give up"
+            exit 0
+        fi
+        rm -rf "$BRUSH_LOCK"          # 陈旧锁（持有者已死）：清掉重抢
+        sleep 0.3
+    done
     trap 'rmdir "$BRUSH_LOCK" 2>/dev/null; rm -f "$MODDIR/brush.pid"' EXIT INT TERM
     echo $$ > "$MODDIR/brush.pid"
     # ⑦ 笔刷触感看护：两条子循环并跑
@@ -934,6 +984,9 @@ case "$1" in
             now_sec=$((now_sec+1))
             # ⑥ 每 2 秒看一次"设置→手写笔"有没有变（双击/轻捏开关、轻捏力度）
             if [ $((tick % 2)) -eq 0 ]; then sync_pen_settings || true; fi
+            # 看护自愈：monitor 是唯一常驻不退出的循环，penring / brushwatch 若被杀掉/崩溃
+            # （历史事故：函数整段丢失导致开机后静默不启动）在这里两秒内重生一次。
+            if [ $((tick % 2)) -eq 1 ]; then penring_ensure; brushwatch_ensure; fi
         fi
         att=$(read_att "$last_att")
         lvl=$(read_level)
@@ -1039,6 +1092,14 @@ case "$1" in
 
     rm -rf "$LOCK" 2>/dev/null
     mkdir -p "$LOCK" 2>/dev/null || exit 0
+
+    # 接管：上一轮会话（或旧版本模块）用 setsid 拉起的看护不会被 init 收走，
+    # supervisor 死后它们还活着 —— 必须清掉，否则新旧两份同时往笔里写波形。
+    for p in $(brushwatch_pids) $(penring_pids); do
+        kill -9 "$p" 2>/dev/null
+    done
+    rm -rf "$BRUSH_LOCK" 2>/dev/null
+    rm -f "$MODDIR/brush.pid" "$PENRING_PID" 2>/dev/null
 
     # ③ BPF 监视器拆弹、④ 死电话栈、① 唤醒守护三者各自独立，互不依赖。
     if [ ! -e "$DISABLE_BPFMON" ]; then

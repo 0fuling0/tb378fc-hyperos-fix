@@ -81,8 +81,19 @@ pack() {
   unzip -l "$zip"
 }
 
+# ---------- ② 脚本自检 ----------
+# 背景：脚本里"调用了但没定义"的函数（曾经整段丢失 brushwatch_ensure），sh 只会打一行
+# not found 继续跑 —— 看护进程静默不启动，现象上极难定位。这里构建期直接拦下来。
+check_scripts() {
+  echo "== 脚本自检（未定义函数 / 语法）"
+  sh -n "$MODULE/service.sh"
+  sh -n "$MODULE/post-fs-data.sh"
+  python3 "$HERE/tools/check-helpers.py" "$MODULE/service.sh" "$MODULE/post-fs-data.sh"
+}
+
 build_app
 build_penring
+check_scripts
 [ "$DO_PAYLOAD" = 1 ] && build_payload
 pack
 

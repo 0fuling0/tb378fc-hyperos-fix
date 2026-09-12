@@ -223,3 +223,57 @@ adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/penring.log'   # 每�
 adb shell su -c 'cat /proc/bus/input/devices | grep -A4 "Xiaomi Pen"'      # 虚拟笔在不在
 adb logcat -s MiuiStylusDeviceListener MiuiStylusTouchFilmManager QuickAppPanelView
 ```
+
+---
+
+## 8. 看护进程（brushwatch）为什么会"没自动启动"
+
+症状：开机后笔刷触感/笔尾切橡皮完全没反应，`ps` 里看不到 `service.sh --brushwatch`，
+但 supervisor / monitor / penring 都在。三个独立的坑，任何一个都能让它静默消失：
+
+1. **函数整段丢失 → 静默 not found。**
+   一次误操作把 `brushwatch_ensure()` / `brushwatch_alive()` 两个定义删掉了，只留下调用点。
+   `sh` 对未定义函数的反应是打一行 `brushwatch_ensure: not found` 继续往下跑 —— 于是
+   monitor 每轮都"调用成功"，看护永远起不来，日志里看不出任何异常。
+   → 现在构建期跑 `tools/check-helpers.py`（剥离引号与 `$(( ))` 后比对"被调用 vs 已定义"），
+   并 `sh -n` 语法检查，这类问题在打包前就报错。
+
+2. **"先扫描、后谦让"的竞态 → 两个都退出。**
+   supervisor 和 monitor 都会调 `brushwatch_ensure`。原实现是"扫描全表，发现有别的
+   brushwatch 就退出"——两个并发实例各自看到对方，双双退出，看护静默消失。
+   → 改成 **`mkdir $BRUSH_LOCK` 原子抢锁**：抢到的人才是实例，永不反悔；抢不到的人再扫进程表，
+   有活人就退出，没活人（陈旧锁，持有者被 `kill -9` 过、trap 没执行）就清掉重抢，最多 5 次。
+
+3. **只看 pid 文件 → 孤儿进程骗过判定。**
+   看护是 `setsid` 出来的，supervisor/monitor 被重启后它们变成孤儿继续活着；此时 pid 文件
+   已被覆盖或删除，`kill -0` + pid 文件会误判成"没有实例"，于是又拉一份 → 两份各按自己
+   那份代码判定、各往笔里写波形（实测出现过）。
+   → 存活判定改成 **扫进程表** `ps -A -o PID,ARGS`（一次 fork），并且必须同时满足
+   `$2` 是 shell **且** cmdline 命中 `$MODDIR/service.sh --brushwatch` —— 否则
+   `timeout 8 /system/bin/sh service.sh --brushwatch` 这类包装进程也会被当成实例。
+   启动阶段（`service.sh` 无参分支）再加一次**接管**：清掉上一轮遗留的 brushwatch / penring 孤儿。
+
+另外两处随之修掉的健壮性问题：
+
+- **内层循环空转。** 内层 `while :; do read -t 2 ...; done` 在 `penring --watch`
+  死掉后 `read` 会立刻返回失败 → 空转，而且每轮都跑 `brush_exit_check`（里面有 `dumpsys`），
+  几秒内几千次 fork。现在 read 失败时每 3 次做一次进程表检查，`--watch` 没了就跳出内层让外层重建。
+- **监控自愈。** monitor 是唯一常驻不退出的循环，现在每 2 秒跑一次
+  `penring_ensure; brushwatch_ensure`，看护被杀/崩溃后 ≤2 秒重生。
+
+### 排障速查
+
+```sh
+M=/data/adb/modules/tb378fc_hyperos_fix
+# 实例与子进程（正常：1 个 --brushwatch 父 + 1 个 fork 子（cmdline 相同）+ 1 个 penring --watch）
+ps -A -o PID,PPID,ARGS | grep -E "service\.sh --|penring"
+cat $M/brush.pid; ls -d $M/brush.lock          # pid / 锁
+tail -f $M/wake.log                            # 启动与自愈：brushwatch started / already running
+tail -f $M/brush.log                           # 波形判定：send? ... / wave=NN
+
+# 真实 fork 压力（归属测试：模块全停 vs 运行）
+awk '/^processes/{print $2}' /proc/stat        # 前后各读一次，差值 / 秒
+```
+
+**不要用"逐个 `/proc/<pid>/cmdline` 去 tr+grep"判活**：300+ 进程时每次调用要 600+ 次 fork，
+两秒一轮就能把 pid 耗尽（实测 pid 从 30000 绕回到 663、load 12）—— 必须用一次 `ps` 全表 + `awk`。
