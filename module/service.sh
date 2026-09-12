@@ -123,6 +123,7 @@ BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 =
 BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
 # 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
+BRUSH_LOCK="$MODDIR/brush.lock"    # 单实例锁（mkdir 原子；防止多个 brushwatch 各跑一份老代码）
 PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.stylus/files/penstate"
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
@@ -694,6 +695,17 @@ case "$1" in
     ;;
 
 --brushwatch)
+    # 单实例：已有活着的实例就直接退出（否则会有多个实例各发一份波形、还各按自己那份代码判定）
+    if [ -d "$BRUSH_LOCK" ]; then
+        old=$(cat "$MODDIR/brush.pid" 2>/dev/null)
+        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+            log "brushwatch already running pid=$old, exit"
+            exit 0
+        fi
+        rm -rf "$BRUSH_LOCK"
+    fi
+    mkdir "$BRUSH_LOCK" 2>/dev/null || exit 0
+    trap 'rmdir "$BRUSH_LOCK" 2>/dev/null; rm -f "$MODDIR/brush.pid"' EXIT INT TERM
     echo $$ > "$MODDIR/brush.pid"
     # ⑦ 笔刷触感看护：两条子循环并跑
     #   A) 轮询笔记/小米创作的 creation_shpref.xml 里 current_brush（笔刷切换）
@@ -706,6 +718,7 @@ case "$1" in
     : > "$BRUSH_BASE"
 
     brush_watch_loop
+    rmdir "$BRUSH_LOCK" 2>/dev/null
     exit 0
     ;;
 
