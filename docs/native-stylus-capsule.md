@@ -104,17 +104,23 @@ adb shell su -c 'am broadcast --user 0 \
                       └─ 真值 != coil 才补一条校正（相同不重复弹）
 ```
 
-### 3.4 延迟都花在哪（为什么第一版要 ~3 秒）
+### 3.4 延迟都花在哪（实测分解）
 
-| 环节 | 第一版 | v3.1 |
-|---|---|---|
-| 检测吸附边沿 | 主循环 `sleep 1` 轮询 → 最坏 **1.0 s** | `POLL_MS=200` + 内建 `read` → 最坏 **0.2 s** |
-| 等线圈握手 | 固定 `sleep 2` → **2.0 s** | 读一次就发；读不到才重试 4×0.2 s |
-| 谁来发广播 | 先叫醒 PenBridge 应用（冷启动进程）再转发 → **0.3~1 s** | 守护直发（`CAPSULE_DIRECT=1`），**不起应用进程** |
-| `am` + AMS + SecurityCoreAdd 接收 | 0.2~0.5 s | 同左 |
-| **合计（典型）** | **≈3~4 s** | **≈0.4~0.8 s** |
+| 环节 | 第一版 | v3.1 | 能不能再省 |
+|---|---|---|---|
+| **线圈硬件握手**：`attached` 0→1 | 2.0 s | 2.0 s | ❌ 硬件，笔放上去后线圈要启动+握手，实测固定 ~2 s |
+| 检测到边沿 | 主循环 `sleep 1` → 最坏 1.0 s | `POLL_MS=200` + 内建 `read` → 最坏 0.2 s | ✅ 可调 `POLL_MS=100/50` |
+| 等线圈读出电量（`level` 变有效） | 被固定 `sleep 2` 掩盖 | ~0.5 s（`level` 在 `attached` 之后约 0.5 s 才有效） | ⚠️ 用缓存值可跳过 |
+| 发广播 | 先冷启动 PenBridge 再转发 → 0.3~1 s | 守护直发（`CAPSULE_DIRECT=1`）→ 0.2~0.4 s | ✅ 已优化 |
+| **合计（从笔放上去算）** | **≈4~5 s**（用户感知 ~3 s） | **≈2.9 s** | 见下 |
 
-想再快/更省电可以调 `POLL_MS`（50/100 更灵敏，500/1000 更省电）。
+**想更快只剩两条路**（都还没做，见 README 的选项）：
+
+1. **线圈启动边沿 + 缓存电量**：笔一放上去线圈会先 `online` 1→0 / `level` 归 0（比 `attached=1` **早约 2 s**）。
+   在那一刻就用**上一次的 `level`** 先弹一条，真值到了再刷新 → 感知延迟 **≈0.3 s**，代价是
+   第一眼可能是旧数字（例如上次 100%、这次其实 60%）。
+2. **装回 LSPosed hook**：`InputDevice.getBatteryState()` 是公开 API，装好 hook 后 0 ms 就能拿到
+   真实电量 + 充电状态，连 GATT 都不需要（也就不需要"补一条校正"）。但它救不了那 2 s 硬件握手。
 
 ---
 
@@ -151,9 +157,24 @@ adb shell su -c 'am broadcast --user 0 \
 
 | 来源 | 谁读 | 取值 | 特点 |
 |---|---|---|---|
-| `wls_tx/level` | `service.sh`（root） | 0..100 | 反向无线充电线圈看到的笔电量，**零延迟**；未吸附时的值可能是缓存/占位，所以只是一次"先弹" |
+| `wls_tx/level` | `service.sh`（root） | 0..100 | 反向无线充电线圈看到的笔电量，**零延迟**；**取下时保留上一次的值**（实测吸附前读 100），握手瞬间会短暂为 0 |
+| `InputDevice.getBatteryState()` | PenBridge（公开 API，无需权限） | `isPresent/getCapacity/getStatus` | 最快最准且自带充电状态，**但依赖 LSPosed hook**（PenStylusHook 把数字板与蓝牙笔关联起来）。没装 hook 时 `dumpsys input` 里是 `NativeBattery=State{<not present>}, BluetoothState=null` |
 | GATT `0x180F/0x2A19` | PenBridge（普通 App） | 0..100 | 标准电池服务，真实但要连一次 BLE（1~3 s）；读到不同值会补发一条校正 |
-| `wls_tx/charge_state` | `service.sh`（root） | 观测值 `2`（未充） | 只写进 `wake.log` 备查，不参与判定 |
+| `dumpsys bluetooth_manager` | — | 只有 `BatteryStateMachine state=Connected` | **没有电量数字**，不能当来源 |
+
+### 吸附时的实测时间线（0.5 s 采样，`wls_tx/*`）
+
+| 时刻 | `attached` | `level` | `charge_state` | `online` | 含义 |
+|---|---|---|---|---|---|
+| 放置前 | 0 | 100 | 2 | 1 | 取下状态：level 是**上次的值** |
+| t≈+0 s | 0 | 0 | 0 | 0 | 线圈启动、开始握手 |
+| t≈+2.0 s | **1** | 0 | 0 | 1 | `attached` 才置 1 —— **这 2 秒是硬件握手，软件省不掉** |
+| t≈+2.5 s | 1 | **100** | 0→1 | 1 | 线圈读到电量；`charge_state=1` |
+| t≈+42 s | 1 | 100 | 2 | 1 | 充满/涓流，`charge_state` 回到 2 |
+| 取下 | 0 | 100 | 2 | 1 | — |
+
+`charge_state` **线圈自己的枚举**：`1` = 充电中，`2` = 未充电/充满
+（MIUI 那边 `state` 用的是 `4` = 充电中 / `2` = 未充电，**不是同一套编号**，别混用）。
 
 ### 前置条件（缺一不可，模块自动处理）
 
