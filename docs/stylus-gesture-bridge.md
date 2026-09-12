@@ -84,7 +84,36 @@ PAGE_UP/PAGE_DOWN（代价：380ms 内它们会被 MIUI 当成截图/速记键�
 [`zuxos-pen-protocol.md` §2.1](zuxos-pen-protocol.md)。笔重启/睡死会把它清零，
 模块在 `startup-wake` 和每次取下的 `detach-wake` 都会补写 `{8,6,63}`（`TOUCHFILM`）。
 
-## 4. 移植 ROM 自带的老笔桥要停掉
+## 4. 把"设置 → 手写笔"里的开关/力度路由给笔
+
+MIUI 的设置页（`stylus_pinch_status` / `stylus_double_click_status` / `stylus_pinch_pressure_adjust` …）
+本来是给**小米自家笔**用的：框架只把阈值丢给 `MiuiStylusBleHelper`（它自己的 BLE 服务），
+联想笔的固件听不懂。等价物在 ZUX 协议里，所以模块的守护每 2 秒看一次这几个 key，
+一变就发对应的 FE41 帧：
+
+| MIUI 设置（`Settings.System`） | 默认 | 下发给笔 | 说明 |
+|---|---|---|---|
+| `stylus_double_click_status` | 1 | `{8,6,mask}` **bit0** | 0 = 关，非 0（含功能号 1..N）= 开 |
+| `stylus_pinch_status` | 5 | `{8,6,mask}` **bit4** | 0 = 轻捏关；5 = 轻捏=快捷环（功能号本身由 MIUI 主机侧处理） |
+| `stylus_pinch_pressure_adjust` | 2 | `{8,5,level}`，`level = adjust + 1` | MIUI 是 0 基（0..4，对应 `pinch_trigger_pressure_*` 五档），笔端是 1..5（1 轻…5 重） |
+
+上滑/下滑（bit2|3）与笔尾（bit5）没有对应的 MIUI 开关，按本模块的 `GESTURE_*` 常开。
+实测（改设置 → 笔）：
+
+```
+settings put system stylus_double_click_status 0     → {8,6,0x3C}  (bit0 清掉)
+settings put system stylus_pinch_pressure_adjust 4   → {8,5,5}     (力度 5)
+settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
+```
+
+开关/力度都走 `bin/penring` 的存在性做前置判断；关掉这个行为：`config` 里 `SETTINGS_SYNC=0`。
+手动跑一次：`sh /data/adb/modules/tb378fc_hyperos_fix/service.sh --syncsettings`，
+结果看 `wake.log` 的 `settings->pen mask=.. squeeze=..` 一行。
+
+"双击功能选择"（橡皮擦/截图/…）**没法路由**：那是 MIUI 对自家触控膜下发的功能码
+（`bundle 3001`），联想笔没有这个概念 —— 那个功能只能在 App 侧实现（App 收到 195 自己切橡皮擦）。
+
+## 5. 移植 ROM 自带的老笔桥要停掉
 
 `/system/etc/init/init.lwky.rc` 里有一个 `lwky_pen` 服务（`/system/lwky/penbridge_hyperos`），
 在 `sys.boot_completed=1` 时启动，是移植 ROM 作者写的旧桥：
@@ -98,7 +127,7 @@ PAGE_UP/PAGE_DOWN（代价：380ms 内它们会被 MIUI 当成截图/速记键�
 
 （`lwky_touchfeature` 那个假 HAL **不要停**：MIUI 的 `ITouchFeature.setTouchMode()` 需要它返回成功。）
 
-## 5. 构建 / 安装 / 自检
+## 6. 构建 / 安装 / 自检
 
 ```bash
 ./build.sh                 # 会同时构建 PenBridge.apk 与 bin/penring

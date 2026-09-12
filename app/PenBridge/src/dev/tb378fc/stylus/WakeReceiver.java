@@ -64,11 +64,13 @@ public final class WakeReceiver extends BroadcastReceiver {
             @Override
             public void run() {
                 try {
-                    // touchfilm：顺便重发一次 {8,6,mask} 触控膜功能位（默认全开 0x3F，
-                    // 传 -1 就只唤醒不改手势位）。笔重启/睡死会把功能位清零，
-                    // 联想原厂每次连接都会重发，HyperOS 上只能我们自己补。
+                    // touchfilm：{8,6,mask} 笔端手势功能位（默认全开 0x3F，-1 = 这次不写）
+                    // squeeze  ：{8,5,level} 捏合力度 1..5（默认 -1 = 这次不写）
+                    // wake     ：0 = 只改设置，不唤醒（根侧守护同步"小米设置"时用）
                     final int touchfilm = intent.getIntExtra("touchfilm", PenBle.TOUCHFILM_ALL);
-                    PenBle.Result r = PenBle.run(app, mac, touchfilm);
+                    final int squeeze = intent.getIntExtra("squeeze", -1);
+                    final boolean wake = intent.getIntExtra("wake", 1) != 0;
+                    PenBle.Result r = PenBle.sendCmds(app, mac, wake, touchfilm, squeeze);
                     Log.i(PenBle.TAG, "WAKE " + r);
                 } catch (Throwable t) {
                     Log.e(PenBle.TAG, "wake failed", t);

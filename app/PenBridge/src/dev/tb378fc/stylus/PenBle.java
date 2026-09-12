@@ -73,11 +73,14 @@ public final class PenBle {
         public boolean sawFe41;
         /** `{8,6,mask}` 是否写成功 */
         public boolean touchfilmSent;
+        /** `{8,5,level}` 捏合力度是否写成功 */
+        public boolean squeezeSent;
         /** GATT 读到的电量；-1 = 没读到（无电池服务 / 读失败 / 超时） */
         public int battery = -1;
         public String detail = "";
         @Override public String toString() {
-            return "wakeSent=" + wakeSent + " touchfilm=" + touchfilmSent + " fe41=" + sawFe41
+            return "wakeSent=" + wakeSent + " touchfilm=" + touchfilmSent
+                    + " squeeze=" + squeezeSent + " fe41=" + sawFe41
                     + " battery=" + battery + " {" + detail + "}";
         }
     }
@@ -86,24 +89,41 @@ public final class PenBle {
 
     /** 连上笔 → 写唤醒命令 + 触控膜功能位全开 → 断开。最长阻塞 12 秒。 */
     public static Result run(Context ctx, String wantMac) {
-        return run(ctx, wantMac, TOUCHFILM_ALL);
+        return sendCmds(ctx, wantMac, true, TOUCHFILM_ALL, -1);
     }
 
     /** @param touchfilmMask 要写的 `{8,6,mask}`；&lt;0 表示这次不写 */
     public static Result run(Context ctx, String wantMac, int touchfilmMask) {
-        return session(ctx, wantMac, MODE_WAKE, touchfilmMask);
+        return sendCmds(ctx, wantMac, true, touchfilmMask, -1);
+    }
+
+    /**
+     * 一次 GATT 会话里按顺序写几帧（写成功一帧就够本，失败会重试一次）：
+     *   wake          → `{5,5}` 唤醒
+     *   touchfilmMask → `{8,6,mask}` 手势功能位（&lt;0 不写）
+     *   squeezeLevel  → `{8,5,level}` 捏合力度 1..5（&lt;1 不写）
+     * 根侧守护用它把"小米设置里的手写笔开关/力度"路由给笔。
+     */
+    public static Result sendCmds(Context ctx, String wantMac, boolean wake,
+                                  int touchfilmMask, int squeezeLevel) {
+        return session(ctx, wantMac, MODE_WAKE, wake, touchfilmMask, squeezeLevel);
     }
 
     /** 连上笔 → 读标准电池服务的电量 → 断开。最长阻塞 12 秒；读不到时 battery = -1。 */
     public static Result readBattery(Context ctx, String wantMac) {
-        return session(ctx, wantMac, MODE_BATTERY, -1);
+        return session(ctx, wantMac, MODE_BATTERY, false, -1, -1);
     }
 
     static Result session(Context ctx, String wantMac, final int mode) {
-        return session(ctx, wantMac, mode, mode == MODE_WAKE ? TOUCHFILM_ALL : -1);
+        return session(ctx, wantMac, mode, mode == MODE_WAKE, mode == MODE_WAKE ? TOUCHFILM_ALL : -1, -1);
     }
 
     static Result session(Context ctx, String wantMac, final int mode, final int touchfilmMask) {
+        return session(ctx, wantMac, mode, mode == MODE_WAKE, touchfilmMask, -1);
+    }
+
+    static Result session(Context ctx, String wantMac, final int mode, final boolean wake,
+                          final int touchfilmMask, final int squeezeLevel) {
         final Result res = new Result();
         final StringBuilder log = new StringBuilder();
         HandlerThread ht = null;
@@ -147,14 +167,20 @@ public final class PenBle {
                     BluetoothGattCharacteristic c = s == null ? null : s.getCharacteristic(CH_FE41);
                     res.sawFe41 = c != null;
                     if (c == null) { say(log, "no fe41"); g.disconnect(); return; }
-                    res.wakeSent = writeWake(log, g, c);
+                    if (wake) res.wakeSent = writeWake(log, g, c);
                     if (touchfilmMask >= 0) {
                         SystemClock.sleep(200);
-                        // {8,6,mask}：把笔端手势位重新打开（默认全开 0x3F）
+                        // {8,6,mask}：笔端手势功能位（双击/三击/上滑/下滑/捏合/笔尾）
                         res.touchfilmSent = writeCmd(log, g, c,
                                 new byte[]{8, 6, (byte) (touchfilmMask & 0xFF)});
                     }
-                    SystemClock.sleep(500);
+                    if (squeezeLevel >= 1) {
+                        SystemClock.sleep(200);
+                        // {8,5,level}：捏合力度 1(轻)..5(重)，对应设置里"轻捏力度"
+                        res.squeezeSent = writeCmd(log, g, c,
+                                new byte[]{8, 5, (byte) (squeezeLevel & 0xFF)});
+                    }
+                    SystemClock.sleep(400);
                     g.disconnect();
                 }
 

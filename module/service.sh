@@ -165,6 +165,8 @@ GESTURE_DOUBLE=195
 GESTURE_SLIDE_UP=196
 GESTURE_SLIDE_DOWN=197
 GESTURE_TAIL=92
+# ⑥ 把"设置 → 手写笔"里的双击开关/轻捏开关/轻捏力度实时路由给笔（1 = 开，默认）
+SETTINGS_SYNC=1
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -192,6 +194,54 @@ penring_alive() {
     kill -0 "$p" 2>/dev/null || return 1
     # 只认 cmdline 里确实是我们的二进制，防止 pid 复用
     grep -qa "penring" "/proc/$p/cmdline" 2>/dev/null
+}
+
+# ⑥ 把"设置 → 手写笔"里的开关/力度翻译成笔端命令：
+#     双击开/关   -> {8,6,mask} bit0（0x01）
+#     轻捏开/关   -> {8,6,mask} bit4（0x10）
+#     轻捏力度    -> {8,5,level}，level = stylus_pinch_pressure_adjust + 1（1 轻..5 重）
+#   上滑/下滑（bit2|3）和笔尾（bit5）由本模块的 GESTURE_* 决定，一直开着。
+#   MIUI 自己那份设置是给"小米笔"用的：它只会把阈值丢给自己的 BLE 服务，
+#   联想笔听不懂，所以得我们把等价的 ZUX 帧发过去。
+SLIDE_BITS=$(( (GESTURE_SLIDE_UP >= 0 ? 4 : 0) + (GESTURE_SLIDE_DOWN >= 0 ? 8 : 0) ))
+pen_mask=0
+pen_lvl=3
+last_mask=""
+last_lvl=""
+
+pen_sync_read() {
+    local dbl pinch adj lvl
+    dbl=$(settings get system stylus_double_click_status 2>/dev/null)
+    pinch=$(settings get system stylus_pinch_status 2>/dev/null)
+    adj=$(settings get system stylus_pinch_pressure_adjust 2>/dev/null)
+    case "$dbl"   in ''|null|*[!0-9]*) dbl=1 ;; esac     # 缺省按 MIUI 默认：双击开
+    case "$pinch" in ''|null|*[!0-9]*) pinch=5 ;; esac   # 0 = 轻捏关，其它 = 功能号（5=快捷环）
+    case "$adj"   in ''|null|*[!0-9]*) adj=2 ;; esac
+
+    pen_mask=$SLIDE_BITS
+    [ "$GESTURE_TAIL" -ge 0 ] 2>/dev/null && pen_mask=$((pen_mask | 32))
+    [ "$dbl" != "0" ]   && pen_mask=$((pen_mask | 1))
+    [ "$pinch" != "0" ] && pen_mask=$((pen_mask | 16))
+
+    lvl=$((adj + 1))
+    [ "$lvl" -gt 5 ] && lvl=5
+    [ "$lvl" -lt 1 ] && lvl=1
+    pen_lvl=$lvl
+}
+
+# 设置变了就下发（1 秒最多查一次，由 monitor 的秒级分支调用）
+sync_pen_settings() {
+    case "$SETTINGS_SYNC" in 0|false|no|off) return 0 ;; esac
+    [ -x "$PENRING_BIN" ] || return 0
+    pen_sync_read
+    if [ "$pen_mask" != "$last_mask" ] || [ "$pen_lvl" != "$last_lvl" ]; then
+        log "settings->pen mask=$pen_mask squeeze=$pen_lvl (双击=$([ $((pen_mask & 1)) -ne 0 ] && echo on || echo off) 轻捏=$([ $((pen_mask & 16)) -ne 0 ] && echo on || echo off))"
+        last_mask="$pen_mask"
+        last_lvl="$pen_lvl"
+        send_extra "$A_WAKE" "settings-sync" --ei wake 0 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
+        return 0
+    fi
+    return 1
 }
 
 penring_ensure() {
@@ -391,6 +441,18 @@ supervisor_alive() {
 
 case "$1" in
 
+--syncsettings)
+    # ⑥ 手动跑一次"设置 → 笔"同步（排障用；monitor 每 2 秒自己也会跑）
+    pen_sync_read
+    last_mask=""; last_lvl=""
+    if sync_pen_settings; then
+        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl sent"
+    else
+        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl（未下发：可能 SETTINGS_SYNC=0 或 penring 不在）"
+    fi
+    exit 0
+    ;;
+
 --stoprompen)
     # ⑥ 移植 ROM 自带的笔桥（/system/etc/init/init.lwky.rc 里的 lwky_pen =
     #    /system/lwky/penbridge_hyperos）是"老一套"：它造的是 type-1（0x1915/0xEAEA）虚拟笔，
@@ -515,7 +577,8 @@ case "$1" in
 
     if [ "$last_att" = 0 ]; then
         # 开机时笔不在线圈上：唤醒它，并同步一次 {8,6,mask} 手势位（见 detach 处说明）
-        send_extra "$A_WAKE" "startup-wake" --ei touchfilm "${TOUCHFILM:-63}"
+        pen_sync_read
+        send_extra "$A_WAKE" "startup-wake" --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
     fi
 
     while [ ! -e "$DISABLE" ]; do
@@ -524,19 +587,22 @@ case "$1" in
         if [ $((sub % PER_SEC)) -eq 0 ]; then
             tick=$((tick+1))
             now_sec=$((now_sec+1))
+            # ⑥ 每 2 秒看一次"设置→手写笔"有没有变（双击/轻捏开关、轻捏力度）
+            if [ $((tick % 2)) -eq 0 ]; then sync_pen_settings || true; fi
         fi
         att=$(read_att "$last_att")
         lvl=$(read_level)
         if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
 
-        # 取下：发唤醒，并把胶囊调度清掉。
+        # 取下：发唤醒 + 同步笔端手势位/力度，并把胶囊调度清掉。
         # **必须同时清空 shown** —— 否则下一次吸附时"新电量 == 上次显示过的值"（比如笔一直是 100%），
         # 刷新逻辑会以为"这条已经弹过了"而整次都不弹（实测：连吸 3 次只有第 1 次出胶囊）。
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
             # touchfilm=63(0x3F)：顺便把笔端触控膜功能位全开（双击/三击/上滑/下滑/捏合/笔尾）。
             # 笔重启或睡死会把这位清零 → 手势全部消失；联想原厂每次连接都重发，这里替他发。
             # 只要唤醒不改位就传 --ei touchfilm -1。
-            send_extra "$A_WAKE" "detach-wake" --ei touchfilm "${TOUCHFILM:-63}"
+            pen_sync_read
+            send_extra "$A_WAKE" "detach-wake" --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
             tick=0
             refresh_at=0
             refresh_deadline=0
