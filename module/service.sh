@@ -756,7 +756,9 @@ case "$1" in
     # 单实例：已有活着的实例就直接退出（否则会有多个实例各发一份波形、还各按自己那份代码判定）
     if [ -d "$BRUSH_LOCK" ]; then
         old=$(cat "$MODDIR/brush.pid" 2>/dev/null)
-        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+        # 必须再核对 /proc/<pid>/cmdline：重启后 pid 会被复用，只 kill -0 会误判成"已有实例"
+        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null \
+                && grep -qa "brushwatch" "/proc/$old/cmdline" 2>/dev/null; then
             log "brushwatch already running pid=$old, exit"
             exit 0
         fi
