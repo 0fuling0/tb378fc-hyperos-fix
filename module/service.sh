@@ -177,7 +177,14 @@ BRUSH=1
 BRUSH_APPS="com.miui.notes com.miui.creation"
 BRUSH_LEVEL=3
 BRUSH_FRICTION=1
-BRUSH_MAP="0:32,1:33,2:34,3:36,4:36,5:36"   # current_brush 值 -> CON 波形
+# current_brush 编号（小米创作/笔记实测）-> CON 波形
+#   1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔
+#   波形：32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 无音效版
+BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
+# 工具状态 select_state_save 取这些值时当作"橡皮"（UI 里选橡皮时 current_brush 不变）
+# 用一个新值就把它加进来，多个用空格分隔
+BRUSH_ERASER_STATES=""
+BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
@@ -332,31 +339,62 @@ brush_diff() {
     echo "$out"
 }
 
+# 读工具状态：current_brush / select_state_save / ai_type / current_ai_brush
+brush_tool_sig() {
+    local f="$1" k out=""
+    for k in $BRUSH_STATE_KEYS; do
+        out="$out$k=$(sed -n "s/.*name=\"$k\" value=\"\([^\"]*\)\".*/\1/p" "$f" 2>/dev/null | head -1) "
+    done
+    echo "$out"
+}
+
+brush_tool_val() {
+    echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
+}
+
+# 判断该发哪个波形：橡皮状态 > current_brush > select_state_save
+brush_decide_wave() {
+    local sig="$1" cur sel st
+    cur=$(brush_tool_val "$sig" current_brush)
+    sel=$(brush_tool_val "$sig" select_state_save)
+    for st in $BRUSH_ERASER_STATES; do
+        [ "$sel" = "$st" ] && { echo "$BRUSH_ERASER"; return 0; }
+    done
+    if [ -n "$cur" ]; then
+        st=$(brush_wave_of "$cur")
+        [ -n "$st" ] && { echo "$st"; return 0; }
+    fi
+    for st in $BRUSH_ERASER_STATES; do
+        [ "$cur" = "$st" ] && { echo "$BRUSH_ERASER"; return 0; }
+    done
+    if [ -n "$sel" ]; then
+        st=$(brush_wave_of "$sel")
+        [ -n "$st" ] && { echo "$st"; return 0; }
+    fi
+    echo ""
+}
+
 brush_poll_loop() {
-    local pkg f v wave sent="" fg miss=0 snap="" prev="" changed lastflast last
+    local pkg f v wave sent="" fg miss=0 sig="" last_sig lastflast
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
         for pkg in $BRUSH_APPS; do
             f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
             [ -r "$f" ] || continue
-            v=$(sed -n 's/.*name="current_brush" value="\([0-9][0-9]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
-            [ -n "$v" ] || continue
+            sig=$(brush_tool_sig "$f")
             lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
-            last=$(cat "$lastf" 2>/dev/null)
-            if [ "$v" != "$last" ]; then
-                wave=$(brush_wave_of "$v")
-                snap=$(brush_snapshot "$f")
-                changed=$(brush_diff "$prev" "$snap")
-                prev="$snap"
-                echo "$v" > "$lastf"
+            last_sig=$(cat "$lastf" 2>/dev/null)
+            if [ "$sig" != "$last_sig" ]; then
+                wave=$(brush_decide_wave "$sig")
+                echo "$sig" > "$lastf"
                 fg=$(pen_fg)
                 if ! brush_is_fg "$fg"; then
-                    brush_log "$pkg current_brush=$v -> wave=${wave:-未映射} (变化: ${changed:-无}) 但前台是 ${fg:-?}，先不发"
+                    brush_log "$pkg 工具状态变了 [$sig] -> wave=${wave:-未映射} 但前台是 ${fg:-?}，先不发"
                     continue
                 fi
-                brush_log "$pkg current_brush=$v -> wave=${wave:-未映射} (变化: ${changed:-无}) fg=$fg"
+                brush_log "$pkg 工具状态 [$sig] -> wave=${wave:-未映射} fg=$fg"
                 if [ -n "$wave" ] && [ "$sent" != "$wave" ]; then
                     sent="$wave"
-                    brush_send "$wave" "$pkg current_brush=$v"
+                    brush_send "$wave" "$pkg $sig"
                 fi
             fi
         done
