@@ -3,8 +3,7 @@
 #
 #   ./build.sh              构建 PenBridge.apk + penring（手势桥），并用仓库里现成的 payload 打包
 #   ./build.sh --payload    额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
-#   ./build.sh --hook       额外构建 extras/PenStylusHook（LSPosed，v3.0 模块不含）
-#   ./build.sh --all        --payload + --hook
+#   ./build.sh --all        --payload（LSPosed 部分已并入 PenBridge，见 app/PenBridge）
 #   ./build.sh --clean      删掉 out/ 与各构建中间目录
 #
 # 产物
@@ -21,15 +20,12 @@ SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}}"
 export ANDROID_SDK_ROOT="$SDK"
 
 DO_PAYLOAD=0
-DO_HOOK=0
 for a in "$@"; do
   case "$a" in
     --payload) DO_PAYLOAD=1 ;;
-    --hook)    DO_HOOK=1 ;;
-    --all)     DO_PAYLOAD=1; DO_HOOK=1 ;;
+    --all)     DO_PAYLOAD=1 ;;
     --clean)
-      rm -rf "$OUT" "$HERE/app/PenBridge/build" "$HERE/app/PenBridge/PenBridge.apk" \
-             "$HERE/extras/PenStylusHook/build" "$HERE/extras/PenStylusHook/PenStylusHook.apk"
+      rm -rf "$OUT" "$HERE/app/PenBridge/build" "$HERE/app/PenBridge/PenBridge.apk"
       echo "cleaned"; exit 0 ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "未知参数: $a（-h 看用法）" >&2; exit 2 ;;
@@ -85,16 +81,9 @@ pack() {
   unzip -l "$zip"
 }
 
-# ---------- ④ 可选 hook ----------
-build_hook() {
-  echo "== [extra] PenStylusHook.apk（LSPosed，v3.0 模块不含）"
-  bash "$HERE/extras/PenStylusHook/build.sh"
-}
-
 build_app
 build_penring
 [ "$DO_PAYLOAD" = 1 ] && build_payload
-[ "$DO_HOOK" = 1 ] && build_hook
 pack
 
 echo

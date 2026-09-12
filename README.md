@@ -64,8 +64,6 @@ tb378fc-hyperos-fix/
 ├── payload-src/
 │   ├── PowerKeeper-stock.apk    # 移植包**原厂** APK（补丁输入，来自 system_ext/app/PowerKeeper）
 │   └── repack_payload.py        # 把打好补丁的 dex 塞回 APK（保持 stored + 原条目元数据）
-├── extras/PenStylusHook/        # 【可选，v3.0 模块不含】LSPosed：让系统读到笔电量
-│   ├── src/…/PenStylusHook.java # hook BatteryController#getBluetoothDevice
 │   ├── stub-patches/            # Xposed API 编译桩（d8 时过滤掉）
 │   └── build.sh
 └── out/                         # 构建产物：<id>-v<version>.zip
@@ -81,7 +79,6 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 ```bash
 ./build.sh              # 只构建 PenBridge.apk + 打包（payload 用仓库里现成的那份）
 ./build.sh --payload    # 额外从 payload-src/PowerKeeper-stock.apk 重建 payload
-./build.sh --hook       # 额外构建 extras/PenStylusHook
 ./build.sh --all        # 上面两个都做
 ./build.sh --clean
 ```
@@ -90,7 +87,6 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 
 ```
 app/PenBridge/PenBridge.apk              （同时拷进 module/bin/）
-extras/PenStylusHook/PenStylusHook.apk   （--hook）
 out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 的内容）
 ```
 
@@ -164,7 +160,6 @@ adb shell am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
   那是本机默认的坏状态，不是卸载模块的人想要的结果）。要恢复见 `module/uninstall.sh` 末尾的提示。
 - ③ 停掉的只是**开机后**由 init 拉起的监视器（`dynbpfloader`）；开机期 `hyper_bpfloader`
   本体加载的约 50 个 BPF 不受影响。
-- `extras/PenStylusHook` 需要手动在 LSPosed 里启用并勾选作用域「系统框架」，模块本身无法自动写
   LSPosed 数据库（`app_process` 的 linker namespace 里没有 `libandroidicu.so`）。
 
 ---

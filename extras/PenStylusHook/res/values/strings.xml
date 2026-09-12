@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">联想笔电量通路</string>
-    <string name="module_description">把 system_server 里 NVTCapacitivePen 数字板与联想蓝牙笔关联起来，让系统能读到这支笔的电量（低电量提醒等原生能力）。</string>
-</resources>

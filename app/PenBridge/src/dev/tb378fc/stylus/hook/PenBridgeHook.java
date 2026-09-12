@@ -67,7 +67,6 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
 
         hookToolType(lpparam);
         hookStylusState(lpparam);
-        hookPostureFacade(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
@@ -83,12 +82,8 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             int orig = (Integer) param.getResult();
-                            // 前 10 次无条件记（判断 App 到底调不调 Java 层 getToolType），
-                            // 之后只在"不是 STYLUS"时记（2=STYLUS 4=ERASER 1=FINGER 0=UNKNOWN）
-                            if (sToolLogs < 10) {
-                                sToolLogs++;
-                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
-                            } else if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 30) {
+                            // 只在"框架报的不是 STYLUS"时记一条（排查用；2=STYLUS 4=ERASER）
+                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 5) {
                                 sToolLogs++;
                                 Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
                             }
@@ -112,12 +107,11 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
      *     顺便打日志（前若干次 + 笔尾按下时）以便校准：能看出 touchType 到底是什么。
      */
     private static int sStateLogs = 0;
-    /** 是否强制改写 eraser 布尔：默认关！
+    /** 是否强制改写 eraser 布尔：默认关（实测会破坏 App 绘制管线）
      *  实测强制打开会破坏 App 的绘制管线（笔尾滑动既不画也不擦、抬手才按轨迹补一笔），
      *  因为 isEraser 要与"橡皮端的坐标/几何"配套，光改标志位状态机就错乱了。
      *  这里保留开关，等找到上游 producer（真正的橡皮判定）再用。 */
     private static final boolean FORCE_ERASER = false;
-    private static int sStackLogs = 0;
     private static int sToolLogs = 0;
     private void hookStylusState(XC_LoadPackage.LoadPackageParam lp) {
         // 注意：真实类名里有希腊字母 ι（U+03B9），jadx 输出到文件名时会变成 ASCII 的 "I"
@@ -144,11 +138,6 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                                         + " int9=" + a[8] + " bool10=" + a[9]
                                         + " tail=" + sTailDown);
                             }
-                            // 前几次打印调用栈：找出"谁"在构造它（那里才是真正的橡皮判定）
-                            if (sStackLogs < 3) {
-                                sStackLogs++;
-                                Log.i(TAG, "I11lii producer stack:", new Throwable());
-                            }
                             if (FORCE_ERASER && sTailDown) {
                                 a[6] = Boolean.TRUE;
                                 a[9] = Boolean.TRUE;
@@ -161,39 +150,6 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
             }
         }
         Log.i(TAG, "hook fc.I11lii ok");
-    }
-
-    /**
-     * 1c) App 的"姿态门面"：`l1Ilili.I11IIil` 有三个方法（getDegree / setPreviewBrush /
-     *     Iiliill(MotionEvent)），姿态桥 p240lii1II.I11lii 就是通过它拿姿态/判断是否橡皮。
-     *     这里只**记录**：进来的 MotionEvent 工具类型 + 返回值，用来看 App 自己怎么算的。
-     */
-    private static int sFacadeLogs = 0;
-    private void hookPostureFacade(XC_LoadPackage.LoadPackageParam lp) {
-        final Class<?> cls = XposedHelpers.findClassIfExists("l1Ilili.I11IIil", lp.classLoader);
-        if (cls == null) { Log.i(TAG, "l1Ilili.I11IIil 不存在"); return; }
-        for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
-            if (m.getParameterTypes().length != 1) continue;
-            if (!m.getParameterTypes()[0].getName().equals("android.view.MotionEvent")) continue;
-            try {
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) {
-                        try {
-                            if (sFacadeLogs >= 20) return;
-                            sFacadeLogs++;
-                            MotionEvent ev = (MotionEvent) p.args[0];
-                            int tool = ev == null ? -1 : ev.getToolType(0);
-                            Log.i(TAG, "posture facade " + p.method.getName()
-                                    + " tool=" + tool + " action=" + (ev == null ? -1 : ev.getAction())
-                                    + " -> " + p.getResult() + " tail=" + sTailDown);
-                        } catch (Throwable ignored) { }
-                    }
-                });
-                Log.i(TAG, "hook posture facade " + m.getName() + " ok");
-            } catch (Throwable t) {
-                Log.w(TAG, "hook posture facade failed", t);
-            }
-        }
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */
