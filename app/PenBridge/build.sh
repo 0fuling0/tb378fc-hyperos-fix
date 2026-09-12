@@ -37,14 +37,14 @@ STUB="$HERE/stub-patches"
 if [ -d "$STUB" ]; then
   echo "== javac (Xposed 桩：编译用，不进 dex)"
   mkdir -p "$OUT/stub"
-  javac -nowarn -classpath "$AJ" -d "$OUT/stub" $(find "$STUB" -name '*.java')
+  javac -nowarn -encoding UTF-8 -classpath "$AJ" -d "$OUT/stub" $(find "$STUB" -name '*.java')
   STUB_CP="$OUT/stub:"
 else
   STUB_CP=""
 fi
 
 echo "== javac"
-javac -nowarn -classpath "$AJ:$STUB_CP$OUT/gen" -d "$OUT/classes" \
+javac -nowarn -encoding UTF-8 -classpath "$AJ:$STUB_CP$OUT/gen" -d "$OUT/classes" \
   $(find "$HERE/src" -name '*.java') $(find "$OUT/gen" -name '*.java')
 
 echo "== d8（过滤掉 de/robv/android/xposed 桩）"

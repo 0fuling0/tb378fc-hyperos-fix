@@ -66,6 +66,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
         hookToolType(lpparam);
+        hookStylusState(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
@@ -91,6 +92,53 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             Log.e(TAG, "hook getToolType failed", t);
         }
+    }
+
+    /**
+     * 1b) 小米创作/笔记的"笔状态"数据类 `fc.I11lii`：
+     *     混淆后字段名不可读，但它的 toString 里能对上 isEraser / isTouchEraser / postureDegree，
+     *     构造参数里还有 `gc.Iiliill touchType`（工具类型枚举，常量名也是混淆的）。
+     *     笔尾在感应范围内时，把这个对象的两个 eraser 布尔强制为 true —— App 的橡皮逻辑就会生效。
+     *     顺便打日志（前若干次 + 笔尾按下时）以便校准：能看出 touchType 到底是什么。
+     */
+    private static int sStateLogs = 0;
+    private void hookStylusState(XC_LoadPackage.LoadPackageParam lp) {
+        // 注意：真实类名里有希腊字母 ι（U+03B9），jadx 输出到文件名时会变成 ASCII 的 "I"
+        Class<?> cls = null;
+        String hit = null;
+        for (String name : new String[]{"fc.I\u03b911lii", "fc.I11lii"}) {
+            cls = XposedHelpers.findClassIfExists(name, lp.classLoader);
+            if (cls != null) { hit = name; break; }
+        }
+        if (cls == null) { Log.i(TAG, "fc.I\u03b911lii 不存在（版本不同？）"); return; }
+        Log.i(TAG, "找到笔状态类 " + hit);
+        for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
+            try {
+                XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Object[] a = p.args;
+                            if (a == null || a.length < 10) return;
+                            boolean logIt = sTailDown || sStateLogs < 5;
+                            if (logIt) {
+                                sStateLogs++;
+                                Log.i(TAG, "I11lii ctor touchType=" + a[5]
+                                        + " bool7=" + a[6] + " posture=" + a[7]
+                                        + " int9=" + a[8] + " bool10=" + a[9]
+                                        + " tail=" + sTailDown);
+                            }
+                            if (sTailDown) {
+                                a[6] = Boolean.TRUE;   // isEraser / isTouchEraser 之一
+                                a[9] = Boolean.TRUE;   // 另一个
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+            } catch (Throwable t) {
+                Log.w(TAG, "hook I11lii ctor failed", t);
+            }
+        }
+        Log.i(TAG, "hook fc.I11lii ok");
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */

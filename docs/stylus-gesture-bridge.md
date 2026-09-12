@@ -127,7 +127,53 @@ settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
 
 （`lwky_touchfeature` 那个假 HAL **不要停**：MIUI 的 `ITouchFeature.setTouchMode()` 需要它返回成功。）
 
-## 6. 构建 / 安装 / 自检
+## 6. 笔尾 = 橡皮：在 App 里挂钩子（LSPosed）
+
+**问题**：翻到橡皮端时，小米笔记/小米创作**不会自己把工具切成橡皮**（也就没有"翻回来变笔刷"）。
+我们这边是好的（`penring` 读 `BTN_TOOL_RUBBER`、波形 35 ↔ 当前笔刷），缺的是"App 自己也认"。
+
+**为什么 App 不认**：它不看 `MotionEvent.getToolType()`（我们覆盖成 `TOOL_TYPE_ERASER` 它也不理），
+而是用**自己的笔状态对象** + MIUI 的笔状态。证据：
+
+| 发现 | 证据 |
+|---|---|
+| App 混淆，笔状态类 `fc.Iι11lii`（真实类名带希腊字母 ι U+03B9） | `dexdump`: `'Lfc/Iι11lii;'`；字段名如 `f2860I11IIil` |
+| 它的 `toString` 能对上语义 | `, isEraser=` / `, isTouchEraser=` / `, postureDegree=` |
+| 构造参数含工具枚举 `gc.Iiliill touchType`（常量名混淆，但 **toString 可读**） | 运行时 `I11lii ctor touchType=TOUCH_MOVE …` |
+| 该构造器**每个笔事件都调用** | 按下时日志每几十毫秒一条 → 改写即时生效 |
+
+### 定位方法（可复现）
+
+1. `unzip -l Creation.apk` 列 `classes*.dex`，**逐个** `unzip -p` 抽出 ——
+   别用 `unzip -p "classes*.dex"`（会把多个 dex 拼成一个，`dexdump` 只读第一个；`isEraser` 在 classes4）
+2. 逐 dex `strings | grep -cE "isEraser|MiuiStylusPosture"` 命中 classes2/classes4
+3. `dexdump -d <dex> | awk '/Class descriptor/{c=$4} /isEraser/{print c; exit}'`
+4. `jadx --single-class <类>` 看逻辑。
+   **坑**：jadx 会把希腊字母转成 ASCII 写文件名（`Iι11lii` → `I11lii.java`），照抄文件名 `findClass` 找不到类；
+   Java 里要写 `"fc.I\u03b911lii"`（`build.sh` 的 javac 已加 `-encoding UTF-8`）。
+
+### 实现（`PenBridgeHook`）
+
+1. `MotionEvent.getToolType(int)` → 笔尾在范围内返回 `TOOL_TYPE_ERASER`（第一层保险）
+2. `fc.Iι11lii` 的**所有构造器** → 笔尾在范围内把两个 eraser 布尔（第 7、10 个参数）置 `true`
+3. 日志（前 5 次 + 笔尾按下时）：`I11lii ctor touchType=.. bool7=.. posture=.. int9=.. bool10=.. tail=..`
+
+作用域 `com.miui.notes` / `com.miui.creation`；改完需 **LSPosed 启用 + 重启这两个 App**。
+
+### 验证 / 继续调
+
+```bash
+adb logcat -s PenBridgeHook:*
+#   tail receiver registered / tail=true -> TOOL_TYPE_ERASER
+#   找到笔状态类 fc.Iι11lii / hook fc.I11lii ok
+#   I11lii ctor touchType=TOUCH_MOVE … tail=true
+adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/brush.log'   # wave=35 / tip back
+```
+
+若 App 仍不切：日志里的 `touchType=` 就是它的工具枚举 —— 找出橡皮那个常量并改成强制 `touchType`；
+再不行就往上找 producer（谁构造 `fc.Iι11lii`）hook 它的判定点。
+
+## 7. 构建 / 安装 / 自检
 
 ```bash
 ./build.sh                 # 会同时构建 PenBridge.apk 与 bin/penring
