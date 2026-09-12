@@ -71,3 +71,24 @@ GESTURE_TAIL=92
 #                  联想笔听不懂，所以由守护每 2 秒核对一次、变了就发等价帧。
 #                  0 = 只按上面的固定映射下发，不跟随设置。
 SETTINGS_SYNC=1
+
+# ---------------------------------------------------------------- ⑦ 笔刷触感（跟随 App 的笔刷）
+# 读笔记/小米创作的 current_brush（root 可读的 prefs），切一次发一次 CON 波形；
+# 笔尾（BTN_TOOL_RUBBER）靠近发 BRUSH_ERASER、离开恢复当前笔刷；
+# 只有 LSPosed hook 报 canvas=1（编辑器 Activity 且无弹窗）时才发波形。
+BRUSH=1
+BRUSH_APPS="com.miui.notes com.miui.creation"
+BRUSH_LEVEL=3
+BRUSH_FRICTION=1
+# current_brush 编号 -> CON 波形（实测：1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔）
+# 波形：32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 无音效版
+BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
+# 认不出的编号（这一版 App 已没有 AI 笔/框选笔）统一用这个波形
+BRUSH_DEFAULT_WAVE=36
+# 笔尾（橡皮端）靠近时用的波形
+BRUSH_ERASER=35
+# 工具状态 select_state_save 取这些值时也算橡皮（UI 里选橡皮时 current_brush 不变）
+BRUSH_ERASER_STATES="7"
+BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
+# 退出应用/离开画布后自动停波形
+BRUSH_EXIT_CHECK=1

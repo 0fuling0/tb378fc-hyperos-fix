@@ -190,9 +190,8 @@ BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
 BRUSH_ERASER_STATES=""
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
-BRUSH_AI_WAVE=36                             # AI 笔刷（current_ai_brush=true）用的波形
-BRUSH_LASSO_STATES=""                        # 框选笔的 select_state_save 值（看日志填）
-BRUSH_LASSO_WAVE=36                          # 框选笔用的波形
+# 这一版 App 里已经没有 AI 笔/框选笔了；认不出的编号统一用这个波形
+BRUSH_DEFAULT_WAVE=36
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
@@ -329,20 +328,12 @@ brush_decide_wave() {
         [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
         [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
     done
-    for w in $BRUSH_LASSO_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
-    done
     w=$(brush_wave_of "$cur")
     [ -n "$w" ] && { echo "$w"; return 0; }
-    if [ "$(brush_tool_val "$sig" current_ai_brush)" = "true" ]; then
-        echo "$BRUSH_AI_WAVE"; return 0
-    fi
     w=$(brush_wave_of "$sel")
     [ -n "$w" ] && { echo "$w"; return 0; }
-    if [ "$(brush_tool_val "$sig" ai_type)" != "0" ] && [ -n "$(brush_tool_val "$sig" ai_type)" ]; then
-        echo "$BRUSH_AI_WAVE"; return 0
-    fi
-    echo ""
+    # 这一版没有 AI 笔/框选笔，认不出的编号一律回落到联想笔刷(36)，别再"未映射"
+    echo "$BRUSH_DEFAULT_WAVE"
 }
 
 brush_now()  { cat "$BRUSH_STATE" 2>/dev/null; }

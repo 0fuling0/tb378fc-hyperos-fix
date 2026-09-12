@@ -51,6 +51,8 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     private static volatile boolean sTailDown = false;
     /** 当前 App 是否处于"可以写字"的状态（前台 + 没有弹窗/面板） */
     private static volatile boolean sCanvas = false;
+    /** 当前 Activity 是不是编辑器/画布（只有它算"可写"，首页/列表一律禁） */
+    private static volatile boolean sEditorActivity = false;
     private static volatile Context sApp;
     private static int sDialogs = 0;
     private static int sPopups = 0;
@@ -100,15 +102,16 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                     try { sApp = ((Activity) a).getApplicationContext(); } catch (Throwable ignored) { }
                     tryRegisterReceiver();
                     String cls = a == null ? "?" : a.getClass().getName();
-                    boolean editor = isEditorActivity(cls);
-                    Log.i(TAG, "resume " + cls + " -> canvas=" + editor);
-                    updateCanvas(editor, "resume " + cls);
+                    sEditorActivity = isEditorActivity(cls);
+                    Log.i(TAG, "resume " + cls + " editor=" + sEditorActivity);
+                    recomputeCanvas("resume " + cls);
                 }
             });
             XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     // 切 Activity 时先按"离开画布"处理；紧接着的 onResume 会按新 Activity 修正
-                    updateCanvas(false, "activity pause");
+                    sEditorActivity = false;
+                    recomputeCanvas("activity pause");
                 }
             });
         } catch (Throwable t) {
@@ -118,13 +121,14 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Dialog.class, "show", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     sDialogs++;
-                    updateCanvas(false, "dialog show");
+                    recomputeCanvas("dialog show");
                 }
             });
             XposedHelpers.findAndHookMethod(Dialog.class, "dismiss", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     if (sDialogs > 0) sDialogs--;
-                    updateCanvas(sDialogs == 0 && sPopups == 0, "dialog dismiss");
+                    // 注意：不能无脑 canvas=true —— 弹窗关掉时当前 Activity 可能早就不是编辑器了
+                    recomputeCanvas("dialog dismiss");
                 }
             });
         } catch (Throwable t) {
@@ -135,7 +139,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                     "android.view.View", int.class, int.class, int.class, new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam p) {
                             sPopups++;
-                            updateCanvas(false, "popup show");
+                            recomputeCanvas("popup show");
                         }
                     });
             XposedHelpers.findAndHookMethod(PopupWindow.class, "dismiss", new XC_MethodHook() {
@@ -147,6 +151,13 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             Log.e(TAG, "hook popup failed", t);
         }
+    }
+
+    /** 状态机唯一出口：画布可写 = 当前是编辑器 Activity 且没有弹窗/面板 */
+    private static void recomputeCanvas(String why) {
+        boolean canvas = sEditorActivity && sDialogs == 0 && sPopups == 0;
+        updateCanvas(canvas, why + " [editor=" + sEditorActivity
+                + " dialogs=" + sDialogs + " popups=" + sPopups + "]");
     }
 
     /**
@@ -202,7 +213,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                             updateCanvas(sCanvas, "tail change");
                         }
                     } else if (ACTION_FORCE_FOCUS.equals(a)) {
-                        updateCanvas(intent.getIntExtra("canvas", 0) != 0, "forced");
+                        recomputeCanvas("forced");
                     }
                 }
             };
