@@ -366,6 +366,58 @@ brush_decide_wave() {
 }
 
 # 应用里的工具换了：更新基准；不在橡皮态就立刻切过去
+brush_now()   { cat "$BRUSH_STATE" 2>/dev/null; }
+brush_base()  { cat "$BRUSH_BASE" 2>/dev/null; }
+brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
+
+# 画布是否可写（hook 写的 penstate；优先读"前台那个 App"的文件，避免读到另一边的旧状态）
+brush_canvas() {
+    local f v fg order
+    fg=$(cat "$MODDIR/brush.fg" 2>/dev/null)
+    order="$PENSTATE_LIST"
+    case "$fg" in
+        com.miui.notes)    order="/data/data/com.miui.notes/files/penstate $PENSTATE_LIST" ;;
+        com.miui.creation) order="/data/data/com.miui.creation/files/penstate $PENSTATE_LIST" ;;
+    esac
+    for f in $order; do
+        v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
+        [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
+    done
+    return 0
+}
+
+# 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
+brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.stylus.TAIL --ei down "$1" >/dev/null 2>&1 & }
+
+# $1 波形（0 = 停）；$2 原因；$3 非空表示"这是当前笔刷的基准波形"
+brush_send() {
+    local wave="$1" why="$2" setbase="$3" now tailin
+    [ -n "$wave" ] || return 0
+    now=$(brush_now)
+    tailin=$(cat "$BRUSH_TAIL" 2>/dev/null)
+    brush_log "send? wave=$wave now=${now:-空} base=$([ -n "$setbase" ] && echo yes || echo no) tail=${tailin:-0} why=$why"
+
+    if [ "$wave" = "0" ]; then
+        # 停止帧无条件发：本地记录可能是空的（守护重启过），但笔里可能还 latch 着波形
+        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0 \
+            --ei friction "$BRUSH_FRICTION" --ei ms 80
+        : > "$BRUSH_STATE"
+        brush_log "stop ($why)"
+        return 0
+    fi
+
+    [ -n "$setbase" ] && echo "$wave" > "$BRUSH_BASE"
+    if [ -z "$setbase" ] && ! brush_canvas; then
+        brush_log "skip wave=$wave ($why)：画布未聚焦"
+        return 0
+    fi
+    [ "$wave" = "$now" ] && return 0
+    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave" \
+        --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
+    echo "$wave" > "$BRUSH_STATE"
+    brush_log "wave=$wave ($why)"
+}
+
 brush_on_tool_change() {
     local pkg="$1" sig="$2" wave
     echo "$pkg" > "$MODDIR/brush.fg"
