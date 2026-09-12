@@ -386,14 +386,18 @@ brush_exit_check() {
     local fg
     [ -n "$(brush_now)" ] || return 0
     case "$BRUSH_EXIT_CHECK" in 0|false|no|off) return 0 ;; esac
+    # hook 说画布还在（canvas=1）就别停 —— 这条比 dumpsys 可靠
+    if brush_canvas; then BRUSH_MISS=0; return 0; fi
     fg=$(pen_fg)
+    # dumpsys 偶尔拿不到前台包（空串），这种情况不计入"离开"，否则会误杀波形
+    [ -n "$fg" ] || return 0
     if brush_is_fg "$fg"; then
         BRUSH_MISS=0
         return 0
     fi
     BRUSH_MISS=$((BRUSH_MISS+1))
-    if [ "$BRUSH_MISS" -ge 2 ]; then
-        brush_send 0 "app left (${fg:-?})"
+    if [ "$BRUSH_MISS" -ge 3 ]; then
+        brush_send 0 "app left ($fg)"
         BRUSH_MISS=0
         : > "$BRUSH_BASE"
     fi
@@ -450,6 +454,8 @@ brush_watch_loop() {
                             */com.miui.creation/*) pkg=com.miui.creation ;;
                             *) pkg="" ;;
                         esac
+                        fg=$(pen_fg)
+                        [ -n "$fg" ] && echo "$fg" > "$MODDIR/brush.fg"
                         [ -n "$pkg" ] && brush_scan_one "$pkg"
                         case "$line" in
                             *" penstate")
