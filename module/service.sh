@@ -479,12 +479,10 @@ brush_watch_loop() {
                             *" penstate")
                                 if brush_canvas; then
                                     brush_tell_hooks "$(brush_tail_in && echo 1 || echo 0)"
-                                    if [ -n "$(brush_base)" ]; then
-                                        brush_send "$(brush_base)" "canvas focused"
-                                    else
-                                        # 启动后第一次拿到画布：先看看现在选的是哪支笔
-                                        brush_scan_apps
-                                    fi
+                                    # 每次进入画布都重扫一遍（不同笔记本可能记着不同笔刷），
+                                    # 然后按当前笔刷下发波形
+                                    brush_scan_apps
+                                    [ -n "$(brush_base)" ] && brush_send "$(brush_base)" "canvas focused"
                                 else
                                     brush_send 0 "canvas lost"
                                 fi ;;

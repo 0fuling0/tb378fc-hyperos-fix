@@ -96,13 +96,18 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
-                    try { sApp = ((Activity) p.thisObject).getApplicationContext(); } catch (Throwable ignored) { }
+                    Object a = p.thisObject;
+                    try { sApp = ((Activity) a).getApplicationContext(); } catch (Throwable ignored) { }
                     tryRegisterReceiver();
-                    updateCanvas(true, "activity resume");
+                    String cls = a == null ? "?" : a.getClass().getName();
+                    boolean editor = isEditorActivity(cls);
+                    Log.i(TAG, "resume " + cls + " -> canvas=" + editor);
+                    updateCanvas(editor, "resume " + cls);
                 }
             });
             XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    // 切 Activity 时先按"离开画布"处理；紧接着的 onResume 会按新 Activity 修正
                     updateCanvas(false, "activity pause");
                 }
             });
@@ -142,6 +147,20 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             Log.e(TAG, "hook popup failed", t);
         }
+    }
+
+    /**
+     * 只有真正的编辑器/画布 Activity 才算"可写"。
+     * 首页/列表/设置页不算 —— 否则一进 App 就振，而真正进画布时状态没变反而不振
+     * （用户实测：进画布第一次不振、画布外反而振）。
+     * 类名里带 Edit / Canvas / Draw / Paint / Note 的都当画布，日志会把实际类名打出来便于校准。
+     */
+    private static boolean isEditorActivity(String cls) {
+        if (cls == null) return false;
+        if (cls.contains("Setting") || cls.contains("Home") || cls.contains("Main")
+                || cls.contains("List") || cls.contains("Launcher")) return false;
+        return cls.contains("Edit") || cls.contains("Canvas") || cls.contains("Draw")
+                || cls.contains("Paint") || cls.contains("Note");
     }
 
     /** 把"可写/不可写"写进 files/penstate，根侧守护（root）读它决定要不要继续发波形 */
