@@ -182,6 +182,21 @@ adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/brush.log'   # wave=3
    `ud.lιIil11` → `he.ll1ιι11i` → …（同样混淆）。要读 `ud.lιIil11` 看它怎么算出 `isEraser`
    （大概是从 MIUI 的笔状态/InputDevice 读的），然后**只钩那个来源**。
 
+
+### 最终结论（2026-09-13）：App 的橡皮判定在 native，Java hook 修不了
+
+- 决定性实测：`MotionEvent.getToolType()` 改成"前 10 次无条件记录"后，用笔尖碰屏 + 翻笔尾
+  → **一条日志都没有** ⇒ App 不调 Java 层，native 直接读 NDK 事件数据
+- 上游链路：`ud.lIil11.m15546I111ll(..., boolean z /*eraser*/, ...)` ←
+  `p240lii1II.I11lii`（TAG=`MiuiStylusPosture`）← 门面 `l1Ilili.I11IIil`
+  （`getDegree`/`setPreviewBrush`/`Iiliill(MotionEvent)`）+ `xc.engine.cbridge.SStore`（native）
+- 排除项：日志里 `StylusModule.onUpdateToolType … tool type = 0` 是 **GBoard** 的，不是笔记/创作
+- 因此剩下两条路：
+  1. 给 MIUI 姿态通道喂真数据 —— 改我们自己的假 HAL `/system/lwky/touchfeature_hal.jar`，
+     实现 `ITouchFeature.registerCallback` → `onTouchModeChanged`（mode `20036` 姿态）；
+     需要逆向 modeData 的字节布局，工作量中高、成功率不确定
+  2. 接受现状：**笔端手感**跟着笔尾切（35 ↔ 当前笔刷，已实测），但 **App 工具图标不会自动切**
+
 ## 7. 构建 / 安装 / 自检
 
 ```bash
