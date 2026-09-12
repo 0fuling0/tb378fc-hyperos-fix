@@ -105,15 +105,16 @@ out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 
 
 ### ⑤ 胶囊：触发方法与参数（详版见 docs/native-stylus-capsule.md）
 
-触发链（v3.1 快路径，实测总延迟 ~0.5s）：
+触发链（v3.1 快路径，实测"笔放上去 → 胶囊出现"里只有 ~0.3s 是软件）：
 
 ```
-wls_tx/attached 0->1（吸附）
-  └─ service.sh --monitor：POLL_MS=200 轮询（内建 read），立刻读 wls_tx/level
-       └─ 守护直发 am broadcast … STYLUS_STATE_SOC（battery=<线圈值> state=4 connect=5）
-            → com.miui.securitycore/…MiuiStylusReceiver → 原生胶囊立刻出现
-       └─ 再转发 ATTACH(battery=-1, coil=<线圈值>) 给 PenBridge
-            └─ GATT(0x180F/0x2A19) 读真值，不同才补一条校正
+wls_tx 边沿（POLL_MS=200 轮询，内建 read）
+  ├─ 边沿 A：level 1..100 -> 0（线圈刚启动，比 attached 早 ~2s）
+  │     └─ CAPSULE_FAST=1：先用上一次的线圈电量弹一条（~0.2s 出胶囊），2s 后拿新值刷新
+  └─ 边沿 B：attached 0 -> 1（硬件握手完成）
+  └─ 两条边都：守护直发 am broadcast … STYLUS_STATE_SOC（battery/state=4/connect=5）
+        → com.miui.securitycore/…MiuiStylusReceiver → 原生胶囊（实测 +0.3s 内出现）
+     并转发 ATTACH(battery=-1, coil=<已显示值>) 给 PenBridge 做兜底校正
 ```
 
 发往 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：
@@ -133,7 +134,8 @@ wls_tx/attached 0->1（吸附）
 |---|---|---|
 | `POLL_MS` | `200` | 吸附检测轮询间隔，决定"吸上去多久才弹"（第一版 `sleep 1`+`sleep 2` ≈ 3s，现在 ~0.5s） |
 | `CAPSULE_DIRECT` | `1` | 守护直发原生广播，省掉"叫醒 App 进程"一跳 |
-| `CAPSULE_GATT` | `1` | 直发后再用 GATT 读真值，**不同**才补弹一条校正 |
+| `CAPSULE_GATT` | `1` | 直发后再用系统 API / GATT 读真值，**不同**才补弹一条校正 |
+| `CAPSULE_FAST` | `1` | 边沿一到就用上次的线圈电量先弹（~0.2s），1~2s 后刷新为新值；`0` = 等本次真值（慢 1~2s） |
 
 手动验证（绕过守护直接弹）：
 

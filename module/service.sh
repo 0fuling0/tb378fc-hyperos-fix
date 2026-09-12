@@ -145,6 +145,9 @@ POLL_MS=200
 CAPSULE_DIRECT=1
 # 1 = 直发之后，再让 PenBridge 走 GATT 读一次真电量，不同则补一条校正
 CAPSULE_GATT=1
+# 1（默认）= 边沿一到就先用**上一次的线圈电量**弹一条（~0.2s 出胶囊），1~2 秒后拿新值刷新；
+# 0 = 不抢跑，等线圈报出新值再弹（慢 1~2 秒，但第一眼就是本次的电量）
+CAPSULE_FAST=1
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -164,6 +167,10 @@ capsule_direct() {
 
 capsule_gatt() {
     case "$CAPSULE_GATT" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+capsule_fast() {
+    case "$CAPSULE_FAST" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
 }
 
 # 轮询间隔：把 POLL_MS 变成 sleep 的参数 + tick 折算（tick 仍按秒，供 REFRESH/日志轮转用）
@@ -236,48 +243,46 @@ prepare_stylus_settings() {
     fi
 }
 
-# ⑤ 吸附边沿：把线圈读到的笔电量/充电状态交给 PenBridge，由它去发
-#    com.android.settings.stylus.STYLUS_STATE_SOC（参数语义见 docs/native-stylus-capsule.md）。
-#    battery 非法（非 0..100）时传 -1，让 App 自己走 GATT 读。
-# ⑤ 吸附：尽快把原生电量胶囊弹出来。链路越短越快：
-#   1. 读线圈电量（刚吸上可能还没握手，最多重试 4 次 × 0.2s ≈ 0.6s）
-#   2. CAPSULE_DIRECT=1（默认）：守护**自己**发原生 STYLUS_STATE_SOC —— 少一跳（不起 App 进程）
+# ⑤ 直发一条原生电量胶囊。
+#
+# 为什么要"先用缓存值弹"：笔放上去到线圈把 `attached` 置 1 要 **2 秒**（实测硬件握手），
+# 而线圈报出新的 `level` 还要再等 1~2 秒 —— 傻等真值的话胶囊要 4 秒才出来。
+# 所以边沿一到就用**上一次的 level** 先弹（线圈在取下时保留上一次的值），
+# 1~2 秒后拿到新值再补一条刷新（同样是原生胶囊，会替换掉旧的）。
+#
+#   1. CAPSULE_DIRECT=1（默认）：守护**自己**发原生 STYLUS_STATE_SOC —— 少一跳（不起 App 进程）
 #      否则只发 ATTACH 给 PenBridge，由 App 组装并弹
-#   3. CAPSULE_GATT=1：再叫 PenBridge 走 GATT 读真值，与已显示的值不同才补一条校正
-send_attach() {
-    local batt=-1 chg i=0
-    while [ "$i" -lt 4 ]; do
-        batt=$(read_int "$WLS_LEVEL" -1)
-        case "$batt" in ''|*[!0-9]*) batt=-1 ;; esac
-        if [ "$batt" -ge 0 ] && [ "$batt" -le 100 ]; then break; fi
-        batt=-1
-        i=$((i+1))
-        [ "$i" -lt 4 ] && sleep 0.2
-    done
-    chg=$(read_int "$WLS_CHG" -1)
-    # 吸附边沿上笔就在充电线圈上 → state=4（图标带闪电）；coil_chg 只写日志备查
+#   2. CAPSULE_GATT=1：再叫 PenBridge 用系统 API / GATT 读真值，与已显示的值不同才补一条校正
+sensor_capsule() {
+    local batt="$1" fb
+    [ "$batt" -ge 1 ] && [ "$batt" -le 100 ] || return 1
     if capsule_direct; then
         if am broadcast --user 0 -a "$A_SOC" -n "$SOC_RCV" \
                 --ei battery "$batt" --ei state 4 --ei connect 5 >/dev/null 2>&1; then
-            log "capsule direct sent (battery=$batt state=4 coil_chg=$chg)"
+            shown="$batt"
+            log "capsule sent battery=$batt (coil_chg=$(read_int "$WLS_CHG" -1))"
         else
-            log "ERROR capsule direct failed"
-        fi
-        if capsule_gatt; then
-            # 首弹已经由守护发过了，这里把 coil 一起带上，App 只在 GATT 真值不同时才补一条
-            if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
-                    --ei battery -1 --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
-                log "attach forwarded for gatt check (coil=$batt)"
-            fi
-        fi
-    else
-        if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
-                --ei battery "$batt" --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
-            log "attach-capsule sent (battery=$batt state=4 coil_chg=$chg)"
-        else
-            log "ERROR attach-capsule failed"
+            log "ERROR capsule send failed battery=$batt"
         fi
     fi
+    # 交给 PenBridge：
+    #   a) 直发成功 + 开了 GATT 校正 → battery=-1（"已弹过，别重复弹"）+ coil=已显示值
+    #   b) 直发没成功（或 CAPSULE_DIRECT=0）→ battery=本值，让 App 立刻弹
+    if capsule_gatt || [ "$shown" != "$batt" ]; then
+        if [ "$shown" = "$batt" ]; then fb=-1; else fb="$batt"; fi
+        if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
+                --ei battery "$fb" --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
+            log "attach forwarded (battery=$fb coil=$batt)"
+        fi
+    fi
+    return 0
+}
+
+# 读线圈电量（内建 read，不起进程）；非 0..100 一律返回 -1
+read_level() {
+    local v=""
+    read -r v < "$WLS_LEVEL" 2>/dev/null
+    case "$v" in ''|*[!0-9]*) echo -1 ;; *) echo "$v" ;; esac
 }
 
 # ④ 停死电话栈。原理见文件头 ④。
@@ -409,13 +414,19 @@ case "$1" in
 
     REFRESH=$(refresh_seconds)
     last_att=$(read_att 1)
+    last_lvl=$(read_level)
+    last_good=-1
+    [ "$last_lvl" -ge 1 ] && [ "$last_lvl" -le 100 ] && last_good=$last_lvl
+    shown=""
     tick=0
     sub=0
+    now_sec=0
+    refresh_at=0
     if capsule_enabled; then
         prepare_stylus_settings
-        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT"
+        log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT fast=$CAPSULE_FAST"
     else
-        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=off poll=${POLL_MS}ms"
+        log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=off poll=${POLL_MS}ms"
     fi
 
     if [ "$last_att" = 0 ]; then
@@ -427,24 +438,56 @@ case "$1" in
         sub=$((sub+1))
         if [ $((sub % PER_SEC)) -eq 0 ]; then
             tick=$((tick+1))
+            now_sec=$((now_sec+1))
         fi
         att=$(read_att "$last_att")
+        lvl=$(read_level)
+        if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
 
+        # 取下：发唤醒，并把胶囊调度清掉
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
             send "$A_WAKE" "detach-wake"
             tick=0
-        elif [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
-            # ⑤ 吸附：立刻读线圈电量并弹原生胶囊（不再有固定 sleep，检测间隔就是 POLL_MS）
-            if capsule_enabled; then
-                send_attach
+            refresh_at=0
+        fi
+
+        if capsule_enabled; then
+            # 边沿 A：线圈刚启动（level 1..100 -> 0）—— 实测比 attached 早约 2 秒。
+            # 此时真值还没有，先用缓存值弹一条，2 秒后拿新值刷新。
+            if [ "$last_att" = 0 ] && [ "$att" = 0 ] && [ "$last_lvl" -ge 1 ] && [ "$lvl" = 0 ] \
+                    && [ "$refresh_at" = 0 ]; then
+                log "coil-start edge (cached=$last_good)"
+                if capsule_fast && [ "$last_good" -ge 1 ]; then
+                    sensor_capsule "$last_good"
+                fi
+                refresh_at=$((now_sec + 2))
             fi
-            tick=0
-        elif [ "$att" = 0 ] && [ "$REFRESH" -gt 0 ] && [ "$tick" -ge "$REFRESH" ]; then
+            # 边沿 B：attached 0 -> 1（硬件握手完成）
+            if [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
+                if [ "$refresh_at" = 0 ]; then
+                    if capsule_fast && [ "$last_good" -ge 1 ]; then
+                        sensor_capsule "$last_good"
+                    fi
+                    refresh_at=$((now_sec + 2))
+                fi
+                tick=0
+            fi
+            # 刷新：等线圈报出新值，与已显示的不同才补一条
+            if [ "$refresh_at" -gt 0 ] && [ "$now_sec" -ge "$refresh_at" ] && [ "$att" = 1 ]; then
+                if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ] && [ "$lvl" != "$shown" ]; then
+                    sensor_capsule "$lvl"
+                fi
+                refresh_at=0
+            fi
+        fi
+
+        if [ "$att" = 0 ] && [ "$REFRESH" -gt 0 ] && [ "$tick" -ge "$REFRESH" ]; then
             send "$A_WAKE" "refresh-wake"
             tick=0
         fi
 
         last_att=$att
+        last_lvl=$lvl
 
         if [ $((tick % 600)) -eq 0 ] && [ -f "$LOG" ] &&
                 [ "$(wc -c < "$LOG" 2>/dev/null)" -gt 262144 ]; then

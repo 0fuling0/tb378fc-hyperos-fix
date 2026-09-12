@@ -88,21 +88,40 @@ adb shell su -c 'am broadcast --user 0 \
 # 或者直接把磁吸状态机的边沿走一遍：吸附笔即可（attached 0 -> 1）
 ```
 
-### 3.3 模块自动触发（正常使用，v3.1 的快路径）
+### 3.3 模块自动触发（v3.1 的快路径）
 
 ```
-/sys/class/power_supply/wls_tx/attached  0 -> 1（吸附）
-  └─ service.sh --monitor：POLL_MS=200 轮询（shell 内建 read，几乎零成本）
-       └─ 立刻读 wls_tx/level（最多重试 4×0.2s 等线圈握手）
-            └─ 守护**直接**发原生广播（CAPSULE_DIRECT=1，省掉 App 一跳）：
-                 am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
-                   -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
-                   --ei battery <线圈值> --ei state 4 --ei connect 5
-                 → 原生胶囊立刻出现
-            └─ 再转发 dev.tb378fc.stylus.ATTACH（battery=-1, coil=<线圈值>）给 PenBridge
-                 └─ PenBle.readBattery()（GATT 0x180F/0x2A19）
-                      └─ 真值 != coil 才补一条校正（相同不重复弹）
+wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不起进程）
+  │
+  ├─ 边沿 A：level 1..100 -> 0（线圈刚启动）  ← 实测比 attached 早约 2 秒
+  │    └─ CAPSULE_FAST=1：立刻用**上一次的 level** 弹一条（~0.2s 出胶囊）
+  │         2 秒后再读一次，值不同就补一条刷新（同样是原生胶囊）
+  │
+  └─ 边沿 B：attached 0 -> 1（硬件握手完成）
+       └─ 若 A 没弹过（例如刚开机没缓存值）→ 这里弹
+  │
+  └─ 两条边的实际动作都是：
+       am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
+         -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
+         --ei battery <值> --ei state 4 --ei connect 5          ← 守护直发，不起 App 进程
+       + 转发 ATTACH(battery=-1, coil=<已显示值>) 给 PenBridge
+            └─ ① InputDevice.getBatteryState()（装了 hook 才有值）
+               ② 都没有 → GATT 0x180F/0x2A19（实测热链路上只要 ~40ms）
+               真值 != 已显示值才补弹一条
 ```
+
+实测（TB378FC，2026-09-13 一轮快速吸附/取下）：
+
+```
+02:21:18  detach-wake sent
+02:21:22  coil-start edge 触发 → capsule sent battery=100 (coil_chg=0)
+02:21:22.459  MiuiStylusBatteryManager: From source: bluetooth batteryLevel : 100 stylusState : 4 connectState : 5
+02:21:22.486  MiuiStylusBatteryManager: Battery window attached      ← 原生窗口出现
+02:21:22.497  PenWake: conn st=0 new=2 → 22.538 battery=100          ← GATT 兜底只花 41ms
+02:21:24.475  MiuiStylusBatteryManager: Battery window detached      ← 2s 自动消失
+```
+
+**从线圈侦测到笔 → 胶囊出现 ≈ 0.3 秒**（`am` 广播占大头）；**笔放上去 → 线圈侦测到**那 ~2 秒是硬件。
 
 ### 3.4 延迟都花在哪（实测分解）
 
@@ -151,7 +170,8 @@ adb shell su -c 'am broadcast --user 0 \
 | `CAPSULE` | `1` | 吸附是否弹胶囊（也可用 `disable-capsule` 标记单独关） |
 | `POLL_MS` | `200` | 吸附检测轮询间隔；直接决定"吸上去多久才弹" |
 | `CAPSULE_DIRECT` | `1` | 守护直发原生广播（少一跳）；`0` = 只发 ATTACH 交给 App |
-| `CAPSULE_GATT` | `1` | 直发后再用 GATT 读真值，**不同**才补一条校正；`0` = 只信线圈值，不补弹 |
+| `CAPSULE_GATT` | `1` | 直发后再用系统 API / GATT 读真值，**不同**才补一条校正；`0` = 不补弹 |
+| `CAPSULE_FAST` | `1` | 边沿一到就用**上一次的线圈电量**先弹（~0.2s 出胶囊），1~2 秒后拿新值刷新；`0` = 等本次真值再弹（慢 1~2 秒） |
 
 ### 电量从哪来（PenBridge 的取值顺序）
 
@@ -159,7 +179,7 @@ adb shell su -c 'am broadcast --user 0 \
 |---|---|---|---|---|
 | 1 | **`InputDevice.getBatteryState()`** | PenBridge（**公开 API，无需权限**） | **0 ms** | 自带 `getCapacity()` + `getStatus()`（充电状态），是**真值**。但要 LSPosed hook 把数字板与蓝牙笔关联起来；没装 hook 时 `isPresent()=false`，本类返回 null |
 | 2 | `wls_tx/level` | `service.sh`（root） | **0 ms** | 反向无线充电线圈读数；吸附时准，**取下时保留上一次的值**，握手瞬间会短暂为 0 |
-| 3 | GATT `0x180F/0x2A19` | PenBridge（普通 App） | **1~3 s** | 只在上面两条都拿不到时才走；要连一次 BLE |
+| 3 | GATT `0x180F/0x2A19` | PenBridge（普通 App） | 实测热链路 **~40 ms**（冷启动 App 进程另加 0.3~0.5 s） | 只在上面两条都拿不到时才走；要连一次 BLE |
 
 **关于"蓝牙读"的澄清**（别指望它更快）：
 
