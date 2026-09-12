@@ -81,8 +81,14 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            if (!sTailDown) return;
                             int orig = (Integer) param.getResult();
+                            // 原始值不是"手写笔/橡皮"时打一次日志：用来判断框架到底报了什么工具类型
+                            // （2=STYLUS 4=ERASER 1=FINGER 0=UNKNOWN）
+                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 20) {
+                                sToolLogs++;
+                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
+                            }
+                            if (!sTailDown) return;
                             if (orig == MotionEvent.TOOL_TYPE_STYLUS || orig == MotionEvent.TOOL_TYPE_ERASER) {
                                 param.setResult(MotionEvent.TOOL_TYPE_ERASER);
                             }
@@ -108,6 +114,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
      *  这里保留开关，等找到上游 producer（真正的橡皮判定）再用。 */
     private static final boolean FORCE_ERASER = false;
     private static int sStackLogs = 0;
+    private static int sToolLogs = 0;
     private void hookStylusState(XC_LoadPackage.LoadPackageParam lp) {
         // 注意：真实类名里有希腊字母 ι（U+03B9），jadx 输出到文件名时会变成 ASCII 的 "I"
         Class<?> cls = null;
