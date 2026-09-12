@@ -20,7 +20,7 @@
 | ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
 | ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
 | ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
-| ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外把"设置 → 手写笔"里的**双击开关/轻捏开关/轻捏力度**实时路由给笔（`{8,6,mask}` bit0/bit4、`{8,5,level}`）、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `TOUCHFILM=-1` / `SETTINGS_SYNC=0`，或标记文件 `disable-gesture` / `disable-rompen` |
+| ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外把"设置 → 手写笔"里的**双击开关/轻捏开关/轻捏力度**实时路由给笔（`{8,6,mask}` bit0/bit4、`{8,5,level}`）、把手势映射成笔的马达波形（捏/双击/笔尾=IMP 冲击；**上滑/下滑=CON 连续振动**，强度按小米 `device_features` 的幅度值换算）、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `HAPTIC=0` / `TOUCHFILM=-1` / `SETTINGS_SYNC=0`，或标记文件 `disable-gesture` / `disable-rompen` |
 
 原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
 ⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，

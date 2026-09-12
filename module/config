@@ -71,3 +71,19 @@ GESTURE_TAIL=92
 #                  联想笔听不懂，所以由守护每 2 秒核对一次、变了就发等价帧。
 #                  0 = 只按上面的固定映射下发，不跟随设置。
 SETTINGS_SYNC=1
+
+# HAPTIC=1        手势触感（让笔振）：penring 把捏/双击/滑动/笔尾映射成马达波形发给笔（默认开）
+#                 波形 id（ZUX）：1 CLICK / 3 HAPTIC_ENABLED / 6 RECOG_FINISHED / 7 PRESS /
+#                 32..41 连续振动（BALLPEN/PENCIL/CHISEL_MARKER/ERASER/LENOVO_BRUSH + NS 版）；
+#                 0 = 这一条不振。type：IMP 冲击（离散）/ CON 连续（滑动用，会在 SLIDE_MS 后自动停）。
+HAPTIC=1
+HAPTIC_PINCH=3        # 捏下 -> IMP
+HAPTIC_PINCH_UP=0     # 捏松 -> IMP（0=不振）
+HAPTIC_DOUBLE=1       # 双击 -> IMP（CLICK）
+HAPTIC_SLIDE=41       # 上滑/下滑 -> CON 连续振动（41 = 联想笔刷·无音效）
+HAPTIC_SLIDE_MS=120   # 连续振动持续多久（毫秒）
+HAPTIC_TAIL=6         # 笔尾按住 -> IMP（RECOG_FINISHED）
+HAPTIC_FRICTION=1     # CON 第 4 字节：摩擦感 0/1
+# HAPTIC_LEVEL    强度 1..5；-1（默认）= 按 MIUI 的 device_features 幅度换算
+#                 （/product/etc/device_features/<机型>.xml 里的 *_haptic_feedback，128 -> 3）
+HAPTIC_LEVEL=-1

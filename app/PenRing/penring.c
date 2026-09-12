@@ -55,6 +55,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -103,12 +104,25 @@ struct cfg {
     int slide_up;    /* 上滑      -> 键码 */
     int slide_down;  /* 下滑      -> 键码 */
     int tail;        /* 笔尾按住  -> 键码（92 截图 / 93 速记 / -1 关） */
+
+    /* 手势触感（马达）：波形 id，0 = 不振 */
+    int haptic;      /* 总开关 */
+    int w_pinch;     /* 捏下 -> IMP 波形 */
+    int w_pinch_up;  /* 捏松 -> IMP 波形 */
+    int w_double;    /* 双击 -> IMP 波形 */
+    int w_slide;     /* 上滑/下滑 -> CON 连续振动波形 */
+    int slide_ms;    /* 连续振动持续多久 */
+    int w_tail;      /* 笔尾 -> IMP 波形 */
+    int level;       /* -1 = 按 MIUI 的 feature 幅度换算，0..5 = 固定 */
+    int friction;    /* CON 第 4 字节（摩擦感 0/1） */
 };
 
-static struct cfg g_cfg = {194, 195, 196, 197, 92};
+static struct cfg g_cfg = {194, 195, 196, 197, 92,
+                           1, 3, 0, 1, 41, 120, 6, -1, 1};
 static const char *g_moddir = DEF_MODDIR;
 static const char *g_log = NULL;
 static const char *g_dev = NULL;   /* --dev：强制读某个 event 节点（自检/排障用） */
+static char g_devname[92] = "piano";   /* ro.product.device，用来找 device_features xml */
 static int g_ui = -1;
 static volatile sig_atomic_t g_stop = 0;
 static long g_tail_down_ms = 0;   /* 笔尾按下的时刻，用来过滤误触 */
@@ -191,10 +205,22 @@ static void load_config(const char *path)
         else if (!strcmp(k, "GESTURE_SLIDE_UP"))    g_cfg.slide_up = parse_int(v, g_cfg.slide_up);
         else if (!strcmp(k, "GESTURE_SLIDE_DOWN"))  g_cfg.slide_down = parse_int(v, g_cfg.slide_down);
         else if (!strcmp(k, "GESTURE_TAIL"))        g_cfg.tail = parse_int(v, g_cfg.tail);
+        else if (!strcmp(k, "HAPTIC"))              g_cfg.haptic = parse_int(v, g_cfg.haptic);
+        else if (!strcmp(k, "HAPTIC_PINCH"))        g_cfg.w_pinch = parse_int(v, g_cfg.w_pinch);
+        else if (!strcmp(k, "HAPTIC_PINCH_UP"))     g_cfg.w_pinch_up = parse_int(v, g_cfg.w_pinch_up);
+        else if (!strcmp(k, "HAPTIC_DOUBLE"))       g_cfg.w_double = parse_int(v, g_cfg.w_double);
+        else if (!strcmp(k, "HAPTIC_SLIDE"))        g_cfg.w_slide = parse_int(v, g_cfg.w_slide);
+        else if (!strcmp(k, "HAPTIC_SLIDE_MS"))     g_cfg.slide_ms = parse_int(v, g_cfg.slide_ms);
+        else if (!strcmp(k, "HAPTIC_TAIL"))         g_cfg.w_tail = parse_int(v, g_cfg.w_tail);
+        else if (!strcmp(k, "HAPTIC_LEVEL"))        g_cfg.level = parse_int(v, g_cfg.level);
+        else if (!strcmp(k, "HAPTIC_FRICTION"))     g_cfg.friction = parse_int(v, g_cfg.friction);
     }
     fclose(f);
     logf_("config: ring=%d double=%d slideUp=%d slideDown=%d tail=%d",
           g_cfg.ring, g_cfg.double_tap, g_cfg.slide_up, g_cfg.slide_down, g_cfg.tail);
+    logf_("haptic: on=%d pinch=%d pinchUp=%d double=%d slide=%d/%dms tail=%d level=%d friction=%d",
+          g_cfg.haptic, g_cfg.w_pinch, g_cfg.w_pinch_up, g_cfg.w_double,
+          g_cfg.w_slide, g_cfg.slide_ms, g_cfg.w_tail, g_cfg.level, g_cfg.friction);
 }
 
 /* ---------------------------------------------------------------- 键位文件 */
@@ -319,29 +345,156 @@ static int find_pen(char *path, size_t pathlen)
     return -1;
 }
 
+/* ------------------------------------------------- 手势触感（马达） */
+/*
+ * MIUI 对触控膜笔的"触感优化"就是 /product/etc/device_features/<机型>.xml 里这几个值：
+ *   double_tap_haptic_feedback / sliding_up_haptic_feedback / sliding_down_haptic_feedback
+ *   pinch_trigger_pressure_*（五档：[触发克数, 释放克数, 按下触感, 松开触感]）
+ * 幅度 0~255。这里读出来换算成笔端 level（0~5），让联想笔的振感和原厂调校一致。
+ */
+static int g_amp_double = -1, g_amp_slide_up = -1, g_amp_slide_down = -1;
+static int g_amp_press = -1, g_amp_lift = -1;
+
+static int xml_int(const char *key, int dflt)
+{
+    char path[256];
+    char line[512];
+    char pat[128];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "/product/etc/device_features/%s.xml", g_devname);
+    f = fopen(path, "r");
+    if (!f) {
+        f = fopen("/product/etc/device_features/piano.xml", "r");
+        if (!f) return dflt;
+    }
+    snprintf(pat, sizeof(pat), "name=\"%s\"", key);
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strstr(line, pat);
+        if (!p) continue;
+        p = strchr(p + strlen(pat), '>');
+        if (!p) continue;
+        fclose(f);
+        return atoi(p + 1);
+    }
+    fclose(f);
+    return dflt;
+}
+
+static int amp_to_level(int amp)
+{
+    int lvl;
+    if (g_cfg.level >= 0) return g_cfg.level;
+    if (amp < 0) amp = 128;                 /* 读不到就用小米默认值 */
+    lvl = (amp * 5 + 127) / 255;            /* 128 -> 3 */
+    if (lvl < 1) lvl = 1;
+    if (lvl > 5) lvl = 5;
+    return lvl;
+}
+
+static void load_miui_haptic_config(void)
+{
+    snprintf(g_devname, sizeof(g_devname), "%s", "piano");
+    __system_property_get("ro.product.device", g_devname);
+    g_amp_double = xml_int("double_tap_haptic_feedback", -1);
+    g_amp_slide_up = xml_int("sliding_up_haptic_feedback", -1);
+    g_amp_slide_down = xml_int("sliding_down_haptic_feedback", -1);
+    /* 捏合按下/松开的触感取"中等"那一档的数组：[触发克数, 释放克数, 按下触感, 松开触感] */
+    {
+        char line[512];
+        char path[512];
+        FILE *f;
+        int items[4];
+        int n = 0;
+        int in = 0;
+        snprintf(path, sizeof(path), "/product/etc/device_features/%s.xml", g_devname);
+        f = fopen(path, "r");
+        if (!f) f = fopen("/product/etc/device_features/piano.xml", "r");
+        if (f) {
+            while (fgets(line, sizeof(line), f)) {
+                if (!in && strstr(line, "name=\"pinch_trigger_pressure_medium\"")) { in = 1; continue; }
+                if (!in) continue;
+                if (strstr(line, "</integer-array>")) break;
+                if (strstr(line, "<item>") && n < 4) items[n++] = atoi(strstr(line, "<item>") + 6);
+            }
+            fclose(f);
+        }
+        if (n >= 3) g_amp_press = items[2];    /* 按下触感 */
+        if (n >= 4) g_amp_lift = items[3];     /* 松开触感 */
+    }
+    logf_("MIUI 触感幅度: double=%d slideUp=%d slideDown=%d pinchPress=%d pinchLift=%d -> level %d/%d/%d/%d",
+          g_amp_double, g_amp_slide_up, g_amp_slide_down, g_amp_press, g_amp_lift,
+          amp_to_level(g_amp_double), amp_to_level(g_amp_slide_up),
+          amp_to_level(g_amp_slide_down), amp_to_level(g_amp_press));
+}
+
+/** 后台起一条 am broadcast，不阻塞读事件（每 60ms 一次也不掉帧）。 */
+static void run_async(const char *cmd)
+{
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        setsid();
+        execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
+static long g_last_slide_ms;
+
+/** 让笔振一下：type 0 = IMP 冲击，1 = CON 连续（连续振动由 App 侧自动补停止帧）。 */
+static void haptic_play(int type, int wave, int amp, int ms)
+{
+    char cmd[512];
+    int lvl;
+
+    if (!g_cfg.haptic || wave <= 0) return;
+    lvl = amp_to_level(amp);
+    snprintf(cmd, sizeof(cmd),
+             "am broadcast --user 0 -n dev.tb378fc.stylus/.WakeReceiver "
+             "-a dev.tb378fc.stylus.HAPTIC --ei type %d --ei wave %d --ei level %d "
+             "--ei friction %d --ei ms %d >/dev/null 2>&1 &",
+             type, wave, lvl, g_cfg.friction, ms);
+    run_async(cmd);
+}
+
 /* ---------------------------------------------------------------- 手势映射 */
 static void on_usage(int scan)
 {
     if (scan == U_PINCH_DOWN) {
+        haptic_play(0, g_cfg.w_pinch, g_amp_press, 0);
         if (g_cfg.ring < 0) return;
         logf_("捏        → Android %d（快捷环）", g_cfg.ring);
         key_press(g_ui, raw_of(g_cfg.ring));
     } else if (scan == U_PINCH_UP) {
+        haptic_play(0, g_cfg.w_pinch_up, g_amp_lift, 0);
         if (g_cfg.ring < 0) return;
         key_release(g_ui, raw_of(g_cfg.ring));
     } else if (scan == U_DOUBLE_TAP) {
+        haptic_play(0, g_cfg.w_double, g_amp_double, 0);
         if (g_cfg.double_tap < 0) return;
         logf_("双击      → Android %d", g_cfg.double_tap);
         key_tap(g_ui, raw_of(g_cfg.double_tap));
     } else if (scan == U_SLIDE_UP) {
+        if (now_ms() - g_last_slide_ms > 120) {          /* 连续振动别刷太快 */
+            g_last_slide_ms = now_ms();
+            haptic_play(1, g_cfg.w_slide, g_amp_slide_up, g_cfg.slide_ms);
+        }
         if (g_cfg.slide_up < 0) return;
         logf_("上滑      → Android %d", g_cfg.slide_up);
         key_tap(g_ui, raw_of(g_cfg.slide_up));
     } else if (scan == U_SLIDE_DOWN) {
+        if (now_ms() - g_last_slide_ms > 120) {
+            g_last_slide_ms = now_ms();
+            haptic_play(1, g_cfg.w_slide, g_amp_slide_down, g_cfg.slide_ms);
+        }
         if (g_cfg.slide_down < 0) return;
         logf_("下滑      → Android %d", g_cfg.slide_down);
         key_tap(g_ui, raw_of(g_cfg.slide_down));
     } else if (scan == U_TAIL_DOWN) {
+        haptic_play(0, g_cfg.w_tail, -1, 0);
         if (g_cfg.tail < 0) return;
         g_tail_down_ms = now_ms();
         logf_("笔尾按住  → Android %d（%s）", g_cfg.tail,
@@ -390,6 +543,7 @@ int main(int argc, char **argv)
         else { usage(argv[0]); return 2; }
     }
 
+    signal(SIGCHLD, SIG_IGN);          /* 不回收 am broadcast 的子进程（避免僵尸） */
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGHUP, on_signal);
@@ -418,6 +572,7 @@ int main(int argc, char **argv)
     logf_("penring 启动 pid=%d moddir=%s", (int)getpid(), g_moddir);
     write_keylayout();
     load_config(cfgpath);
+    load_miui_haptic_config();
 
     while (!g_stop) {
         char path[64];
