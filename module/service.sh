@@ -190,10 +190,11 @@ BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
 BRUSH_ERASER_STATES=""
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
-# AI 笔：它不改 current_brush（用 current_ai_brush=true 标识）
+# 工具栏工具值（select_state_save）实测：8 AI 笔 / 6 框选笔 / 7 橡皮
+BRUSH_AI_STATES="8"
 BRUSH_AI_WAVE=36
 # 框选笔：同样不改 current_brush，用 select_state_save 的值标识（看日志填，逗号分隔）
-BRUSH_LASSO_STATES=""
+BRUSH_LASSO_STATES="6"
 BRUSH_LASSO_WAVE=36
 # 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
@@ -330,81 +331,37 @@ brush_decide_wave() {
     cur=$(brush_tool_val "$sig" current_brush)
     sel=$(brush_tool_val "$sig" select_state_save)
 
-    # 1) AI 笔：它不改 current_brush（实测 current_ai_brush=true 时 current_brush 还是上一支），
-    #    所以必须最先判，否则会沿用上一支笔的波形
+    # select_state_save 是"工具栏当前工具"，**优先** —— 选 AI 笔/框选笔/橡皮时
+    # current_brush 还停在上一支真笔刷上（实测：AI 时 current_brush=4 但 select=8），
+    # 先查 current_brush 就会一直沿用上一支的手感。
+    # 实测值：8 AI 笔 / 6 框选笔 / 7 橡皮（普通笔刷时它等于 current_brush，不冲突）
+    # 三个特殊工具先按 select_state_save 精确匹配（用户实测值，优先级最高：
+    # current_ai_brush 是残留标记，选橡皮时它可能还是 true，不能让它抢答）
+    for w in $BRUSH_ERASER_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
+    done
+    for w in $BRUSH_AI_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_AI_WAVE"; return 0; }
+    done
+    for w in $BRUSH_LASSO_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
+    done
+    for w in $BRUSH_ERASER_STATES; do
+        [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
+    done
     if [ "$(brush_tool_val "$sig" current_ai_brush)" = "true" ]; then
         echo "$BRUSH_AI_WAVE"; return 0
     fi
-    # 2) 橡皮（UI 里选橡皮时 current_brush 不变，只有 select_state_save 变）
-    for w in $BRUSH_ERASER_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
-        [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
-    done
-    # 3) 正常笔刷
+
+    # 普通笔刷：查表（select_state_save 与 current_brush 一致，用哪个都行）
     w=$(brush_wave_of "$cur")
     [ -n "$w" ] && { echo "$w"; return 0; }
     w=$(brush_wave_of "$sel")
     [ -n "$w" ] && { echo "$w"; return 0; }
-    # 4) 框选笔（也是不改 current_brush 的一类；值看日志填）
-    for w in $BRUSH_LASSO_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
-    done
     w=$(brush_tool_val "$sig" ai_type)
     [ -n "$w" ] && [ "$w" != "0" ] && { echo "$BRUSH_AI_WAVE"; return 0; }
-    # 5) 兜底：认不出的编号一律联想笔刷
+    # 认不出的编号：联想笔刷
     echo "$BRUSH_DEFAULT_WAVE"
-}
-
-brush_now()  { cat "$BRUSH_STATE" 2>/dev/null; }
-brush_base() { cat "$BRUSH_BASE" 2>/dev/null; }
-brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
-
-# 画布是否可写（hook 写的 penstate；文件不存在时按"可写"处理，保持旧行为）
-brush_canvas() {
-    local f v fg order
-    fg=$(cat "$MODDIR/brush.fg" 2>/dev/null)
-    # 优先读前台那个 App 的 penstate（两个 App 都会写，读错了会用到旧状态）
-    order="$PENSTATE_LIST"
-    case "$fg" in
-        com.miui.notes)    order="/data/data/com.miui.notes/files/penstate $PENSTATE_LIST" ;;
-        com.miui.creation) order="/data/data/com.miui.creation/files/penstate $PENSTATE_LIST" ;;
-    esac
-    for f in $order; do
-        v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
-        [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
-    done
-    return 0
-}
-
-# 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
-brush_tell_hooks() {
-    am broadcast --user 0 -a dev.tb378fc.stylus.TAIL --ei down "$1" >/dev/null 2>&1 &
-}
-
-brush_send() {
-    # $1 = 波形 id（0 = 停）；$2 = 原因；$3 = 非空表示"这是笔刷基准值"
-    local wave="$1" why="$2" setbase="$3" now
-    [ -n "$wave" ] || return 0
-    now=$(brush_now)
-    if [ "$wave" = "0" ]; then
-        [ -z "$now" ] && return 0
-        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0 \
-            --ei friction "$BRUSH_FRICTION" --ei ms 80
-        : > "$BRUSH_STATE"
-        brush_log "stop ($why)"
-        return 0
-    fi
-    [ -n "$setbase" ] && echo "$wave" > "$BRUSH_BASE"
-    # 画布没聚焦（弹窗/面板打开、App 不在前台）就先不响，等 penstate 说 canvas=1 再放
-    if [ -z "$setbase" ] && ! brush_canvas; then
-        brush_log "skip wave=$wave ($why)：画布未聚焦"
-        return 0
-    fi
-    [ "$wave" = "$now" ] && return 0
-    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave" \
-        --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
-    echo "$wave" > "$BRUSH_STATE"
-    brush_log "wave=$wave ($why)"
 }
 
 # 应用里的工具换了：更新基准；不在橡皮态就立刻切过去

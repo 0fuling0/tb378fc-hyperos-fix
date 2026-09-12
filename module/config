@@ -83,10 +83,12 @@ BRUSH_FRICTION=1
 # current_brush 编号 -> CON 波形（实测：1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔）
 # 波形：32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 无音效版
 BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
-# AI 笔：不改 current_brush（current_ai_brush=true 标识），映射到这个波形
+# 工具栏工具值（select_state_save）实测：8 = AI 笔 / 6 = 框选笔 / 7 = 橡皮
+# 这三类都不改 current_brush（还停在上一支真笔刷上），所以判定时优先看 select_state_save
+BRUSH_AI_STATES="8"
 BRUSH_AI_WAVE=36
-# 框选笔：也不改 current_brush，用 select_state_save 的值标识（看 brush.log 填，空格分隔）
-BRUSH_LASSO_STATES=""
+# 框选笔：同样不改 current_brush，用 select_state_save=6 标识
+BRUSH_LASSO_STATES="6"
 BRUSH_LASSO_WAVE=36
 # 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
