@@ -170,8 +170,17 @@ adb logcat -s PenBridgeHook:*
 adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/brush.log'   # wave=35 / tip back
 ```
 
-若 App 仍不切：日志里的 `touchType=` 就是它的工具枚举 —— 找出橡皮那个常量并改成强制 `touchType`；
-再不行就往上找 producer（谁构造 `fc.Iι11lii`）hook 它的判定点。
+### 实测踩坑（重要）
+
+1. **`touchType` 不是"工具"，是"触摸阶段"**：`gc.Iiliill` 的常量 toString 是
+   `TOUCH_DOWN / TOUCH_MOVE / TOUCH_UP / TOUCH_HOVER / TOUCH_HOVER_EXIT / TOUCH_SHAPE / TOUCH_SHAPE_UP / TOUCH_CLEAN`
+   —— 所以橡皮不在这里。
+2. **不能强行把两个 eraser 布尔改成 true**（`FORCE_ERASER` 默认已关）：
+   实测笔尾滑动会**既不画也不擦**，抬手时按轨迹补一笔 —— 因为 `isEraser` 必须与
+   "橡皮端的坐标/几何"配套，只改标志位会让 App 的绘制状态机错乱。
+3. **下一步定位上游 producer**：构造 `fc.Iι11lii` 的调用链（日志里的 `producer stack`）是
+   `ud.lιIil11` → `he.ll1ιι11i` → …（同样混淆）。要读 `ud.lιIil11` 看它怎么算出 `isEraser`
+   （大概是从 MIUI 的笔状态/InputDevice 读的），然后**只钩那个来源**。
 
 ## 7. 构建 / 安装 / 自检
 

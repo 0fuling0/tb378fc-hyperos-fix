@@ -102,6 +102,12 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
      *     顺便打日志（前若干次 + 笔尾按下时）以便校准：能看出 touchType 到底是什么。
      */
     private static int sStateLogs = 0;
+    /** 是否强制改写 eraser 布尔：默认关！
+     *  实测强制打开会破坏 App 的绘制管线（笔尾滑动既不画也不擦、抬手才按轨迹补一笔），
+     *  因为 isEraser 要与"橡皮端的坐标/几何"配套，光改标志位状态机就错乱了。
+     *  这里保留开关，等找到上游 producer（真正的橡皮判定）再用。 */
+    private static final boolean FORCE_ERASER = false;
+    private static int sStackLogs = 0;
     private void hookStylusState(XC_LoadPackage.LoadPackageParam lp) {
         // 注意：真实类名里有希腊字母 ι（U+03B9），jadx 输出到文件名时会变成 ASCII 的 "I"
         Class<?> cls = null;
@@ -127,9 +133,14 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                                         + " int9=" + a[8] + " bool10=" + a[9]
                                         + " tail=" + sTailDown);
                             }
-                            if (sTailDown) {
-                                a[6] = Boolean.TRUE;   // isEraser / isTouchEraser 之一
-                                a[9] = Boolean.TRUE;   // 另一个
+                            // 前几次打印调用栈：找出"谁"在构造它（那里才是真正的橡皮判定）
+                            if (sStackLogs < 3) {
+                                sStackLogs++;
+                                Log.i(TAG, "I11lii producer stack:", new Throwable());
+                            }
+                            if (FORCE_ERASER && sTailDown) {
+                                a[6] = Boolean.TRUE;
+                                a[9] = Boolean.TRUE;
                             }
                         } catch (Throwable ignored) { }
                     }
