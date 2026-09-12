@@ -115,6 +115,10 @@ DISABLE="$MODDIR/disable"
 DISABLE_BPFMON="$MODDIR/disable-bpfmon"
 DISABLE_TELEPHONY="$MODDIR/disable-telephony"
 DISABLE_CAPSULE="$MODDIR/disable-capsule"
+DISABLE_GESTURE="$MODDIR/disable-gesture"
+DISABLE_ROMPEN="$MODDIR/disable-rompen"
+PENRING_BIN="$MODDIR/bin/penring"
+PENRING_PID="$MODDIR/penring.pid"
 CFG="$MODDIR/config"
 ATT=/sys/class/power_supply/wls_tx/attached
 # ⑤ 胶囊：反向无线充电线圈看到的笔电量/充电状态（root 才读得到）
@@ -151,6 +155,16 @@ CAPSULE_FAST=0
 # ⑥ 笔端触控膜功能位 {8,6,mask}：63=0x3F 全开（双击/三击/上滑/下滑/捏合/笔尾）；
 #    -1 = 只唤醒不改位。位定义见 docs/zuxos-pen-protocol.md §2.1
 TOUCHFILM=63
+# ⑥ 手势桥开关：1 = 起 penring（默认），0 = 不起；也可以建 disable-gesture 标记文件
+GESTURE=1
+# ⑥ 手势 → Android 键码映射（改完重启模块生效；-1 = 关掉这一条）
+#   194 轻捏=快捷环 · 195 双击 · 196 上滑 · 197 下滑
+#   92 截图键 / 93 速记键（"按住 + 点屏幕"那套），笔尾那个键默认映射成截图键
+GESTURE_RING=194
+GESTURE_DOUBLE=195
+GESTURE_SLIDE_UP=196
+GESTURE_SLIDE_DOWN=197
+GESTURE_TAIL=92
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -162,6 +176,31 @@ refresh_seconds() {
 capsule_enabled() {
     [ -e "$DISABLE_CAPSULE" ] && return 1
     case "$CAPSULE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+# ⑥ 手势桥 penring：把联想笔的捏/双击/上滑/下滑/笔尾桥成小米焦点触控笔的键。
+#    由 supervisor 看护（笔不在时它自己每 2 秒轮询，不占 CPU）。见 docs/stylus-gesture-bridge.md
+gesture_enabled() {
+    [ -e "$DISABLE_GESTURE" ] && return 1
+    case "$GESTURE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+penring_alive() {
+    local p
+    p=$(cat "$PENRING_PID" 2>/dev/null)
+    [ -n "$p" ] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    # 只认 cmdline 里确实是我们的二进制，防止 pid 复用
+    grep -qa "penring" "/proc/$p/cmdline" 2>/dev/null
+}
+
+penring_ensure() {
+    gesture_enabled || return 0
+    [ -x "$PENRING_BIN" ] || return 0
+    penring_alive && return 0
+    setsid "$PENRING_BIN" --moddir "$MODDIR" >>"$LOG.ring" 2>&1 </dev/null &
+    sleep 1
+    log "penring started pid=$(cat "$PENRING_PID" 2>/dev/null)"
 }
 
 capsule_direct() {
@@ -352,6 +391,35 @@ supervisor_alive() {
 
 case "$1" in
 
+--stoprompen)
+    # ⑥ 移植 ROM 自带的笔桥（/system/etc/init/init.lwky.rc 里的 lwky_pen =
+    #    /system/lwky/penbridge_hyperos）是"老一套"：它造的是 type-1（0x1915/0xEAEA）虚拟笔，
+    #    并且在 boot_completed 时启动、按自己的映射往笔上灌 PAGEUP/PAGEDOWN(92/93)。
+    #    在 HyperOS 上 type-1 永远进不了 MIUI 的触控膜分支（只认 type 8），而 92/93 又会被
+    #    MiuiStylusShortcutManager 当成"截图键/速记键"乱触发 —— 和我们 penring 抢着注入。
+    #    这里把它停掉（init 的 oneshot 服务，ctl.stop 之后不会自己回来；真回来就再停）。
+    [ -e "$DISABLE_ROMPEN" ] && exit 0
+    was=0
+    while [ ! -e "$DISABLE_ROMPEN" ]; do
+        if pidof penbridge_hyperos >/dev/null 2>&1; then
+            setprop ctl.stop lwky_pen 2>/dev/null
+            sleep 1
+            pkill -x penbridge_hyperos 2>/dev/null
+            sleep 1
+            if pidof penbridge_hyperos >/dev/null 2>&1; then
+                log "WARN ROM 笔桥 lwky_pen 停不掉（还在跑）"
+            elif [ "$was" = 0 ]; then
+                log "ROM 笔桥 lwky_pen 已停（老 type-1 桥不再注入 92/93）"
+                was=1
+            else
+                log "ROM 笔桥 lwky_pen 又被拉起来了，已再停"
+            fi
+        fi
+        sleep 30
+    done
+    exit 0
+    ;;
+
 --stopbpfmon)
     # 见文件头 ③。监视器由 init 在 boot_completed 后启动；ctl.stop 会让 init 不再自动拉起它，
     # 但实测本机它会被别的东西重新拉起来（观察到一次：开机很久之后又出现一个
@@ -402,8 +470,10 @@ case "$1" in
 --supervise)
     echo $$ > "$LOCK/pid"
     log "supervisor up pid=$$"
+    penring_ensure
     while [ ! -e "$DISABLE" ]; do
         /system/bin/sh "$0" --monitor
+        penring_ensure
         [ -e "$DISABLE" ] && break
         log "monitor exited; respawning in 5s"
         sleep 5
@@ -566,6 +636,11 @@ case "$1" in
 
     if [ ! -e "$DISABLE_TELEPHONY" ]; then
         setsid /system/bin/sh "$0" --fixtelephony >/dev/null 2>&1 </dev/null &
+    fi
+
+    # ⑥ 把移植 ROM 自带的旧笔桥（lwky_pen / penbridge_hyperos）停掉，避免和 penring 抢注入
+    if [ ! -e "$DISABLE_ROMPEN" ]; then
+        setsid /system/bin/sh "$0" --stoprompen >/dev/null 2>&1 </dev/null &
     fi
 
     # setsid：KernelSU 通过 init 运行本脚本，普通的 "&" 子进程活不过脚本本身。

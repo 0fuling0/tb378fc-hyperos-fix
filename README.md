@@ -20,11 +20,12 @@
 | ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
 | ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
 | ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
-| ⑥ | **笔端手势功能位** | 唤醒那一帧后面补写 `{8,6,0x3F}`（ZUX `buildTouchfilmEnable`：双击/三击/上滑/下滑/捏合/笔尾），开机与取下边沿各一次 —— 笔一旦重启/睡死这位会被清零，手势就全没了，联想原厂每次连接都重发 | `config` 里 `TOUCHFILM=-1`（只唤醒不改位） |
+| ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外唤醒时补写 `{8,6,0x3F}` 手势功能位、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `TOUCHFILM=-1`，或标记文件 `disable-gesture` / `disable-rompen` |
 
 原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
-⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，⑥ 的位定义见
-**`docs/zuxos-pen-protocol.md` §2.1**。
+⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，
+⑥ 的完整说明（手势表、键位映射、配置项、自检方法）见 **`docs/stylus-gesture-bridge.md`**，
+笔端 `{8,6,mask}` 功能位的位定义见 **`docs/zuxos-pen-protocol.md` §2.1**。
 
 ---
 
@@ -34,17 +35,18 @@
 tb378fc-hyperos-fix/
 ├── build.sh                     # 一键构建 + 打包（KernelSU 模块 zip）
 ├── module/                      # 打进 zip 的内容（设备上那份 v3.0 + ⑤ 胶囊）
-│   ├── module.prop              # id / 版本 / 五项描述
+│   ├── module.prop              # id / 版本 / 六项描述
 │   ├── customize.sh             # 安装期权限设置（从 v2.0 安装包恢复，按 v3.1 清单更新）
 │   ├── post-fs-data.sh          # ② PowerKeeper 覆盖 + 开机清锁
-│   ├── service.sh               # ①③④⑤ 的状态机 / 看护进程
+│   ├── service.sh               # ①③④⑤⑥ 的状态机 / 看护进程（含 penring 与旧桥 lwky_pen）
 │   ├── action.sh                # KernelSU「操作」按钮里显示五项状态
 │   ├── uninstall.sh             # 卸载：停守护、卸 APK、**故意不**恢复死电话包
-│   ├── config                   # REFRESH_SECONDS / CAPSULE 等可调项
+│   ├── config                   # REFRESH_SECONDS / CAPSULE / TOUCHFILM / GESTURE_* 等可调项
 │   ├── tools/
 │   │   ├── patch_powerkeeper.py # 字节补丁：startCloudSyncData 的 return v0 -> return-void
 │   │   └── fix_static.py        # 结构补丁：isFeatureOn 移入 direct_methods + ACC_STATIC
 │   ├── bin/PenBridge.apk        # ① 的载体（构建产物，见 app/PenBridge）
+│   ├── bin/penring              # ⑥ 手势桥守护（构建产物，见 app/PenRing）
 │   └── payload/PowerKeeper.apk  # ② 的载体（构建产物，见 payload-src）
 ├── app/PenBridge/               # PenBridge.apk 源码（BLE 唤醒 / 电量读取 / 胶囊转发）
 │   ├── AndroidManifest.xml      # dev.tb378fc.stylus，versionCode 11 / 3.1
@@ -53,6 +55,10 @@ tb378fc-hyperos-fix/
 │   ├── tools/make_icons.py      # 图标生成
 │   ├── penwake.jks              # 签名密钥（store/key pass 都是 penwake）
 │   └── build.sh                 # aapt2 + javac + d8 + zipalign + apksigner（无 Gradle）
+├── app/PenRing/                 # ⑥ penring：联想笔手势 → type-8 虚拟笔（NDK 静态 aarch64）
+│   ├── penring.c                # 读 MSC_SCAN、造虚拟笔、写 kl、注入 194/195/196/197/92
+│   └── build.sh                 # aarch64-linux-android30-clang，无 Gradle
+├── tools/peninject.c            # 自检：伪造"联想笔手势节点"喂 usage（不需要真笔）
 ├── payload-src/
 │   ├── PowerKeeper-stock.apk    # 移植包**原厂** APK（补丁输入，来自 system_ext/app/PowerKeeper）
 │   └── repack_payload.py        # 把打好补丁的 dex 塞回 APK（保持 stored + 原条目元数据）

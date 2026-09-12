@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TB378FC HyperOS 修复 —— 一键构建（KernelSU 模块包）
 #
-#   ./build.sh              构建 PenBridge.apk，并用仓库里现成的 payload 打包
+#   ./build.sh              构建 PenBridge.apk + penring（手势桥），并用仓库里现成的 payload 打包
 #   ./build.sh --payload    额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
 #   ./build.sh --hook       额外构建 extras/PenStylusHook（LSPosed，v3.0 模块不含）
 #   ./build.sh --all        --payload + --hook
@@ -9,6 +9,7 @@
 #
 # 产物
 #   app/PenBridge/PenBridge.apk          （同时拷进 module/bin/）
+#   app/PenRing/penring                  （同时拷进 module/bin/）
 #   extras/PenStylusHook/PenStylusHook.apk（--hook）
 #   out/<id>-v<version>.zip              KernelSU 模块包（zip 根目录即模块根目录）
 set -euo pipefail
@@ -40,15 +41,24 @@ MOD_VER=$(sed -n 's/^version=//p' "$MODULE/module.prop")
 
 # ---------- ① PenBridge.apk ----------
 build_app() {
-  echo "== [1/3] PenBridge.apk"
+  echo "== [1/4] PenBridge.apk"
   bash "$HERE/app/PenBridge/build.sh"
   cp -f "$HERE/app/PenBridge/PenBridge.apk" "$MODULE/bin/PenBridge.apk"
   sha256sum "$MODULE/bin/PenBridge.apk" | cut -c1-16
 }
 
+# ---------- ①b penring（手势桥守护，NDK 直接编） ----------
+build_penring() {
+  echo "== [2/4] penring（手势桥）"
+  bash "$HERE/app/PenRing/build.sh"
+  cp -f "$HERE/app/PenRing/penring" "$MODULE/bin/penring"
+  chmod 755 "$MODULE/bin/penring"
+  sha256sum "$MODULE/bin/penring" | cut -c1-16
+}
+
 # ---------- ② PowerKeeper payload ----------
 build_payload() {
-  echo "== [2/3] PowerKeeper payload（从原厂 APK 重建）"
+  echo "== [3/4] PowerKeeper payload（从原厂 APK 重建）"
   local stock="$HERE/payload-src/PowerKeeper-stock.apk"
   [ -f "$stock" ] || { echo "缺少 $stock" >&2; exit 1; }
   local tmp
@@ -64,7 +74,7 @@ build_payload() {
 
 # ---------- ③ 打包 ----------
 pack() {
-  echo "== [3/3] 打包模块 zip"
+  echo "== [4/4] 打包模块 zip"
   mkdir -p "$OUT"
   local zip="$OUT/${MOD_ID}-${MOD_VER}.zip"
   rm -f "$zip"
@@ -82,6 +92,7 @@ build_hook() {
 }
 
 build_app
+build_penring
 [ "$DO_PAYLOAD" = 1 ] && build_payload
 [ "$DO_HOOK" = 1 ] && build_hook
 pack

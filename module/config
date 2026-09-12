@@ -44,3 +44,21 @@ CAPSULE_FAST=0
 #             （笔尖写字不受影响）；联想原厂是每次连接都重发一次全量 mask。
 #             -1 = 只唤醒，不动手势位。
 TOUCHFILM=63
+
+# GESTURE     手势桥（bin/penring）开关：1 = 常驻（默认），0 = 不起。
+#             也可以建一个 disable-gesture 标记文件。详见 docs/stylus-gesture-bridge.md。
+GESTURE=1
+
+# 下面这几项是"联想笔的手势 → 注入哪个 Android 键码"，改完重启模块生效，-1 = 关掉这条。
+#   194 轻捏（HyperOS 快捷环；系统级，任何 App 都弹）
+#   195 双击（MIUI 双击功能；只有小米创作 / 自己开过触控膜的 App 有反应）
+#   196 上滑 / 197 下滑（MIUI 上滑下滑；白名单 App 会被 MIUI 转成 92/93 翻页）
+#    92 截图键 / 93 速记键（"按住这个键 + 点屏幕"= 截图标注 / 灵感速记，系统级）
+# 想要"任何 App 里上滑下滑都翻页"，把 GESTURE_SLIDE_UP/DOWN 改成 92/93
+# （那就等于直接发 PAGE_UP/PAGE_DOWN，代价是 380ms 内会被 MIUI 当成截图/速记键待命）。
+GESTURE_RING=194
+GESTURE_DOUBLE=195
+GESTURE_SLIDE_UP=196
+GESTURE_SLIDE_DOWN=197
+# 笔尾那个按键：92 = 截图键（默认），93 = 速记键，-1 = 不管
+GESTURE_TAIL=92

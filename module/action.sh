@@ -16,6 +16,13 @@ echo "② PowerKeeper: $([ -e $MODDIR/disable-powerkeeper ] && echo '已禁用' 
 echo "③ BPF 监视器 : $([ -e $MODDIR/disable-bpfmon ] && echo '已禁用' || echo -n '已停 ') $(pidof hyper_bpfloader >/dev/null 2>&1 && echo '仍在运行(异常)' || echo 'hyper_bpfloader 未运行')"
 echo "④ 死电话栈   : $([ -e $MODDIR/disable-telephony ] && echo '已禁用' || echo -n '已停 ')$n_tele/3 个包$(pidof com.qti.phone >/dev/null 2>&1 && echo "，残留空转进程 $(pidof com.qti.phone)" || echo '，无残留进程')"
 echo "⑤ 吸附胶囊   : $cap  (引导标记 stylus_first_connect=$(settings get secure stylus_first_connect 2>/dev/null))"
+ge=on
+[ -e "$MODDIR/disable-gesture" ] && ge=off
+grep -q '^GESTURE=0' "$MODDIR/config" 2>/dev/null && ge=off
+gp=$(cat "$MODDIR/penring.pid" 2>/dev/null)
+echo "⑥ 手势桥     : $ge  penring $(kill -0 "$gp" 2>/dev/null && echo "运行中 pid=$gp" || echo '未运行')"
+echo "   虚拟笔     : $(grep -c 'Xiaomi Pen' /proc/bus/input/devices 2>/dev/null) 个 (0x0022/0x5081, type 8)"
+echo "   旧笔桥     : $(pidof penbridge_hyperos >/dev/null 2>&1 && echo 'lwky_pen 仍在运行(异常)' || echo 'lwky_pen 已停')"
 echo ' '
 echo '最近日志:'
 tail -n 14 "$MODDIR/wake.log" 2>/dev/null
