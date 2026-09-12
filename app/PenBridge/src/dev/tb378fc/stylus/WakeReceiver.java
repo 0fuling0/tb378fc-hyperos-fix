@@ -76,27 +76,42 @@ public final class WakeReceiver extends BroadcastReceiver {
     }
 
     /**
-     * 吸附时的胶囊。
+     * 吸附时的胶囊。按"越来越贵"的顺序取值：
+     *   1. `InputDevice.getBatteryState()` —— 公开 API、0 ms、自带充电状态；
+     *      只有装了 LSPosed hook（把数字板与蓝牙笔关联）才有值，没装就是 null
+     *   2. 守护传进来的线圈电量（root 读 sysfs，也是 0 ms，但只是线圈的读数）
+     *   3. 都拿不到才连一次 BLE 读标准电池服务（1~3 s）
      *
-     * @param battery 立刻要弹的数字；&lt;0 表示"守护已经直发弹过了，别重复弹"
-     * @param coil    守护已用它弹过的线圈电量；GATT 真值等于它就不补弹
+     * @param battery 守护要我们立刻弹的数字；&lt;0 表示"守护已经直发弹过了，别重复弹"
+     * @param coil    守护已用它弹过的线圈电量；最终值等于它就不补弹
      */
     static void attach(Context app, String mac, int battery, int coil, int state) {
         int st = (state == Capsule.STATE_CHARGING) ? Capsule.STATE_CHARGING : Capsule.STATE_IDLE;
-        boolean shown = Capsule.show(app, battery, st);
-        Log.i(PenBle.TAG, "ATTACH coil=" + coil + " battery=" + battery + " state=" + st
-                + " shown=" + shown);
 
-        PenBle.Result r = null;
-        try {
-            r = PenBle.readBattery(app, mac);
-        } catch (Throwable t) {
-            Log.e(PenBle.TAG, "battery read failed", t);
+        PenSystemBattery.Sample sys = PenSystemBattery.read(app);
+        int show = battery;
+        if (sys != null && sys.capacity >= 0) {
+            // 系统自己知道，就用它的（还带充电状态，比我们猜的 state 准）
+            show = sys.capacity;
+            st = sys.charging ? Capsule.STATE_CHARGING : Capsule.STATE_IDLE;
         }
-        if (r == null) return;
-        Log.i(PenBle.TAG, "ATTACH gatt " + r);
-        if (r.battery >= 0 && r.battery != coil && r.battery != battery) {
-            Capsule.show(app, r.battery, st);      // 真值不同，补一条校正
+        boolean shown = Capsule.show(app, show, st);
+        Log.i(PenBle.TAG, "ATTACH coil=" + coil + " battery=" + battery + " sys=" + sys
+                + " state=" + st + " shown=" + shown);
+
+        // 系统没给值 → 退回 GATT 读一次（装 hook 后这条路基本不会走到）
+        if (sys == null || sys.capacity < 0) {
+            PenBle.Result r = null;
+            try {
+                r = PenBle.readBattery(app, mac);
+            } catch (Throwable t) {
+                Log.e(PenBle.TAG, "battery read failed", t);
+            }
+            if (r == null) return;
+            Log.i(PenBle.TAG, "ATTACH gatt " + r);
+            if (r.battery >= 0 && r.battery != coil && r.battery != show) {
+                Capsule.show(app, r.battery, st);      // 真值不同，补一条校正
+            }
         }
     }
 }

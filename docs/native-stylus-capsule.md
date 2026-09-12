@@ -153,14 +153,26 @@ adb shell su -c 'am broadcast --user 0 \
 | `CAPSULE_DIRECT` | `1` | 守护直发原生广播（少一跳）；`0` = 只发 ATTACH 交给 App |
 | `CAPSULE_GATT` | `1` | 直发后再用 GATT 读真值，**不同**才补一条校正；`0` = 只信线圈值，不补弹 |
 
-### 电量从哪来
+### 电量从哪来（PenBridge 的取值顺序）
 
-| 来源 | 谁读 | 取值 | 特点 |
-|---|---|---|---|
-| `wls_tx/level` | `service.sh`（root） | 0..100 | 反向无线充电线圈看到的笔电量，**零延迟**；**取下时保留上一次的值**（实测吸附前读 100），握手瞬间会短暂为 0 |
-| `InputDevice.getBatteryState()` | PenBridge（公开 API，无需权限） | `isPresent/getCapacity/getStatus` | 最快最准且自带充电状态，**但依赖 LSPosed hook**（PenStylusHook 把数字板与蓝牙笔关联起来）。没装 hook 时 `dumpsys input` 里是 `NativeBattery=State{<not present>}, BluetoothState=null` |
-| GATT `0x180F/0x2A19` | PenBridge（普通 App） | 0..100 | 标准电池服务，真实但要连一次 BLE（1~3 s）；读到不同值会补发一条校正 |
-| `dumpsys bluetooth_manager` | — | 只有 `BatteryStateMachine state=Connected` | **没有电量数字**，不能当来源 |
+| 顺序 | 来源 | 谁读 | 成本 | 特点 |
+|---|---|---|---|---|
+| 1 | **`InputDevice.getBatteryState()`** | PenBridge（**公开 API，无需权限**） | **0 ms** | 自带 `getCapacity()` + `getStatus()`（充电状态），是**真值**。但要 LSPosed hook 把数字板与蓝牙笔关联起来；没装 hook 时 `isPresent()=false`，本类返回 null |
+| 2 | `wls_tx/level` | `service.sh`（root） | **0 ms** | 反向无线充电线圈读数；吸附时准，**取下时保留上一次的值**，握手瞬间会短暂为 0 |
+| 3 | GATT `0x180F/0x2A19` | PenBridge（普通 App） | **1~3 s** | 只在上面两条都拿不到时才走；要连一次 BLE |
+
+**关于"蓝牙读"的澄清**（别指望它更快）：
+
+- 从 App 侧"用蓝牙读一遍" = `connectGatt` → 发现服务 → 读 `0x2A19`，实测 **1~3 秒**，比线圈慢。
+- 蓝牙**协议栈**里确实一直有这支笔的电量（`Profile: BatteryService → BatteryStateMachine state=Connected`），
+  但第三方 App 拿不到：
+  - `BluetoothDevice.getBatteryLevel()` 不在公开 SDK 里（@SystemApi）；
+  - 这版 ROM 的蓝牙 APK（`com.android.bt.apex` → `Bluetooth.apk`）里虽然存在
+    `android.bluetooth.device.action.BATTERY_LEVEL_CHANGED` 字符串，但 `BatteryService` / `BatteryStateMachine`
+    里**没有 sendBroadcast**（已反编译确认），所以没有可监听的广播；
+  - `dumpsys bluetooth_manager` 里那行 `{profile connection policy(... BATTERY=100 ...)}` 是**连接策略**
+    （100 = allowed），不是电量数字，别被它骗了。
+- 唯一把"栈里的电量"暴露给普通 App 的窗口就是第 1 条 `InputDevice.getBatteryState()`。
 
 ### 吸附时的实测时间线（0.5 s 采样，`wls_tx/*`）
 
@@ -191,7 +203,8 @@ adb shell su -c 'am broadcast --user 0 \
 | 文件 | 作用 |
 |---|---|
 | `module/service.sh` | `--monitor` 里按 `POLL_MS` 轮询 `attached` 的 0→1 边沿；`send_attach()` 读 `wls_tx/level` 后**直发** `STYLUS_STATE_SOC`（`CAPSULE_DIRECT=1`），再按需转发 `ATTACH` 做 GATT 校正；`prepare_stylus_settings()` 补两个引导标记 |
-| `app/PenBridge/src/…/WakeReceiver.java` | `ACTION_ATTACH`：`coil`/`battery` 两个 extra 决定"要不要立刻弹"，GATT 真值不同才补一条 |
+| `app/PenBridge/src/…/WakeReceiver.java` | `ACTION_ATTACH`：按 ①系统 ②线圈 ③GATT 的顺序取值；`coil`/`battery` 两个 extra 决定"要不要立刻弹"，最终值等于已显示值就不补弹 |
+| `app/PenBridge/src/…/PenSystemBattery.java` | 用公开 API `InputDevice.getBatteryState()` 0 ms 取真值 + 充电状态（装了 hook 才有值） |
 | `app/PenBridge/src/…/Capsule.java` | 组装并发送 `STYLUS_STATE_SOC`（`battery/state/connect=5`），带范围校验 |
 | `app/PenBridge/src/…/PenBle.java` | `readBattery()`：GATT 连笔 → 读 `0x180F/0x2A19` → 断开，返回 `-1` 表示读不到 |
 | `module/config` | `CAPSULE` / `POLL_MS` / `CAPSULE_DIRECT` / `CAPSULE_GATT`；`disable-capsule` 标记只关胶囊、保留唤醒 |
