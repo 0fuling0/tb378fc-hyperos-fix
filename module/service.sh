@@ -122,7 +122,8 @@ PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在
 BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
 BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
-PENSTATE=/data/data/dev.tb378fc.stylus/files/penstate   # 由 LSPosed hook 写：canvas=1/0
+# 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
+PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.stylus/files/penstate"
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
@@ -350,10 +351,12 @@ brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
 
 # 画布是否可写（hook 写的 penstate；文件不存在时按"可写"处理，保持旧行为）
 brush_canvas() {
-    local v
-    v=$(sed -n 's/^canvas=//p' "$PENSTATE" 2>/dev/null | head -1)
-    [ -z "$v" ] && return 0
-    [ "$v" = "1" ]
+    local f v
+    for f in $PENSTATE_LIST; do
+        v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
+        [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
+    done
+    return 0
 }
 
 # 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
@@ -457,6 +460,8 @@ brush_watch_loop() {
             --prefs /data/data/com.miui.notes/shared_prefs \
             --prefs /data/data/com.miui.creation/shared_prefs \
             --prefs /data/data/dev.tb378fc.stylus/files \
+            --prefs /data/data/com.miui.notes/files \
+            --prefs /data/data/com.miui.creation/files \
             --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
         | while :; do
             if IFS= read -r -t 2 line; then
