@@ -64,7 +64,11 @@ public final class WakeReceiver extends BroadcastReceiver {
             @Override
             public void run() {
                 try {
-                    PenBle.Result r = PenBle.run(app, mac);
+                    // touchfilm：顺便重发一次 {8,6,mask} 触控膜功能位（默认全开 0x3F，
+                    // 传 -1 就只唤醒不改手势位）。笔重启/睡死会把功能位清零，
+                    // 联想原厂每次连接都会重发，HyperOS 上只能我们自己补。
+                    final int touchfilm = intent.getIntExtra("touchfilm", PenBle.TOUCHFILM_ALL);
+                    PenBle.Result r = PenBle.run(app, mac, touchfilm);
                     Log.i(PenBle.TAG, "WAKE " + r);
                 } catch (Throwable t) {
                     Log.e(PenBle.TAG, "wake failed", t);

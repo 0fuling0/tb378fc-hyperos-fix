@@ -54,6 +54,16 @@ public final class PenBle {
     public static final UUID CH_BATTERY = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb");
     public static final String DEFAULT_MAC = "DC:EB:4D:06:E0:95";
 
+    /**
+     * `{8,6,mask}` 触控膜功能位：笔上报哪些手势的总开关（ZUX `buildTouchfilmEnable`）。
+     *   0x01 双击 / 0x02 三击 / 0x04 上滑 / 0x08 下滑 / 0x10 捏合 / 0x20 笔尾
+     * 发 0x00 会让笔彻底不再上报双击/上滑/下滑/捏合（笔尖写字不受影响），
+     * 现象就是"手势突然全没了"——联想原厂每次连接都会重发一次全量 mask，
+     * HyperOS 上没有那个栈，所以这里替他发。
+     */
+    public static final int TOUCHFILM_ALL = 0x3F;
+    public static final int TOUCHFILM_REMOTE = 0x0D;   // 双击|上滑|下滑（原厂"遥控"组合）
+
     /** 一次 GATT 会话的目的 */
     static final int MODE_WAKE = 0;
     static final int MODE_BATTERY = 1;
@@ -61,28 +71,39 @@ public final class PenBle {
     public static final class Result {
         public boolean wakeSent;
         public boolean sawFe41;
+        /** `{8,6,mask}` 是否写成功 */
+        public boolean touchfilmSent;
         /** GATT 读到的电量；-1 = 没读到（无电池服务 / 读失败 / 超时） */
         public int battery = -1;
         public String detail = "";
         @Override public String toString() {
-            return "wakeSent=" + wakeSent + " fe41=" + sawFe41 + " battery=" + battery
-                    + " {" + detail + "}";
+            return "wakeSent=" + wakeSent + " touchfilm=" + touchfilmSent + " fe41=" + sawFe41
+                    + " battery=" + battery + " {" + detail + "}";
         }
     }
 
     private PenBle() { }
 
-    /** 连上笔 → 写唤醒命令 → 断开。最长阻塞 12 秒。 */
+    /** 连上笔 → 写唤醒命令 + 触控膜功能位全开 → 断开。最长阻塞 12 秒。 */
     public static Result run(Context ctx, String wantMac) {
-        return session(ctx, wantMac, MODE_WAKE);
+        return run(ctx, wantMac, TOUCHFILM_ALL);
+    }
+
+    /** @param touchfilmMask 要写的 `{8,6,mask}`；&lt;0 表示这次不写 */
+    public static Result run(Context ctx, String wantMac, int touchfilmMask) {
+        return session(ctx, wantMac, MODE_WAKE, touchfilmMask);
     }
 
     /** 连上笔 → 读标准电池服务的电量 → 断开。最长阻塞 12 秒；读不到时 battery = -1。 */
     public static Result readBattery(Context ctx, String wantMac) {
-        return session(ctx, wantMac, MODE_BATTERY);
+        return session(ctx, wantMac, MODE_BATTERY, -1);
     }
 
     static Result session(Context ctx, String wantMac, final int mode) {
+        return session(ctx, wantMac, mode, mode == MODE_WAKE ? TOUCHFILM_ALL : -1);
+    }
+
+    static Result session(Context ctx, String wantMac, final int mode, final int touchfilmMask) {
         final Result res = new Result();
         final StringBuilder log = new StringBuilder();
         HandlerThread ht = null;
@@ -127,6 +148,12 @@ public final class PenBle {
                     res.sawFe41 = c != null;
                     if (c == null) { say(log, "no fe41"); g.disconnect(); return; }
                     res.wakeSent = writeWake(log, g, c);
+                    if (touchfilmMask >= 0) {
+                        SystemClock.sleep(200);
+                        // {8,6,mask}：把笔端手势位重新打开（默认全开 0x3F）
+                        res.touchfilmSent = writeCmd(log, g, c,
+                                new byte[]{8, 6, (byte) (touchfilmMask & 0xFF)});
+                    }
                     SystemClock.sleep(500);
                     g.disconnect();
                 }
@@ -223,7 +250,13 @@ public final class PenBle {
 
     @SuppressWarnings("deprecation")
     static boolean writeWake(StringBuilder log, BluetoothGatt g, BluetoothGattCharacteristic c) {
-        byte[] v = new byte[]{5, 5};
+        return writeCmd(log, g, c, new byte[]{5, 5});
+    }
+
+    /** 往 FE41 写一帧（写类型 2，带响应；失败 200ms 后重试一次）。 */
+    @SuppressWarnings("deprecation")
+    static boolean writeCmd(StringBuilder log, BluetoothGatt g, BluetoothGattCharacteristic c,
+                            byte[] v) {
         /* Android 13 起 setValue+writeCharacteristic 被弃用，改用带 value 的新重载；
          * 这里优先走新 API（返回状态码），不行再退回老 API。 */
         try {
@@ -232,7 +265,7 @@ public final class PenBle {
             Object r = m.invoke(g, c, v, 2);
             if (r instanceof Integer) {
                 int code = (Integer) r;
-                say(log, "write rc=" + code);
+                say(log, "write " + hex(v) + " rc=" + code);
                 if (code == 0) return true;
                 SystemClock.sleep(200);
                 Object r2 = m.invoke(g, c, v, 2);
@@ -247,12 +280,21 @@ public final class PenBle {
             c.setValue(v);
             boolean b = g.writeCharacteristic(c);
             if (!b) { SystemClock.sleep(200); c.setValue(v); b = g.writeCharacteristic(c); }
-            say(log, "legacy write=" + b);
+            say(log, "legacy write " + hex(v) + "=" + b);
             return b;
         } catch (Throwable t) {
             say(log, "legacy failed " + t);
             return false;
         }
+    }
+
+    static String hex(byte[] v) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : v) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(String.format("%02x", b & 0xFF));
+        }
+        return sb.toString();
     }
 
     /** 找这支笔：优先根侧写入的 MAC，其次已配对设备里名字含 "Tab Pen" 的那个。 */

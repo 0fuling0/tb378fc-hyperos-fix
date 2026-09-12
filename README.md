@@ -20,9 +20,11 @@
 | ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
 | ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
 | ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
+| ⑥ | **笔端手势功能位** | 唤醒那一帧后面补写 `{8,6,0x3F}`（ZUX `buildTouchfilmEnable`：双击/三击/上滑/下滑/捏合/笔尾），开机与取下边沿各一次 —— 笔一旦重启/睡死这位会被清零，手势就全没了，联想原厂每次连接都重发 | `config` 里 `TOUCHFILM=-1`（只唤醒不改位） |
 
-原理细节都写在脚本文件头：`module/service.sh`（①③④⑤）、`module/post-fs-data.sh`（②）；
-⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**。
+原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
+⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，⑥ 的位定义见
+**`docs/zuxos-pen-protocol.md` §2.1**。
 
 ---
 

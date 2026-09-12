@@ -34,12 +34,48 @@ debugfs -R "dump /system/framework/services.jar /tmp/framework.jar" image/super_
 | `{8,4}` / `{8,5}` | `buildTouchfilmModeCmd` | 触控膜模式 A/B |
 | `{8,5,1..5}` | `buildSqueezeForceCmd` | **捏合力度**（1 轻…5 重） |
 | `{8,4,3,0/1}` | `buildSqueezeEnableCmd` | 捏合使能 |
-| `{8,6,bits}` | `buildEraserBackCmd` / `buildTouchfilmEnable` | 笔尾橡皮擦回传 / 触控膜功能位 |
+| `{8,6,mask}` | `buildTouchfilmEnable` | **触控膜功能位：笔上报哪些手势的总开关**（见 §2.1） |
 | `{8,7,x}` | `buildTailConfigCmd` | **笔尾按钮功能配置** |
+| `{10,0/1}` | `buildEraserBackCmd` | 笔尾橡皮擦回传（267 切橡皮→`{10,1}`，11 切回笔→`{10,0}`） |
 | `{12,0}` | `buildPadIdCmd` | 取 ID |
 | `{3,1,1,1}` | `writeActiveInfoFlag` | active info |
 | `{6,1}` / `{6,0}` | `setParker6DofSwitch` | 6DOF 通知开关（开时连带写 CCCD） |
 | `{2,2}` | `forceRebootParkerPen` | **强制重启笔**（设置项 `reboot_connected_parker_pen`） |
+
+### 2.1 `{8,6,mask}` 触控膜功能位（手势总开关）
+
+`BluetoothPenUtils.buildTouchfilmEnable(double, triple, slide, remote, squeeze, tail)`
+（从 `services.jar` 字节码逐条解出来的，`or-int/lit8` 常量如下）：
+
+| 位 | 值 | 手势 |
+|---|---|---|
+| bit0 | `0x01` | 双击 |
+| bit1 | `0x02` | 三击 |
+| bit2 | `0x04` | 上滑 |
+| bit3 | `0x08` | 下滑 |
+| bit4 | `0x10` | 捏合 |
+| bit5 | `0x20` | 笔尾 |
+
+- `slideEnable` 一次把 **0x04|0x08** 都置上（两个方向各一位）；
+- `remoteEnable`（遥控模式）置 **0x0D** = 双击|上滑|下滑；
+- **全开 = `{8,6,0x3F}`**；**全关 = `{8,6,0x00}`** → 笔从此不再上报双击/上滑/下滑/捏合
+  （笔尖写字、按键不受影响），现象就是"手势突然全都没反应"，只能重发 mask 恢复。
+
+**原厂什么时候发**：`BluetoothPenInputManager.setPenSwitchCmd()` —— 连接建立时（`BluetoothPenInputManager:99`）
+以及每次相关设置变化时（`:146-166`）都发一次**全量 mask**。来源设置项：
+
+| 设置 | 默认 | 位 |
+|---|---|---|
+| `Settings.Global pen_touch_film_tap_two` | 1 | 双击 |
+| `Settings.Global pen_touch_film_copy_paste` | **0** | 上滑/下滑 |
+| `Settings.Global pen_touch_film_squeeze` | **0** | 捏合 |
+| `Settings.Secure pen_set_remote_control_on` | 关 | 0x0D 遥控 |
+| `Settings.Global pen_click_tail_action`(1) / `pen_click_twice_tail_action`(0) | 1 / 0 | 笔尾 |
+| `Settings.System touchfilm_mode_config` | — | 触控膜模式 A/B |
+
+也就是说原厂默认只开"双击 + 笔尾"，上滑/下滑和捏合要在设置里打开。**HyperOS 上没有 ZUX 栈，
+没人发这一帧**，所以要么模块自己在唤醒/吸附流程里补发（建议 `{8,6,0x3F}`），要么用试验台手动发。
+
 
 ## 3. 马达帧（`ZuiPenHapticUtils`）
 

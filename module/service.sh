@@ -148,6 +148,9 @@ CAPSULE_GATT=1
 # 1（默认）= 边沿一到就先用**上一次的线圈电量**弹一条（~0.2s 出胶囊），1~2 秒后拿新值刷新；
 # 0 = 不抢跑，等线圈报出新值再弹（慢 1~2 秒，但第一眼就是本次的电量）
 CAPSULE_FAST=0
+# ⑥ 笔端触控膜功能位 {8,6,mask}：63=0x3F 全开（双击/三击/上滑/下滑/捏合/笔尾）；
+#    -1 = 只唤醒不改位。位定义见 docs/zuxos-pen-protocol.md §2.1
+TOUCHFILM=63
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -220,6 +223,16 @@ send() {
         log "$2 sent"
     else
         log "ERROR $2 failed"
+    fi
+}
+
+# 带 extra 的广播（例如 --ei touchfilm 63）
+send_extra() {
+    local action="$1" what="$2"; shift 2
+    if am broadcast --user 0 -n "$RCV" -a "$action" "$@" >/dev/null 2>&1; then
+        log "$what sent ($*)"
+    else
+        log "ERROR $what failed ($*)"
     fi
 }
 
@@ -431,7 +444,8 @@ case "$1" in
     fi
 
     if [ "$last_att" = 0 ]; then
-        send "$A_WAKE" "startup-wake"
+        # 开机时笔不在线圈上：唤醒它，并同步一次 {8,6,mask} 手势位（见 detach 处说明）
+        send_extra "$A_WAKE" "startup-wake" --ei touchfilm "${TOUCHFILM:-63}"
     fi
 
     while [ ! -e "$DISABLE" ]; do
@@ -449,7 +463,10 @@ case "$1" in
         # **必须同时清空 shown** —— 否则下一次吸附时"新电量 == 上次显示过的值"（比如笔一直是 100%），
         # 刷新逻辑会以为"这条已经弹过了"而整次都不弹（实测：连吸 3 次只有第 1 次出胶囊）。
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
-            send "$A_WAKE" "detach-wake"
+            # touchfilm=63(0x3F)：顺便把笔端触控膜功能位全开（双击/三击/上滑/下滑/捏合/笔尾）。
+            # 笔重启或睡死会把这位清零 → 手势全部消失；联想原厂每次连接都重发，这里替他发。
+            # 只要唤醒不改位就传 --ei touchfilm -1。
+            send_extra "$A_WAKE" "detach-wake" --ei touchfilm "${TOUCHFILM:-63}"
             tick=0
             refresh_at=0
             refresh_deadline=0
