@@ -1,11 +1,18 @@
-# 唤醒策略配置
+# 唤醒 / 胶囊 策略配置
 #
 # REFRESH_SECONDS=0   只按吸附状态触发（默认）：
 #                       取下 -> 发唤醒命令
-#                       吸附 -> 读电量并发一条通知
+#                       吸附 -> 弹原生电量胶囊（见 CAPSULE）
 #                     其余时间不打扰，笔按自己的节奏休眠
 #
 # REFRESH_SECONDS=120 额外安全网：未吸附期间每 120 秒补发一次唤醒。
 #                     适合"笔搁在桌上睡死了、你又不想吸附一下"的场景，
 #                     代价是笔在未吸附且平板闲置时会保持唤醒（耗笔的电）。
 REFRESH_SECONDS=0
+
+# CAPSULE=1   吸附时弹 HyperOS 原生电量胶囊（默认开）。
+#             做法：读 /sys/class/power_supply/wls_tx/level 拿到线圈看到的笔电量，
+#             交给 PenBridge 发一条 com.android.settings.stylus.STYLUS_STATE_SOC
+#             给 com.miui.securitycore（参数语义见 docs/native-stylus-capsule.md）。
+#             想单独关掉胶囊（保留唤醒）也可以建一个 disable-capsule 标记文件。
+CAPSULE=1

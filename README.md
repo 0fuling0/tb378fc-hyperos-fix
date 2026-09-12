@@ -1,15 +1,17 @@
 # TB378FC HyperOS 修复 —— 源码树
 
-联想小新 Pad Pro GT 13（**TB378FC**）刷 HyperOS 移植包（`OS3.0.307.0.WPYCNXM` / Android 16）之后的四项修复。
+联想小新 Pad Pro GT 13（**TB378FC**）刷 HyperOS 移植包（`OS3.0.307.0.WPYCNXM` / Android 16）之后的五项修复。
 本目录是**可构建的源码树**：模块脚本 + PenBridge 应用源码 + PowerKeeper payload 的重建工具链。
 
-> 说明：`module/` 里的文件是从设备上**已安装的 v3.0 模块**原样拉下来的
+> 说明：`module/` 里的文件最初是从设备上**已安装的 v3.0 模块**原样拉下来的
 > （`adb exec-out su -c "tar -cf - -C /data/adb/modules tb378fc_hyperos_fix"`），
 > 只去掉了运行期状态（`wake.log` / `.monitor.lock/` / `.apk.sha`），并补回了安装期才用到的 `customize.sh`。
+> 当前版本 **v3.1** 在此基础上加了 ⑤ 吸附胶囊：`service.sh` / `config` / `action.sh` / `module.prop` /
+> `app/PenBridge`（`Capsule.java` + `WakeReceiver` 的 ATTACH 分支 + `PenBle.readBattery`）。
 
 ---
 
-## 四项修复
+## 五项修复
 
 | # | 修复 | 做法 | 关掉的标记文件 |
 |---|---|---|---|
@@ -17,8 +19,10 @@
 | ② | **PowerKeeper 修复** | 用打好两处字节补丁的 `PowerKeeper.apk` 在 `post-fs-data` 阶段 bind mount 覆盖 `/system_ext/app/PowerKeeper/PowerKeeper.apk` | `module/disable-powerkeeper` |
 | ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
 | ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
+| ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
 
-原理细节都写在脚本文件头：`module/service.sh`（①③④）、`module/post-fs-data.sh`（②）。
+原理细节都写在脚本文件头：`module/service.sh`（①③④⑤）、`module/post-fs-data.sh`（②）；
+⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**。
 
 ---
 
@@ -27,22 +31,22 @@
 ```
 tb378fc-hyperos-fix/
 ├── build.sh                     # 一键构建 + 打包（KernelSU 模块 zip）
-├── module/                      # 打进 zip 的内容（= 设备上那份 v3.0）
-│   ├── module.prop              # id / 版本 / 四项描述
-│   ├── customize.sh             # 安装期权限设置（从 v2.0 安装包恢复，按 v3.0 清单更新）
+├── module/                      # 打进 zip 的内容（设备上那份 v3.0 + ⑤ 胶囊）
+│   ├── module.prop              # id / 版本 / 五项描述
+│   ├── customize.sh             # 安装期权限设置（从 v2.0 安装包恢复，按 v3.1 清单更新）
 │   ├── post-fs-data.sh          # ② PowerKeeper 覆盖 + 开机清锁
-│   ├── service.sh               # ①③④ 的状态机 / 看护进程
-│   ├── action.sh                # KernelSU「操作」按钮里显示四项状态
+│   ├── service.sh               # ①③④⑤ 的状态机 / 看护进程
+│   ├── action.sh                # KernelSU「操作」按钮里显示五项状态
 │   ├── uninstall.sh             # 卸载：停守护、卸 APK、**故意不**恢复死电话包
-│   ├── config                   # REFRESH_SECONDS 等可调项
+│   ├── config                   # REFRESH_SECONDS / CAPSULE 等可调项
 │   ├── tools/
 │   │   ├── patch_powerkeeper.py # 字节补丁：startCloudSyncData 的 return v0 -> return-void
 │   │   └── fix_static.py        # 结构补丁：isFeatureOn 移入 direct_methods + ACC_STATIC
 │   ├── bin/PenBridge.apk        # ① 的载体（构建产物，见 app/PenBridge）
 │   └── payload/PowerKeeper.apk  # ② 的载体（构建产物，见 payload-src）
-├── app/PenBridge/               # PenBridge.apk 源码（BLE 唤醒 / 电量读取）
-│   ├── AndroidManifest.xml      # dev.tb378fc.stylus，versionCode 10 / 3.0
-│   ├── src/dev/tb378fc/stylus/  # PenBle.java, WakeReceiver.java, WakeActivity.java
+├── app/PenBridge/               # PenBridge.apk 源码（BLE 唤醒 / 电量读取 / 胶囊转发）
+│   ├── AndroidManifest.xml      # dev.tb378fc.stylus，versionCode 11 / 3.1
+│   ├── src/dev/tb378fc/stylus/  # PenBle.java, WakeReceiver.java, WakeActivity.java, Capsule.java
 │   ├── res/                     # 图标
 │   ├── tools/make_icons.py      # 图标生成
 │   ├── penwake.jks              # 签名密钥（store/key pass 都是 penwake）
@@ -77,7 +81,7 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 ```
 app/PenBridge/PenBridge.apk              （同时拷进 module/bin/）
 extras/PenStylusHook/PenStylusHook.apk   （--hook）
-out/tb378fc_hyperos_fix-v3.0.zip         KernelSU 模块包（zip 根 = module/ 的内容）
+out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 的内容）
 ```
 
 刷入：把 zip 交给 KernelSU 管理器，或 `su -c "magisk --install-module out/tb378fc_hyperos_fix-v3.0.zip"`，
@@ -98,6 +102,42 @@ out/tb378fc_hyperos_fix-v3.0.zip         KernelSU 模块包（zip 根 = module/ 
 - 必须 `post-fs-data`（早于 PackageManager 扫描包）阶段覆盖；`service.sh` 阶段太晚。
 
 ---
+
+### ⑤ 胶囊：触发方法与参数（详版见 docs/native-stylus-capsule.md）
+
+触发链：
+
+```
+wls_tx/attached 0->1（吸附）
+  └─ service.sh --monitor：sleep 2 等线圈认出笔，读 wls_tx/level
+       └─ am broadcast … dev.tb378fc.stylus.ATTACH --ei battery <level> --ei state 4
+            └─ PenBridge/WakeReceiver：先 Capsule.show() 立刻弹，再 GATT(0x180F/0x2A19) 读真值补一条
+                 └─ com.android.settings.stylus.STYLUS_STATE_SOC
+                      → com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
+                        → MiuiStylusBatteryManager → 浮窗 "StylusBattery"
+```
+
+发给 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：
+
+| extra | 取值 | 说明 |
+|---|---|---|
+| `battery` | `0..100` | 胶囊显示的电量；非法值本模块直接不发（否则显示 "-1"） |
+| `state` | `4`=充电中（⚡）/ `2`=未充电 | 吸附时固定 `4` |
+| `connect` | **`5`=已连接（唯一会直接弹电量胶囊的值）**；`0/1/3/4/7/8/9` 见文档 | 本模块固定 `5` |
+
+前置条件：`settings put secure stylus_first_connect 1`（否则只走"首次连接引导"不弹胶囊）——
+`service.sh` 的 `prepare_stylus_settings()` 会自动补写；`setting_stylus_version` 需非 0（本机为 1）。
+
+手动验证（绕过守护直接弹）：
+
+```bash
+adb shell am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
+  -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
+  --ei battery 88 --ei state 4 --ei connect 5
+```
+
+**不要**发 `STYLUS_BATTERY_NOTIFY` 的 `battery=80`、也不要发 `connect=9`：这两个会调用
+`IMiCharge.setWirelessChargingEnabled(...)`，真的会开关反向无线充电。
 
 ## 已知取舍
 

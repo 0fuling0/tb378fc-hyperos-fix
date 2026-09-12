@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 构建 PenBridge.apk —— 手写笔 BLE 唤醒 + 电量读取（模块 bin/ 里那个应用）。
+# 构建 PenBridge.apk —— 手写笔 BLE 唤醒 + 电量读取 + 吸附胶囊转发（模块 bin/ 里那个应用）。
 # 直接用 aapt2 + javac + d8 + zipalign + apksigner，不依赖 Gradle。
 #
-# 产物：app/PenBridge/PenBridge.apk（versionCode 10 / versionName 3.0，与设备上装的一致）
+# 产物：app/PenBridge/PenBridge.apk（versionCode 11 / versionName 3.1）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -12,8 +12,8 @@ PLATFORM="${ANDROID_PLATFORM:-android-36}"
 AJ="$SDK/platforms/$PLATFORM/android.jar"
 KS="$HERE/penwake.jks"
 OUT="$HERE/build"
-VERSION_CODE=10
-VERSION_NAME=3.0
+VERSION_CODE=11
+VERSION_NAME=3.1
 
 [ -x "$BT/aapt2" ] || { echo "找不到 aapt2：$BT（用 BT_DIR= 指定 build-tools 目录）" >&2; exit 1; }
 [ -f "$AJ" ] || { echo "找不到 android.jar：$AJ（用 ANDROID_PLATFORM= 指定平台）" >&2; exit 1; }

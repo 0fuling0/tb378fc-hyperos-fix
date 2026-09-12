@@ -1,12 +1,13 @@
 #!/system/bin/sh
 # TB378FC HyperOS 修复 —— 服务脚本
 #
-# 本模块做四件事：
+# 本模块做五件事：
 #   ① 手写笔唤醒   —— 否则笔闲置后 MCU 休眠、蓝牙却仍显示已连接，笔看起来"死了"
 #   ② PowerKeeper  —— 见 post-fs-data.sh（修补移植包改坏的两处字节码）
 #   ③ 停 BPF 监视器 —— 否则开 DroidSpaces 容器后会被 hyper_bpfloader 重启进 recovery
 #   ④ 停死电话栈   —— 否则移植包自带的 persistent 电话组件每秒崩几百次，
 #                     白烧 zygote / system_server，并连带把系统 feature flags 反复重置
+#   ⑤ 手写笔胶囊   —— 吸附时弹 HyperOS 原生的电量胶囊（否则这支联想笔在系统眼里不存在）
 #
 # ① 的原理
 # --------
@@ -20,8 +21,19 @@
 #
 # 触发源只认吸附状态（/sys/class/power_supply/wls_tx/attached），与屏幕状态无关：
 #     1 -> 0  取下笔      发唤醒命令
-#     0 -> 1  吸附笔      读电量/充电状态，发一条普通系统通知
+#     0 -> 1  吸附笔      弹原生电量胶囊（见 ⑤）
 #     启动时若笔已取下    补发一次唤醒
+#
+# ⑤ 的原理
+# --------
+# 胶囊不是 SystemUI 画的，而是 SecurityCoreAdd（com.miui.securitycore）里
+# com.miui.miinput.stylus 那套；原生由小米笔的 MIPP/BLE 协议栈
+# （BluetoothExtension 的 MiuiBleOobHelperService）发广播驱动：
+#     com.android.settings.stylus.STYLUS_STATE_SOC   extras: battery / state / connect
+# 联想笔走普通 BT HID，不说 MIPP，所以谁都不发。这里在吸附边沿读反向无线充电线圈看到的
+# 笔电量（/sys/class/power_supply/wls_tx/level），把 ATTACH 广播交给 PenBridge，
+# 由它转成上面那条原生广播；GATT 能读到真值时再补一条校正。
+# 参数语义、前置条件与踩坑见 docs/native-stylus-capsule.md。
 #
 # ③ 的原理
 # --------
@@ -94,6 +106,7 @@
 #     disable-powerkeeper  ② PowerKeeper 补丁（见 post-fs-data.sh）
 #     disable-bpfmon       ③ BPF 监视器拆弹
 #     disable-telephony    ④ 死电话栈
+#     disable-capsule      ⑤ 吸附胶囊（只关胶囊，唤醒照常）
 
 MODDIR=${0%/*}
 LOG="$MODDIR/wake.log"
@@ -101,12 +114,17 @@ LOCK="$MODDIR/.monitor.lock"
 DISABLE="$MODDIR/disable"
 DISABLE_BPFMON="$MODDIR/disable-bpfmon"
 DISABLE_TELEPHONY="$MODDIR/disable-telephony"
+DISABLE_CAPSULE="$MODDIR/disable-capsule"
 CFG="$MODDIR/config"
 ATT=/sys/class/power_supply/wls_tx/attached
+# ⑤ 胶囊：反向无线充电线圈看到的笔电量/充电状态（root 才读得到）
+WLS_LEVEL=/sys/class/power_supply/wls_tx/level
+WLS_CHG=/sys/class/power_supply/wls_tx/charge_state
 PKG=dev.tb378fc.stylus
 RCV="$PKG/.WakeReceiver"
 APK="$MODDIR/bin/PenBridge.apk"
 A_WAKE=dev.tb378fc.stylus.WAKE
+A_ATTACH=dev.tb378fc.stylus.ATTACH
 
 # ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
 TELEPHONY_PKGS="com.qti.phone com.qualcomm.qcrilmsgtunnel com.qualcomm.qti.telephonyservice"
@@ -115,11 +133,25 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
 # 可选配置项；未知键自然被忽略
 REFRESH_SECONDS=0
+CAPSULE=1
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
     local v="$REFRESH_SECONDS"
     case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+# ⑤ 是否要弹胶囊：config CAPSULE=1（默认）且没有 disable-capsule 标记
+capsule_enabled() {
+    [ -e "$DISABLE_CAPSULE" ] && return 1
+    case "$CAPSULE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+# 读一个 sysfs 整数，非法时回落到默认值
+read_int() {
+    local v
+    v=$(cat "$1" 2>/dev/null)
+    case "$v" in ''|*[!0-9-]*) echo "$2" ;; *) echo "$v" ;; esac
 }
 
 read_att() {
@@ -150,6 +182,45 @@ send() {
         log "$2 sent"
     else
         log "ERROR $2 failed"
+    fi
+}
+
+# ⑤ 前置：SecurityCoreAdd 的胶囊代码只在"不是首次连接"时才弹电量胶囊，否则走首次引导。
+# 这两个 key 是"首次连接引导已看过"的标记（未设置时 getIntForUser 取 0 → 判定为首次）。
+prepare_stylus_settings() {
+    local cur
+    cur=$(settings get secure stylus_first_connect 2>/dev/null)
+    if [ "$cur" != "1" ]; then
+        if settings put secure stylus_first_connect 1 >/dev/null 2>&1; then
+            log "stylus_first_connect 1 (was ${cur:-unset})"
+        else
+            log "ERROR stylus_first_connect write failed"
+        fi
+    fi
+    cur=$(settings get secure touch_film_stylus_first_connect 2>/dev/null)
+    if [ "$cur" != "1" ]; then
+        if settings put secure touch_film_stylus_first_connect 1 >/dev/null 2>&1; then
+            log "touch_film_stylus_first_connect 1 (was ${cur:-unset})"
+        fi
+    fi
+}
+
+# ⑤ 吸附边沿：把线圈读到的笔电量/充电状态交给 PenBridge，由它去发
+#    com.android.settings.stylus.STYLUS_STATE_SOC（参数语义见 docs/native-stylus-capsule.md）。
+#    battery 非法（非 0..100）时传 -1，让 App 自己走 GATT 读。
+send_attach() {
+    local batt state chg
+    batt=$(read_int "$WLS_LEVEL" -1)
+    case "$batt" in ''|*[!0-9]*) batt=-1 ;; esac
+    if [ "$batt" -lt 0 ] || [ "$batt" -gt 100 ]; then batt=-1; fi
+    # 吸附边沿上笔就是在充电线圈上，state=4（图标带闪电）；coil_chg 只写进日志备查
+    state=4
+    chg=$(read_int "$WLS_CHG" -1)
+    if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
+            --ei battery "$batt" --ei state "$state" >/dev/null 2>&1; then
+        log "attach-capsule sent (battery=$batt state=$state coil_chg=$chg)"
+    else
+        log "ERROR attach-capsule failed"
     fi
 }
 
@@ -283,7 +354,12 @@ case "$1" in
     REFRESH=$(refresh_seconds)
     last_att=$(read_att 1)
     tick=0
-    log "monitor start attached=$last_att refresh=${REFRESH}s"
+    if capsule_enabled; then
+        prepare_stylus_settings
+        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=on"
+    else
+        log "monitor start attached=$last_att refresh=${REFRESH}s capsule=off"
+    fi
 
     if [ "$last_att" = 0 ]; then
         send "$A_WAKE" "startup-wake"
@@ -296,6 +372,13 @@ case "$1" in
 
         if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
             send "$A_WAKE" "detach-wake"
+            tick=0
+        elif [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
+            # ⑤ 吸附：等线圈跟笔握上手（约 1~2 秒）再读 wls_tx/level，然后弹原生胶囊
+            if capsule_enabled; then
+                sleep 2
+                send_attach
+            fi
             tick=0
         elif [ "$att" = 0 ] && [ "$REFRESH" -gt 0 ] && [ "$tick" -ge "$REFRESH" ]; then
             send "$A_WAKE" "refresh-wake"
