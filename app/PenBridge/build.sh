@@ -33,16 +33,35 @@ echo "== aapt2"
   --java "$OUT/gen" --min-sdk-version 30 --target-sdk-version 30 \
   --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
 
+STUB="$HERE/stub-patches"
+if [ -d "$STUB" ]; then
+  echo "== javac (Xposed 桩：编译用，不进 dex)"
+  mkdir -p "$OUT/stub"
+  javac -nowarn -classpath "$AJ" -d "$OUT/stub" $(find "$STUB" -name '*.java')
+  STUB_CP="$OUT/stub:"
+else
+  STUB_CP=""
+fi
+
 echo "== javac"
-javac -nowarn -classpath "$AJ:$OUT/gen" -d "$OUT/classes" \
+javac -nowarn -classpath "$AJ:$STUB_CP$OUT/gen" -d "$OUT/classes" \
   $(find "$HERE/src" -name '*.java') $(find "$OUT/gen" -name '*.java')
 
-echo "== d8"
-"$BT/d8" --min-api 30 --lib "$AJ" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class') >/dev/null
+echo "== d8（过滤掉 de/robv/android/xposed 桩）"
+CLASSES=()
+while IFS= read -r f; do
+  rel="${f#"$OUT"/classes/}"
+  case "$rel" in de/robv/android/xposed/*) continue ;; esac
+  CLASSES+=("$f")
+done < <(find "$OUT/classes" -name '*.class')
+"$BT/d8" --min-api 30 --lib "$AJ" --output "$OUT/dex" "${CLASSES[@]}" >/dev/null
 
 echo "== assemble"
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
 (cd "$OUT/dex" && zip -q -0 "$OUT/unsigned.apk" classes.dex)
+# LSPosed 入口 + 作用域（只有模块才需要，普通应用多这两个文件也无害）
+[ -d "$HERE/assets" ] && (cd "$HERE" && zip -q "$OUT/unsigned.apk" assets/xposed_init)
+[ -d "$HERE/META-INF/xposed" ] && (cd "$HERE" && zip -q "$OUT/unsigned.apk" META-INF/xposed/scope.list)
 "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
 echo "== sign"

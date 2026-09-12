@@ -14,6 +14,11 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:hasCode="true">
+        <!-- LSPosed：本 APK 同时是 Xposed 模块（画布焦点 + 笔尾=橡皮） -->
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+        <meta-data android:name="xposeddescription" android:value="联想笔手势/笔刷触感桥：让笔记与小米创作把笔尾当橡皮、只在画布聚焦时振动" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
 
         <receiver
             android:name=".WakeReceiver"

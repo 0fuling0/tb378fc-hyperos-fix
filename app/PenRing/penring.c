@@ -395,6 +395,7 @@ static int watch_mode(int argc, char **argv, int start)
     int npref = 0;
     int ifd, i, tail_state = -1, touch_fd = -1;
     const char *match = "creation_shpref.xml";
+    const char *match2 = "penstate";
 
     for (i = start; i < argc; i++) {
         if (!strcmp(argv[i], "--prefs") && i + 1 < argc && npref < 8)
@@ -441,7 +442,8 @@ static int watch_mode(int argc, char **argv, int start)
             ssize_t off = 0;
             while (got > 0 && off + (ssize_t)sizeof(struct inotify_event) <= got) {
                 struct inotify_event *ev = (struct inotify_event *)(buf + off);
-                if (ev->len > 0 && ev->name[0] != '.' && !strcmp(ev->name, match)) {
+                if (ev->len > 0 && ev->name[0] != '.' &&
+                    (!strcmp(ev->name, match) || !strcmp(ev->name, match2))) {
                     const char *d = "?";
                     int k;
                     for (k = 0; k < npref; k++)

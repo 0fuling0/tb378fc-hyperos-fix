@@ -122,6 +122,7 @@ PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在
 BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
 BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
+PENSTATE=/data/data/dev.tb378fc.stylus/files/penstate   # 由 LSPosed hook 写：canvas=1/0
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
@@ -188,6 +189,9 @@ BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
 BRUSH_ERASER_STATES=""
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
+BRUSH_AI_WAVE=36                             # AI 笔刷（current_ai_brush=true）用的波形
+BRUSH_LASSO_STATES=""                        # 框选笔的 select_state_save 值（看日志填）
+BRUSH_LASSO_WAVE=36                          # 框选笔用的波形
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
@@ -324,16 +328,38 @@ brush_decide_wave() {
         [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
         [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
     done
+    for w in $BRUSH_LASSO_STATES; do
+        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
+    done
     w=$(brush_wave_of "$cur")
     [ -n "$w" ] && { echo "$w"; return 0; }
+    if [ "$(brush_tool_val "$sig" current_ai_brush)" = "true" ]; then
+        echo "$BRUSH_AI_WAVE"; return 0
+    fi
     w=$(brush_wave_of "$sel")
     [ -n "$w" ] && { echo "$w"; return 0; }
+    if [ "$(brush_tool_val "$sig" ai_type)" != "0" ] && [ -n "$(brush_tool_val "$sig" ai_type)" ]; then
+        echo "$BRUSH_AI_WAVE"; return 0
+    fi
     echo ""
 }
 
 brush_now()  { cat "$BRUSH_STATE" 2>/dev/null; }
 brush_base() { cat "$BRUSH_BASE" 2>/dev/null; }
 brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
+
+# 画布是否可写（hook 写的 penstate；文件不存在时按"可写"处理，保持旧行为）
+brush_canvas() {
+    local v
+    v=$(sed -n 's/^canvas=//p' "$PENSTATE" 2>/dev/null | head -1)
+    [ -z "$v" ] && return 0
+    [ "$v" = "1" ]
+}
+
+# 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
+brush_tell_hooks() {
+    am broadcast --user 0 -a dev.tb378fc.stylus.TAIL --ei down "$1" >/dev/null 2>&1 &
+}
 
 brush_send() {
     # $1 = 波形 id（0 = 停）；$2 = 原因；$3 = 非空表示"这是笔刷基准值"
@@ -349,6 +375,11 @@ brush_send() {
         return 0
     fi
     [ -n "$setbase" ] && echo "$wave" > "$BRUSH_BASE"
+    # 画布没聚焦（弹窗/面板打开、App 不在前台）就先不响，等 penstate 说 canvas=1 再放
+    if [ -z "$setbase" ] && ! brush_canvas; then
+        brush_log "skip wave=$wave ($why)：画布未聚焦"
+        return 0
+    fi
     [ "$wave" = "$now" ] && return 0
     send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave" \
         --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
@@ -425,6 +456,7 @@ brush_watch_loop() {
         "$PENRING_BIN" --watch \
             --prefs /data/data/com.miui.notes/shared_prefs \
             --prefs /data/data/com.miui.creation/shared_prefs \
+            --prefs /data/data/dev.tb378fc.stylus/files \
             --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
         | while :; do
             if IFS= read -r -t 2 line; then
@@ -437,14 +469,24 @@ brush_watch_loop() {
                             */com.miui.creation/*) pkg=com.miui.creation ;;
                             *) pkg="" ;;
                         esac
-                        [ -n "$pkg" ] && brush_scan_one "$pkg" ;;
+                        [ -n "$pkg" ] && brush_scan_one "$pkg"
+                        case "$line" in
+                            *" penstate")
+                                if brush_canvas; then
+                                    [ -n "$(brush_base)" ] && brush_send "$(brush_base)" "canvas focused"
+                                else
+                                    brush_send 0 "canvas lost"
+                                fi ;;
+                        esac ;;
                     "TAIL down")
                         echo 1 > "$BRUSH_TAIL"
+                        brush_tell_hooks 1
                         if [ -n "$(brush_base)" ]; then
                             brush_send "$BRUSH_ERASER" "tail(eraser) in range"
                         fi ;;
                     "TAIL up")
                         echo 0 > "$BRUSH_TAIL"
+                        brush_tell_hooks 0
                         if [ -n "$(brush_base)" ]; then
                             brush_send "$(brush_base)" "tip back"
                         fi ;;
