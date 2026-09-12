@@ -716,6 +716,8 @@ case "$1" in
     log "brushwatch up (apps=$BRUSH_APPS level=$BRUSH_LEVEL map=$BRUSH_MAP eraser=$BRUSH_ERASER)"
     : > "$BRUSH_STATE"
     : > "$BRUSH_BASE"
+    # 启动先清一次：上一轮守护可能被重启过，笔里还挂着 CON 波形
+    brush_send 0 "watch start"
 
     brush_watch_loop
     rmdir "$BRUSH_LOCK" 2>/dev/null
