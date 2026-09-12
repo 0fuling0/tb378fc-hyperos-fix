@@ -79,13 +79,24 @@ fi
 # 这里在 post-fs-data（SystemServer 起来之前）把那份目录 bind mount 过去。
 # 关掉：建 marker 文件 disable-aon。
 AON_SRC=/product/etc/cust_features
+AON_WORK="$MODDIR/mi_ext/product/etc/cust_features"   # 可写的工作副本（/ 是 erofs 只读）
 AON_DST=/mi_ext/product/etc/cust_features
-# 注意：/ 是 erofs 只读，/mi_ext 也在上面 → 直接 mkdir 会 "Read-only file system"。
-# 先拿 tmpfs 盖住 /mi_ext（挂载点在已有目录上是允许的），再建目录 + bind mount。
 if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
+    mkdir -p "$AON_WORK" 2>/dev/null
+    cp -a "$AON_SRC"/. "$AON_WORK"/ 2>/dev/null
+    # 解析器可能只读 cust_features.xml（实测里面没有 config_supported_aon_devices，
+    # 它在 device_features.xml 里）→ 两边都保证有 true
+    for f in "$AON_WORK/cust_features.xml" "$AON_WORK/device_features.xml"; do
+        [ -f "$f" ] || continue
+        if ! grep -q config_supported_aon_devices "$f" 2>/dev/null; then
+            sed -i 's#<cust_feature>#<cust_feature>\n        <bool name="config_supported_aon_devices">true</bool>#' "$f" 2>/dev/null
+            log_msg "⑧ 往 $(basename "$f") 注入 config_supported_aon_devices=true"
+        fi
+    done
+    # /mi_ext 在只读 erofs 上：先 tmpfs 盖一层再建目录
     mount -t tmpfs tmpfs /mi_ext 2>/dev/null
-    if mkdir -p "$AON_DST" 2>/dev/null && mount --bind "$AON_SRC" "$AON_DST" 2>/dev/null; then
-        log_msg "⑧ mi_ext cust_features ok: $AON_SRC -> $AON_DST (tmpfs+bind)"
+    if mkdir -p "$AON_DST" 2>/dev/null && mount --bind "$AON_WORK" "$AON_DST" 2>/dev/null; then
+        log_msg "⑧ mi_ext cust_features ok (工作副本 → $AON_DST)"
     else
         log_msg "⑧ ERROR mi_ext cust_features 挂载失败"
     fi
