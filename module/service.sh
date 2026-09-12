@@ -473,7 +473,13 @@ brush_watch_loop() {
                         case "$line" in
                             *" penstate")
                                 if brush_canvas; then
-                                    [ -n "$(brush_base)" ] && brush_send "$(brush_base)" "canvas focused"
+                                    brush_tell_hooks "$(brush_tail_in && echo 1 || echo 0)"
+                                    if [ -n "$(brush_base)" ]; then
+                                        brush_send "$(brush_base)" "canvas focused"
+                                    else
+                                        # 启动后第一次拿到画布：先看看现在选的是哪支笔
+                                        brush_scan_apps
+                                    fi
                                 else
                                     brush_send 0 "canvas lost"
                                 fi ;;

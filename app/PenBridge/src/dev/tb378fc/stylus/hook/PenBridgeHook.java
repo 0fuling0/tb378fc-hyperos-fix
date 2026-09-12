@@ -54,6 +54,9 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     private static volatile Context sApp;
     private static int sDialogs = 0;
     private static int sPopups = 0;
+    /** 广播接收器只能注册一次；注册时机推迟到拿到 Context（第一次 onResume） */
+    private static volatile boolean sReceiverReady = false;
+    private static BroadcastReceiver sTailReceiver;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -62,7 +65,9 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
 
         hookToolType(lpparam);
         hookLifecycle(lpparam);
-        registerStateReceiver();
+        // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
+        // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
+        tryRegisterReceiver();
         Log.i(TAG, "hooked " + pkg + " (api=" + Build.VERSION.SDK_INT + ")");
     }
 
@@ -92,6 +97,7 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     try { sApp = ((Activity) p.thisObject).getApplicationContext(); } catch (Throwable ignored) { }
+                    tryRegisterReceiver();
                     updateCanvas(true, "activity resume");
                 }
             });
@@ -158,14 +164,15 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
     }
 
     /** 根侧守护用广播告诉我们笔尾状态（动态注册的接收器能收到隐式广播） */
-    private void registerStateReceiver() {
+    private static void tryRegisterReceiver() {
+        if (sReceiverReady) return;
         try {
             Context ctx = currentApp();
-            if (ctx == null) { Log.w(TAG, "no app context yet, tail state disabled"); return; }
+            if (ctx == null) { Log.w(TAG, "no app context yet, will retry on resume"); return; }
             IntentFilter filter = new IntentFilter();
             filter.addAction(ACTION_TAIL);
             filter.addAction(ACTION_FORCE_FOCUS);
-            ctx.registerReceiver(new BroadcastReceiver() {
+            sTailReceiver = new BroadcastReceiver() {
                 @Override public void onReceive(Context context, Intent intent) {
                     String a = intent == null ? "" : String.valueOf(intent.getAction());
                     if (ACTION_TAIL.equals(a)) {
@@ -179,7 +186,22 @@ public class PenBridgeHook implements IXposedHookLoadPackage {
                         updateCanvas(intent.getIntExtra("canvas", 0) != 0, "forced");
                     }
                 }
-            }, filter);
+            };
+            /* API 33+ 注册非系统广播必须显式声明导出与否；这里要收 shell/root 发来的广播 → EXPORTED(2)。
+             * 用反射调 3 参重载，免得在旧 API 上 NoSuchMethod。 */
+            boolean ok = false;
+            if (Build.VERSION.SDK_INT >= 33) {
+                try {
+                    java.lang.reflect.Method m = Context.class.getMethod("registerReceiver",
+                            BroadcastReceiver.class, IntentFilter.class, int.class);
+                    m.invoke(ctx, sTailReceiver, filter, 2 /* RECEIVER_EXPORTED */);
+                    ok = true;
+                } catch (Throwable t) {
+                    Log.w(TAG, "registerReceiver(flags) failed, fallback", t);
+                }
+            }
+            if (!ok) ctx.registerReceiver(sTailReceiver, filter);
+            sReceiverReady = true;
             Log.i(TAG, "tail receiver registered");
         } catch (Throwable t) {
             Log.e(TAG, "register receiver failed", t);
