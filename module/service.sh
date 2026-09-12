@@ -117,6 +117,10 @@ DISABLE_TELEPHONY="$MODDIR/disable-telephony"
 DISABLE_CAPSULE="$MODDIR/disable-capsule"
 DISABLE_GESTURE="$MODDIR/disable-gesture"
 DISABLE_ROMPEN="$MODDIR/disable-rompen"
+DISABLE_BRUSH="$MODDIR/disable-brush"
+PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在这个节点上）
+BRUSH_STATE="$MODDIR/brush.state"       # "<波形id> <包名>"，两个子循环共享
+BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
 CFG="$MODDIR/config"
@@ -128,6 +132,7 @@ PKG=dev.tb378fc.stylus
 RCV="$PKG/.WakeReceiver"
 APK="$MODDIR/bin/PenBridge.apk"
 A_WAKE=dev.tb378fc.stylus.WAKE
+A_HAPTIC=dev.tb378fc.stylus.HAPTIC
 A_ATTACH=dev.tb378fc.stylus.ATTACH
 # ⑤ 原生胶囊广播（发给 SecurityCoreAdd）
 A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
@@ -167,6 +172,14 @@ GESTURE_SLIDE_DOWN=197
 GESTURE_TAIL=92
 # ⑥ 把"设置 → 手写笔"里的双击开关/轻捏开关/轻捏力度实时路由给笔（1 = 开，默认）
 SETTINGS_SYNC=1
+# ⑦ 笔刷触感：读笔记/小米创作的当前笔刷，给笔发一次 CON 波形（笔自己就持续按这个手感振）
+BRUSH=1
+BRUSH_APPS="com.miui.notes com.miui.creation"
+BRUSH_LEVEL=3
+BRUSH_FRICTION=1
+BRUSH_MAP="0:32,1:33,2:34,3:36,4:36,5:36"   # current_brush 值 -> CON 波形
+BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
+BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -242,6 +255,167 @@ sync_pen_settings() {
         return 0
     fi
     return 1
+}
+
+# ---------------------------------------------------------------- ⑦ 笔刷触感
+# 联想笔的 CON（连续振动）波形 id：
+#   32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 同上的"无音效"版
+# 笔记/小米创作把当前笔刷写在 /data/data/<pkg>/shared_prefs/creation_shpref.xml 的
+#   <int name="current_brush" value="N" />，每个笔刷条目里还有 penType
+#   （BALL 圆珠笔 / PENCIL 铅笔 / MARK 马克笔 / INK 墨水笔 / WATER_COLOR 水彩）
+# 所以 root 直接读文件就知道用户切到哪支笔，切一次发一次 CON 帧，笔会自己持续振。
+brush_log() { echo "$(date '+%F %T') $*" >> "$BRUSH_LOG"; }
+
+# 当前前台包（本 ROM 打的是 topResumedActivity）
+pen_fg() {
+    dumpsys activity activities 2>/dev/null \
+        | sed -n 's/.*[Rr]esumedActivity=ActivityRecord{[^}]* \([a-zA-Z0-9._]*\)\/.*/\1/p' \
+        | head -1
+}
+
+brush_is_fg() {
+    case " $BRUSH_APPS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+brush_wave_of() {
+    # $1 = current_brush 值；查 BRUSH_MAP（形如 "0:32,1:33,2:34"）
+    local v="$1" pair
+    for pair in $(echo "$BRUSH_MAP" | tr ',' ' '); do
+        case "$pair" in
+            "$v":*) echo "${pair#*:}"; return 0 ;;
+        esac
+    done
+    echo ""
+}
+
+brush_state_get() { cat "$BRUSH_STATE" 2>/dev/null; }
+
+brush_send() {
+    # $1 = 波形 id（0 = 停） $2 = 原因
+    local wave="$1" why="$2" cur
+    [ -n "$wave" ] || return 0
+    cur=$(brush_state_get)
+    set -- $cur
+    if [ "$wave" = "0" ]; then
+        [ -z "$cur" ] && return 0
+        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0             --ei friction "$BRUSH_FRICTION" --ei ms 80
+        : > "$BRUSH_STATE"
+        brush_log "stop ($why)"
+        return 0
+    fi
+    if [ -n "$cur" ] && [ "$1" = "$2" ]; then
+        return 0                      # 已经就是这个波形，不用重发
+    fi
+    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave"         --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
+    echo "$wave ${3:-}" > "$BRUSH_STATE"
+    brush_log "wave=$wave ($why)"
+}
+
+# 每个笔刷条目的短指纹（用来判断"这次切换到底切到了哪支笔"——切换时 App 会回写旧笔刷状态）
+brush_snapshot() {
+    local f="$1" k out=""
+    for k in brush_ballpoint brush_pencil brush_markpen brush_ink brush_watercolor current_ai_brush eraser_delete; do
+        out="$out$k=$(grep -o "name=\"$k\">[^<]*" "$f" 2>/dev/null | head -c 200 | md5sum | cut -c1-6) "
+    done
+    echo "$out"
+}
+
+# $1 旧指纹 $2 新指纹 -> 变化的键（通常正好是刚离开的那支笔刷）
+brush_diff() {
+    local k o n out=""
+    for k in brush_ballpoint brush_pencil brush_markpen brush_ink brush_watercolor current_ai_brush eraser_delete; do
+        o=$(echo "$1" | tr ' ' '\n' | grep "^$k=" )
+        n=$(echo "$2" | tr ' ' '\n' | grep "^$k=" )
+        [ "$o" = "$n" ] || out="$out${k#brush_} "
+    done
+    echo "$out"
+}
+
+brush_poll_loop() {
+    local pkg f v wave sent="" fg miss=0 snap="" prev="" changed lastflast last
+    while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
+        for pkg in $BRUSH_APPS; do
+            f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
+            [ -r "$f" ] || continue
+            v=$(sed -n 's/.*name="current_brush" value="\([0-9][0-9]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
+            [ -n "$v" ] || continue
+            lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
+            last=$(cat "$lastf" 2>/dev/null)
+            if [ "$v" != "$last" ]; then
+                wave=$(brush_wave_of "$v")
+                snap=$(brush_snapshot "$f")
+                changed=$(brush_diff "$prev" "$snap")
+                prev="$snap"
+                echo "$v" > "$lastf"
+                fg=$(pen_fg)
+                if ! brush_is_fg "$fg"; then
+                    brush_log "$pkg current_brush=$v -> wave=${wave:-未映射} (变化: ${changed:-无}) 但前台是 ${fg:-?}，先不发"
+                    continue
+                fi
+                brush_log "$pkg current_brush=$v -> wave=${wave:-未映射} (变化: ${changed:-无}) fg=$fg"
+                if [ -n "$wave" ] && [ "$sent" != "$wave" ]; then
+                    sent="$wave"
+                    brush_send "$wave" "$pkg current_brush=$v"
+                fi
+            fi
+        done
+
+        # 退出应用就停：只有在有波形时才查前台（每 3 秒最多一次 dumpsys）
+        if [ -n "$(brush_state_get)" ]; then
+            if [ "$BRUSH_EXIT_CHECK" != "0" ]; then
+                fg=$(pen_fg)
+                if brush_is_fg "$fg"; then
+                    miss=0
+                else
+                    miss=$((miss+1))
+                fi
+                if [ "$miss" -ge 2 ]; then
+                    brush_send 0 "app left ($fg)"
+                    miss=0
+                    sent=""
+                    rm -f "$MODDIR"/brush.last.* 2>/dev/null
+                fi
+            fi
+        fi
+        sleep 0.5
+    done
+}
+
+brush_node_loop() {
+    # BTN_TOOL_RUBBER 只有"橡皮端"在感应范围内才按下 → 笔尾靠近/离开的边沿
+    [ -e "$PEN_TOUCH_NODE" ] || { sleep 5; return 0; }
+    getevent -lt "$PEN_TOUCH_NODE" 2>/dev/null | while read -r line; do
+        [ -e "$DISABLE_BRUSH" ] && break
+        case "$line" in
+            *BTN_TOOL_RUBBER*DOWN*)
+                brush_send "$BRUSH_ERASER" "tail(eraser) in range" ;;
+            *BTN_TOOL_RUBBER*UP*)
+                state=$(brush_state_get)
+                case "$state" in
+                    "$BRUSH_ERASER "*) ;;                     # 本来就在橡皮态
+                    *) [ -n "$state" ] && brush_send "$(echo $state | awk '{print $1}')" "tip back" ;;
+                esac ;;
+        esac
+    done
+}
+
+brushwatch_alive() {
+    local p
+    p=$(cat "$MODDIR/brush.pid" 2>/dev/null)
+    [ -n "$p" ] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    grep -qa "brushwatch" "/proc/$p/cmdline" 2>/dev/null
+}
+
+brushwatch_ensure() {
+    [ -e "$DISABLE" ] && return 0
+    [ -e "$DISABLE_BRUSH" ] && return 0
+    case "$BRUSH" in 0|false|no|off) return 0 ;; esac
+    brushwatch_alive && return 0
+    setsid /system/bin/sh "$0" --brushwatch >>"$BRUSH_LOG" 2>&1 </dev/null &
+    sleep 1
+    log "brushwatch started pid=$(cat "$MODDIR/brush.pid" 2>/dev/null)"
 }
 
 penring_ensure() {
@@ -441,6 +615,34 @@ supervisor_alive() {
 
 case "$1" in
 
+--brushsend)
+    # 手动发一个波形：sh service.sh --brushsend 33   （33 = 铅笔，见 ZuxPen 波形表）
+    brush_send "$2" "manual"
+    exit 0
+    ;;
+
+--brushstop)
+    brush_send 0 "manual"
+    exit 0
+    ;;
+
+--brushwatch)
+    echo $$ > "$MODDIR/brush.pid"
+    # ⑦ 笔刷触感看护：两条子循环并跑
+    #   A) 轮询笔记/小米创作的 creation_shpref.xml 里 current_brush（笔刷切换）
+    #   B) 读笔触控节点，BTN_TOOL_RUBBER 按下=笔尾（橡皮端）靠近，抬起=回笔尖
+    #   状态写在 $BRUSH_STATE："<波形id> <包名>"；退出应用后由 A 负责停波形。
+    [ -e "$DISABLE_BRUSH" ] && exit 0
+    case "$BRUSH" in 0|false|no|off) exit 0 ;; esac
+    log "brushwatch up (apps=$BRUSH_APPS level=$BRUSH_LEVEL map=$BRUSH_MAP eraser=$BRUSH_ERASER)"
+    : > "$BRUSH_STATE"
+
+    brush_poll_loop &
+    brush_node_loop &
+    wait
+    exit 0
+    ;;
+
 --syncsettings)
     # ⑥ 手动跑一次"设置 → 笔"同步（排障用；monitor 每 2 秒自己也会跑）
     pen_sync_read
@@ -533,9 +735,11 @@ case "$1" in
     echo $$ > "$LOCK/pid"
     log "supervisor up pid=$$"
     penring_ensure
+    brushwatch_ensure
     while [ ! -e "$DISABLE" ]; do
         /system/bin/sh "$0" --monitor
         penring_ensure
+        brushwatch_ensure
         [ -e "$DISABLE" ] && break
         log "monitor exited; respawning in 5s"
         sleep 5

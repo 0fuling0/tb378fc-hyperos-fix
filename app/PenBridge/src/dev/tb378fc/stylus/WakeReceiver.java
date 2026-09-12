@@ -25,6 +25,8 @@ import android.util.Log;
 public final class WakeReceiver extends BroadcastReceiver {
     public static final String ACTION_WAKE = "dev.tb378fc.stylus.WAKE";
     public static final String ACTION_ATTACH = "dev.tb378fc.stylus.ATTACH";
+    /** 手势触感：让笔按某个波形振一下（by penring） */
+    public static final String ACTION_HAPTIC = "dev.tb378fc.stylus.HAPTIC";
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -55,6 +57,28 @@ public final class WakeReceiver extends BroadcastReceiver {
         }
 
         if (!ACTION_WAKE.equals(action)) {
+            if (ACTION_HAPTIC.equals(action)) {
+                // 手势触感：根侧守护（penring）把捏/双击/滑动/笔尾映射成波形 id 发过来
+                final int type = intent.getIntExtra("type", 0);       // 0=IMP 冲击, 1=CON 连续
+                final int wave = intent.getIntExtra("wave", PenBle.WAVE_CLICK);
+                final int level = intent.getIntExtra("level", 3);      // 0..5
+                final int friction = intent.getIntExtra("friction", 1);
+                final int ms = intent.getIntExtra("ms", 120);
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            PenBle.Result r = PenBle.quickHaptic(app, mac, type, wave, level, friction, ms);
+                            Log.i(PenBle.TAG, "HAPTIC " + r);
+                        } catch (Throwable t) {
+                            Log.e(PenBle.TAG, "haptic failed", t);
+                        } finally {
+                            try { pending.finish(); } catch (Throwable ignored) { }
+                        }
+                    }
+                }, "penhaptic-rx").start();
+                return;
+            }
             Log.i(PenBle.TAG, "ignored action " + action);
             try { pending.finish(); } catch (Throwable ignored) { }
             return;

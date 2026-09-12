@@ -22,6 +22,8 @@
 | ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
 | ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外把"设置 → 手写笔"里的**双击开关/轻捏开关/轻捏力度**实时路由给笔（`{8,6,mask}` bit0/bit4、`{8,5,level}`）、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `TOUCHFILM=-1` / `SETTINGS_SYNC=0`，或标记文件 `disable-gesture` / `disable-rompen` |
 
+| ⑦ | **笔刷触感跟着 App 走** | 读笔记/小米创作的 `creation_shpref.xml` 里 `current_brush`（根可读），切换笔刷就发一次 CON 波形（32 圆珠笔/33 铅笔/34 马克笔/35 橡皮/36 联想笔刷…），笔自己按这个手感持续振；笔尾（`BTN_TOOL_RUBBER`）靠近自动切 35、回笔尖再切回当前笔刷；退出应用（`topResumedActivity`）自动停 | `config` 里 `BRUSH=0` 或标记文件 `disable-brush` |
+
 原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
 ⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，
 ⑥ 的完整说明（手势表、键位映射、配置项、自检方法）见 **`docs/stylus-gesture-bridge.md`**，
