@@ -70,8 +70,6 @@ else
     log_msg "ERROR PowerKeeper bind mount failed"
 fi
 
-exit 0
-
 # ---------------------------------------------------------------- ⑧ AON / 注视感知
 # HyperOS 的客户特性解析器写死了 /mi_ext/product/etc/cust_features/device_features.xml
 # （CustFeatureResolveHelper.DEFAULT_CUST_FEATURE_PATH），而移植包把它放到了
@@ -87,8 +85,10 @@ AON_DST=/mi_ext/product/etc/cust_features
 if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
     mount -t tmpfs tmpfs /mi_ext 2>/dev/null
     if mkdir -p "$AON_DST" 2>/dev/null && mount --bind "$AON_SRC" "$AON_DST" 2>/dev/null; then
-        log "⑧ mi_ext cust_features ok: $AON_SRC -> $AON_DST (tmpfs+bind)"
+        log_msg "⑧ mi_ext cust_features ok: $AON_SRC -> $AON_DST (tmpfs+bind)"
     else
-        log "⑧ ERROR mi_ext cust_features 挂载失败"
+        log_msg "⑧ ERROR mi_ext cust_features 挂载失败"
     fi
 fi
+
+exit 0
