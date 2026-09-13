@@ -124,7 +124,7 @@ BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾�
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
 # 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
 BRUSH_LOCK="$MODDIR/brush.lock"    # 单实例锁（mkdir 原子；防止多个 brushwatch 各跑一份老代码）
-PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.fix/files/penstate"
+PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate"
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
@@ -411,18 +411,20 @@ brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
 
 # 画布是否可写（hook 写的 penstate；优先读"前台那个 App"的文件，避免读到另一边的旧状态）
 brush_canvas() {
-    local f v fg order
-    fg=$(cat "$MODDIR/brush.fg" 2>/dev/null)
-    order="$PENSTATE_LIST"
+    # 只信"前台那个 App 自己写的 penstate"：
+    #   以前前台不是笔记/创作时会回退去读*所有* penstate 文件，结果被别的 App（或被 force-stop
+    #   后没来得及写 canvas=0 的陈旧文件）里的 canvas=1 骗住 → 从画布切出去触感还在（实测）。
+    # 拿不到前台（dumpsys 偶发失败）时才宽松放行，避免抖动。
+    local f v fg
+    fg=$(pen_fg)
+    [ -n "$fg" ] || return 0
     case "$fg" in
-        com.miui.notes)    order="/data/data/com.miui.notes/files/penstate $PENSTATE_LIST" ;;
-        com.miui.creation) order="/data/data/com.miui.creation/files/penstate $PENSTATE_LIST" ;;
+        com.miui.notes)    f=/data/data/com.miui.notes/files/penstate ;;
+        com.miui.creation) f=/data/data/com.miui.creation/files/penstate ;;
+        *) return 1 ;;                       # 前台不是笔记/创作 → 肯定不在画布
     esac
-    for f in $order; do
-        v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
-        [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
-    done
-    return 0
+    v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
+    [ "$v" = "1" ]
 }
 
 # 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
@@ -890,7 +892,7 @@ case "$1" in
     # WebUI 读"生效值"（含默认与 config 覆盖）：sh service.sh --json
     printf '{"BRUSH":%s,"BRUSH_ERASER":%s,"BRUSH_DEFAULT_WAVE":%s,"BRUSH_AI_WAVE":%s,' \
         "${BRUSH:-1}" "${BRUSH_ERASER:-35}" "${BRUSH_DEFAULT_WAVE:-36}" "${BRUSH_AI_WAVE:-36}"
-    printf '"BRUSH_LASSO_WAVE":%s,"BRUSH_ON_TOUCH_REMOVED":0,' "${BRUSH_LASSO_WAVE:-36}"
+    printf '"BRUSH_LASSO_WAVE":%s,' "${BRUSH_LASSO_WAVE:-36}"
     printf '"GESTURE":%s,"GESTURE_RING":%s,"GESTURE_DOUBLE":%s,"GESTURE_SLIDE_UP":%s,' \
         "${GESTURE:-1}" "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
     printf '"GESTURE_SLIDE_DOWN":%s,"GESTURE_TAIL":%s,' "${GESTURE_SLIDE_DOWN:-197}" "${GESTURE_TAIL:-92}"
