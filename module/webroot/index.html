@@ -146,15 +146,23 @@ async function load() {
   renderSelects();
   log("已读取 " + Object.keys(CFG).length + " 项配置");
 }
+/* 本地先改、界面立刻响应；--set 现在会马上返回（重启交给一个 detach 的小脚本），
+   所以不再每次回读 config（少一次 ksu.exec，也就不卡了）。 */
 async function setKey(k, v) {
-  log("set " + k + " = " + v);
-  await run("sh " + M + "/service.sh --set " + k + " '" + v + "'");
-  await load();
+  CFG[k] = String(v);
+  renderSwitches(); renderSelects();
+  log("保存 " + k + " = " + v + " …");
+  const r = await run("sh " + M + "/service.sh --set " + k + " '" + v + "'");
+  log(r.out.indexOf("ok") >= 0 ? "已保存（守护 ~20 秒后重启生效）" : "保存返回: " + r.out);
 }
 document.querySelectorAll(".row[data-key]").forEach(row => {
   const sw = row.querySelector(".sw");
   if (!sw || row.dataset.on === undefined) return;
-  sw.onclick = () => setKey(row.dataset.key, sw.classList.contains("on") ? row.dataset.off : row.dataset.on);
+  sw.onclick = () => {
+    const on = !sw.classList.contains("on");
+    sw.classList.toggle("on", on);
+    setKey(row.dataset.key, on ? row.dataset.on : row.dataset.off);
+  };
 });
 ["w1","w2","w3","w4","w10"].forEach(id => {
   const el = document.getElementById(id);

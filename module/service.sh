@@ -902,7 +902,9 @@ case "$1" in
 
 --set)
     # WebUI 写配置：sh service.sh --set KEY VALUE
-    # 只改 config 里那一行（没有就追加），然后重启一次守护让新值生效。
+    # 立即改 config 那一行并返回（页面不能被卡住）；重启交给一个 detach 出去的小脚本去做。
+    # 注意：绝不能像以前那样"杀掉所有含模块路径的进程" —— 会把正在跑这条命令的 shell 也杀掉，
+    # ksu.exec 永远不返回，WebUI 就卡在那次调用上（实测）。
     _k="$2"; _v="$3"
     case "$_k" in
         ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
@@ -913,14 +915,17 @@ case "$1" in
     else
         echo "$_k=$_v" >> "$CFG"
     fi
-    log "config: $_k=$_v（重启守护生效）"
-    # 重启：杀掉自己这一轮的看护进程，再重新拉起（KernelSU 的 service.sh 只在开机跑一次）
-    for _p in $(ps -A -o PID,ARGS | awk -v me="$$" '$1+0 != me+0 && /tb378fc_hyperos_fix/ {print $1}'); do
-        kill -9 "$_p" 2>/dev/null
-    done
-    sleep 1
-    rm -rf "$MODDIR/brush.lock" 2>/dev/null
-    setsid /system/bin/sh "$MODDIR/service.sh" >/dev/null 2>&1 </dev/null &
+    log "config: $_k=$_v（守护稍后重启生效）"
+    # detach：只精确杀本模块的守护（supervise/monitor/brushwatch/penring），再拉一个新的
+    setsid /system/bin/sh -c '
+        sleep 1
+        for p in $(ps -A -o PID,ARGS | awk "\$2 ~ /service\.sh$/ && \$3 ~ /^--(supervise|monitor|brushwatch)$/ {print \$1}"); do kill -9 "$p" 2>/dev/null; done
+        for p in $(ps -A -o PID,ARGS | awk "\$2 ~ /penring$/ {print \$1}"); do kill -9 "$p" 2>/dev/null; done
+        sleep 1
+        rm -rf "'"$MODDIR"'/brush.lock" 2>/dev/null
+        setsid /system/bin/sh "'"$MODDIR"'/service.sh" >/dev/null 2>&1 </dev/null &
+    ' >/dev/null 2>&1 </dev/null &
+    echo "ok"
     exit 0
     ;;
 
