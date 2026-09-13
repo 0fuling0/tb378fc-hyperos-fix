@@ -45,6 +45,8 @@ log_msg() { echo "$(date '+%F %T') [post-fs-data] $*" >> "$LOG"; }
 # 结果 BPF 拆弹、死电话栈、唤醒守护一个都没起来，整个模块等于没跑（只有 ② 因为走
 # post-fs-data 这条独立路径幸免）。post-fs-data 严格早于 service.sh，在这里清锁即可
 # 彻底消掉这个跨重启竞态。
+rm -f "$MODDIR/aon.restarted" 2>/dev/null    # ⑧ AON app 每次开机清进程的"本轮已做"标记
+
 LOCK="$MODDIR/.monitor.lock"
 if [ -e "$LOCK/pid" ]; then
     log_msg "cleared stale supervisor lock (was pid $(cat "$LOCK/pid" 2>/dev/null))"

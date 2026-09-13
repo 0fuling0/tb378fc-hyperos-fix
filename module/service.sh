@@ -1025,6 +1025,17 @@ case "$1" in
 
     install_apk
 
+    # ⑧ AON：mifaced（HAL）由 init 在 sys.boot_completed=1 时才起，而 com.xiaomi.aon 若在这之前
+    # 已经跑起来，会把 mIAlwaysOn 缓存成 null —— 之后恒返回"无人注视"（实测，必须清一次进程）。
+    # 这里用 kill 而不是 am force-stop：kill 掉后框架下次请求会自然重新 bind（force-stop 会置
+    # stopped 状态，语义更重）。每个开机只做一次（标记文件，post-fs-data 清）。
+    if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/aon.restarted" ] \
+            && [ -x /odm/bin/hw/mifaced ] && pidof com.xiaomi.aon >/dev/null 2>&1; then
+        kill -9 "$(pidof com.xiaomi.aon)" 2>/dev/null
+        : > "$MODDIR/aon.restarted"
+        log "⑧ AON app 进程已清一次（避免它缓存 null 的 mIAlwaysOn）"
+    fi
+
     REFRESH=$(refresh_seconds)
     last_att=$(read_att 1)
     last_lvl=$(read_level)
