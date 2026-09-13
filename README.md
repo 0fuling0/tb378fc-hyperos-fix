@@ -1,13 +1,13 @@
 # TB378FC HyperOS 修复 —— 源码树
 
 联想小新 Pad Pro GT 13（**TB378FC**）刷 HyperOS 移植包（`OS3.0.307.0.WPYCNXM` / Android 16）之后的五项修复。
-本目录是**可构建的源码树**：模块脚本 + PenBridge 应用源码 + PowerKeeper payload 的重建工具链。
+本目录是**可构建的源码树**：模块脚本 + TbFix 应用源码 + PowerKeeper payload 的重建工具链。
 
 > 说明：`module/` 里的文件最初是从设备上**已安装的 v3.0 模块**原样拉下来的
 > （`adb exec-out su -c "tar -cf - -C /data/adb/modules tb378fc_hyperos_fix"`），
 > 只去掉了运行期状态（`wake.log` / `.monitor.lock/` / `.apk.sha`），并补回了安装期才用到的 `customize.sh`。
 > 当前版本 **v3.1** 在此基础上加了 ⑤ 吸附胶囊：`service.sh` / `config` / `action.sh` / `module.prop` /
-> `app/PenBridge`（`Capsule.java` + `WakeReceiver` 的 ATTACH 分支 + `PenBle.readBattery`）。
+> `app/TbFix`（`Capsule.java` + `WakeReceiver` 的 ATTACH 分支 + `PenBle.readBattery`）。
 
 ---
 
@@ -15,15 +15,15 @@
 
 | # | 修复 | 做法 | 关掉的标记文件 |
 |---|---|---|---|
-| ① | **手写笔休眠唤醒** | root 守护按 `wls_tx/attached` 的**取下边沿**，让 PenBridge.apk 往笔的 BLE 特征 `fe41` 写 `{05,05}` 叫醒睡死的笔 | `module/disable` |
+| ① | **手写笔休眠唤醒** | root 守护按 `wls_tx/attached` 的**取下边沿**，让 TbFix.apk 往笔的 BLE 特征 `fe41` 写 `{05,05}` 叫醒睡死的笔 | `module/disable` |
 | ② | **PowerKeeper 修复** | 用打好两处字节补丁的 `PowerKeeper.apk` 在 `post-fs-data` 阶段 bind mount 覆盖 `/system_ext/app/PowerKeeper/PowerKeeper.apk` | `module/disable-powerkeeper` |
 | ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
 | ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
-| ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 PenBridge 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
+| ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 TbFix 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
 | ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外把"设置 → 手写笔"里的**双击开关/轻捏开关/轻捏力度**实时路由给笔（`{8,6,mask}` bit0/bit4、`{8,5,level}`）、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `TOUCHFILM=-1` / `SETTINGS_SYNC=0`，或标记文件 `disable-gesture` / `disable-rompen` |
 
 | ⑦ | **笔刷触感跟着 App 走** | 读笔记/小米创作的 `creation_shpref.xml` 里 `current_brush`（根可读），切换笔刷就发一次 CON 波形（32 圆珠笔/33 铅笔/34 马克笔/35 橡皮/36 联想笔刷…），笔自己按这个手感持续振；笔尾（`BTN_TOOL_RUBBER`）靠近自动切 35、回笔尖再切回当前笔刷；退出应用（`topResumedActivity`）自动停 | `config` 里 `BRUSH=0` 或标记文件 `disable-brush` |；看护的启动/自愈/单实例机制与排障见 **`docs/stylus-gesture-bridge.md` §8**
-| ⑨ | **吸附已满 → 笔休眠** | 笔吸在平板上且**线圈报的 `charge_state` 由 1 变 0 并持续 `REST_IDLE`（默认 20）秒**（= 充完了）进入"休眠档"，电量 ≥ `REST_FULL`(99) 作兜底：停掉一切对笔的主动动作（唤醒广播 / 胶囊的 GATT 校正 / CON 波形），并广播 `dev.tb378fc.stylus.REST` 让 PenBridge 断掉"留给下一条手势"的缓存 BLE 连接；线圈电量轮询降到 `REST_POLL` 秒一次。取下、或线圈又重新开始充电（`chg=1`）立刻恢复。（起因：夜里吸附着掉电——旧 bug 每 3 秒发一条 BLE 唤醒命令，笔整夜进不了深睡） | `config` 里 `PEN_REST=0` 或标记文件 `disable-rest` |
+| ⑨ | **吸附已满 → 笔休眠** | 笔吸在平板上且**线圈报的 `charge_state` 由 1 变 0 并持续 `REST_IDLE`（默认 20）秒**（= 充完了）进入"休眠档"，电量 ≥ `REST_FULL`(99) 作兜底：停掉一切对笔的主动动作（唤醒广播 / 胶囊的 GATT 校正 / CON 波形），并广播 `dev.tb378fc.fix.REST` 让 TbFix 断掉"留给下一条手势"的缓存 BLE 连接；线圈电量轮询降到 `REST_POLL` 秒一次。取下、或线圈又重新开始充电（`chg=1`）立刻恢复。（起因：夜里吸附着掉电——旧 bug 每 3 秒发一条 BLE 唤醒命令，笔整夜进不了深睡） | `config` 里 `PEN_REST=0` 或标记文件 `disable-rest` |
 
 | ⑧ | **注视感知（AON）** | 四步：①tmpfs+bind 把 cust_features 盖到 `/mi_ext`（`/` 是 erofs 只读）并注入 `config_supported_aon_devices=true`；②LSPosed 钩住没注册的 `HyperOSCustFeatureResolve` 与 PMS 包名接口；③`/odm/lib64` 里补 `libcamera2ndk.so`（借 `/vendor/lib64/libcamera2ndk_vendor.so`，否则 mifaced 链接失败）；④三条 SELinux 规则（含 **camera worker 自我 exec**，缺它前摄永远不开、结果恒为"无人注视"）。链路：mifaced → 前摄 → 人脸检测 → `ATTENTION_SUCCESS_PRESENT` → `AttentionDetector: onSuccess: 1` | `disable-aon` / `disable-aonlib`；细节见 **`docs/aon-attention.md`** |
 
@@ -50,11 +50,11 @@ tb378fc-hyperos-fix/
 │   ├── tools/
 │   │   ├── patch_powerkeeper.py # 字节补丁：startCloudSyncData 的 return v0 -> return-void
 │   │   └── fix_static.py        # 结构补丁：isFeatureOn 移入 direct_methods + ACC_STATIC
-│   ├── bin/PenBridge.apk        # ① 的载体（构建产物，见 app/PenBridge）
+│   ├── bin/TbFix.apk        # ① 的载体（构建产物，见 app/TbFix）
 │   ├── bin/penring              # ⑥ 手势桥守护（构建产物，见 app/PenRing）
 │   └── payload/PowerKeeper.apk  # ② 的载体（构建产物，见 payload-src）
-├── app/PenBridge/               # PenBridge.apk 源码（BLE 唤醒 / 电量读取 / 胶囊转发）
-│   ├── AndroidManifest.xml      # dev.tb378fc.stylus，versionCode 11 / 3.1
+├── app/TbFix/               # TbFix.apk 源码（BLE 唤醒 / 电量读取 / 胶囊转发）
+│   ├── AndroidManifest.xml      # dev.tb378fc.fix，versionCode 11 / 3.1
 │   ├── src/dev/tb378fc/stylus/  # PenBle.java, WakeReceiver.java, WakeActivity.java, Capsule.java
 │   ├── res/                     # 图标
 │   ├── tools/make_icons.py      # 图标生成
@@ -80,7 +80,7 @@ tb378fc-hyperos-fix/
 SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `ANDROID_PLATFORM=` 覆盖。
 
 ```bash
-./build.sh              # 只构建 PenBridge.apk + 打包（payload 用仓库里现成的那份）
+./build.sh              # 只构建 TbFix.apk + 打包（payload 用仓库里现成的那份）
 ./build.sh --payload    # 额外从 payload-src/PowerKeeper-stock.apk 重建 payload
 ./build.sh --all        # 上面两个都做
 ./build.sh --clean
@@ -97,7 +97,7 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 产物：
 
 ```
-app/PenBridge/PenBridge.apk              （同时拷进 module/bin/）
+app/TbFix/TbFix.apk              （同时拷进 module/bin/）
 out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 的内容）
 ```
 
@@ -106,7 +106,7 @@ out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 
 
 ### 可复现性（实测）
 
-- `PenBridge.apk`：重新构建的产物与设备上那份 **9 个 zip 条目名/CRC/大小/压缩方式全部相同**，
+- `TbFix.apk`：重新构建的产物与设备上那份 **9 个 zip 条目名/CRC/大小/压缩方式全部相同**，
   `classes.dex` 逐字节相同；整包 sha256 不同只来自签名块/时间戳，功能等价。
 - `PowerKeeper.apk`：`--payload` 从原厂 APK 走完 `patch_powerkeeper.py` → `fix_static.py` → `repack_payload.py`
   后，510 个条目里 **509 个条目 CRC 完全相同**，`classes.dex` 逐字节相同（补丁本身等长：1639 → 1639 字节，
@@ -131,7 +131,7 @@ wls_tx 边沿（POLL_MS=200 轮询，内建 read）
   └─ 边沿 B：attached 0 -> 1（硬件握手完成）
   └─ 两条边都：守护直发 am broadcast … STYLUS_STATE_SOC（battery/state=4/connect=5）
         → com.miui.securitycore/…MiuiStylusReceiver → 原生胶囊（实测 +0.3s 内出现）
-     并转发 ATTACH(battery=-1, coil=<已显示值>) 给 PenBridge 做兜底校正
+     并转发 ATTACH(battery=-1, coil=<已显示值>) 给 TbFix 做兜底校正
 ```
 
 发往 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：

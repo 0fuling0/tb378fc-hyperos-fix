@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      LSPosed 的「推荐作用域」读的是这个旧式数组（不是 META-INF/xposed/scope.list），
+      所以这里必须和 scope.list 保持一致，否则管理界面里看不到缺的那个作用域。
+        android        = 系统框架（system_server）
+                         → ⑧ 注视感知：接管移植包里没有注册的 HyperOSCustFeatureResolve，
+                           以及 PMS 的 getSupportAonServicePackageName / getAttentionServicePackageName
+        com.miui.notes / com.miui.creation
+                         → ⑥ 手写笔：画布焦点判定、笔尾当橡皮（fc.Iι11lii 那份实现）
+    -->
+    <array name="xposed_scope">
+        <item>android</item>
+        <item>com.miui.notes</item>
+        <item>com.miui.creation</item>
+    </array>
+</resources>

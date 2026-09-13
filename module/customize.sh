@@ -15,7 +15,7 @@ set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
 set_perm "$MODPATH/config" 0 0 0644
-set_perm "$MODPATH/bin/PenBridge.apk" 0 0 0644
+set_perm "$MODPATH/bin/TbFix.apk" 0 0 0644
 set_perm "$MODPATH/payload/PowerKeeper.apk" 0 0 0644
 set_perm "$MODPATH/tools/patch_powerkeeper.py" 0 0 0644
 set_perm "$MODPATH/tools/fix_static.py" 0 0 0644

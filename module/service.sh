@@ -31,7 +31,7 @@
 # （BluetoothExtension 的 MiuiBleOobHelperService）发广播驱动：
 #     com.android.settings.stylus.STYLUS_STATE_SOC   extras: battery / state / connect
 # 联想笔走普通 BT HID，不说 MIPP，所以谁都不发。这里在吸附边沿读反向无线充电线圈看到的
-# 笔电量（/sys/class/power_supply/wls_tx/level），把 ATTACH 广播交给 PenBridge，
+# 笔电量（/sys/class/power_supply/wls_tx/level），把 ATTACH 广播交给 TbFix，
 # 由它转成上面那条原生广播；GATT 能读到真值时再补一条校正。
 # 参数语义、前置条件与踩坑见 docs/native-stylus-capsule.md。
 #
@@ -124,7 +124,7 @@ BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾�
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
 # 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
 BRUSH_LOCK="$MODDIR/brush.lock"    # 单实例锁（mkdir 原子；防止多个 brushwatch 各跑一份老代码）
-PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.stylus/files/penstate"
+PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.fix/files/penstate"
 BRUSH_LOG="$MODDIR/brush.log"
 PENRING_BIN="$MODDIR/bin/penring"
 PENRING_PID="$MODDIR/penring.pid"
@@ -135,16 +135,16 @@ WLS_LEVEL=/sys/class/power_supply/wls_tx/level
 WLS_CHG=/sys/class/power_supply/wls_tx/charge_state
 # ⑨ 休眠档状态文件（brushwatch 是另一个进程，看不见 monitor 的变量，靠这个文件判断）
 PEN_REST_FILE="$MODDIR/pen.rest"
-PKG=dev.tb378fc.stylus
+PKG=dev.tb378fc.fix
 RCV="$PKG/.WakeReceiver"
-APK="$MODDIR/bin/PenBridge.apk"
-A_WAKE=dev.tb378fc.stylus.WAKE
-A_HAPTIC=dev.tb378fc.stylus.HAPTIC
-A_ATTACH=dev.tb378fc.stylus.ATTACH
+APK="$MODDIR/bin/TbFix.apk"
+A_WAKE=dev.tb378fc.fix.WAKE
+A_HAPTIC=dev.tb378fc.fix.HAPTIC
+A_ATTACH=dev.tb378fc.fix.ATTACH
 # ⑤ 原生胶囊广播（发给 SecurityCoreAdd）
 A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
 # ⑨ 休眠档广播：告诉 App 断掉"留给下一条手势"的缓存 BLE 连接
-A_REST=dev.tb378fc.stylus.REST
+A_REST=dev.tb378fc.fix.REST
 SOC_RCV=com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
 
 # ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
@@ -181,9 +181,9 @@ CAPSULE=1
 #   200 = 默认，最坏 0.2s 发现吸附；500/1000 更省电但更迟钝
 POLL_MS=200
 # 1 = 守护自己直接发原生 STYLUS_STATE_SOC（省掉 App 一跳，最快）
-# 0 = 只发 ATTACH 给 PenBridge，由 App 组装（多一跳）
+# 0 = 只发 ATTACH 给 TbFix，由 App 组装（多一跳）
 CAPSULE_DIRECT=1
-# 1 = 直发之后，再让 PenBridge 走 GATT 读一次真电量，不同则补一条校正
+# 1 = 直发之后，再让 TbFix 走 GATT 读一次真电量，不同则补一条校正
 CAPSULE_GATT=1
 # 1（默认）= 边沿一到就先用**上一次的线圈电量**弹一条（~0.2s 出胶囊），1~2 秒后拿新值刷新；
 # 0 = 不抢跑，等线圈报出新值再弹（慢 1~2 秒，但第一眼就是本次的电量）
@@ -421,7 +421,7 @@ brush_canvas() {
 }
 
 # 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
-brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.stylus.TAIL --ei down "$1" >/dev/null 2>&1 & }
+brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.fix.TAIL --ei down "$1" >/dev/null 2>&1 & }
 
 # $1 波形（0 = 停）；$2 原因；$3 非空表示"这是当前笔刷的基准波形"
 brush_send() {
@@ -532,7 +532,7 @@ brush_watch_loop() {
         "$PENRING_BIN" --watch 2>/dev/null \
             --prefs /data/data/com.miui.notes/shared_prefs \
             --prefs /data/data/com.miui.creation/shared_prefs \
-            --prefs /data/data/dev.tb378fc.stylus/files \
+            --prefs /data/data/dev.tb378fc.fix/files \
             --prefs /data/data/com.miui.notes/files \
             --prefs /data/data/com.miui.creation/files \
             --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
@@ -682,6 +682,13 @@ install_apk() {
             log "ERROR apk install failed"
         fi
     fi
+    # 迁移：本模块的 App 从 dev.tb378fc.stylus（旧名"联想笔桥接"）改名为 dev.tb378fc.fix，
+    # 装了新包就把旧包卸掉，避免两个 App/两套 receiver 同时在（也会让 LSPosed 列表里留个旧名）。
+    if [ ! -e "$MODDIR/.oldpkg-removed" ] && [ -n "$(pm path dev.tb378fc.stylus 2>/dev/null)" ]; then
+        pm uninstall --user 0 dev.tb378fc.stylus >/dev/null 2>&1
+        : > "$MODDIR/.oldpkg-removed"
+        log "旧包 dev.tb378fc.stylus 已卸载（改名迁移）"
+    fi
     pm grant --user 0 $PKG android.permission.BLUETOOTH_CONNECT >/dev/null 2>&1
     pm grant --user 0 $PKG android.permission.BLUETOOTH_SCAN >/dev/null 2>&1
 }
@@ -734,8 +741,8 @@ prepare_stylus_settings() {
 # 1~2 秒后拿到新值再补一条刷新（同样是原生胶囊，会替换掉旧的）。
 #
 #   1. CAPSULE_DIRECT=1（默认）：守护**自己**发原生 STYLUS_STATE_SOC —— 少一跳（不起 App 进程）
-#      否则只发 ATTACH 给 PenBridge，由 App 组装并弹
-#   2. CAPSULE_GATT=1：再叫 PenBridge 用系统 API / GATT 读真值，与已显示的值不同才补一条校正
+#      否则只发 ATTACH 给 TbFix，由 App 组装并弹
+#   2. CAPSULE_GATT=1：再叫 TbFix 用系统 API / GATT 读真值，与已显示的值不同才补一条校正
 sensor_capsule() {
     local batt="$1" fb
     [ "$batt" -ge 1 ] && [ "$batt" -le 100 ] || return 1
@@ -753,7 +760,7 @@ sensor_capsule() {
         log "capsule: 休眠档跳过 GATT 校正 battery=$batt"
         return 0
     fi
-    # 交给 PenBridge：
+    # 交给 TbFix：
     #   a) 直发成功 + 开了 GATT 校正 → battery=-1（"已弹过，别重复弹"）+ coil=已显示值
     #   b) 直发没成功（或 CAPSULE_DIRECT=0）→ battery=本值，让 App 立刻弹
     if capsule_gatt || [ "$shown" != "$batt" ]; then
@@ -1029,6 +1036,15 @@ case "$1" in
     # 已经跑起来，会把 mIAlwaysOn 缓存成 null —— 之后恒返回"无人注视"（实测，必须清一次进程）。
     # 这里用 kill 而不是 am force-stop：kill 掉后框架下次请求会自然重新 bind（force-stop 会置
     # stopped 状态，语义更重）。每个开机只做一次（标记文件，post-fs-data 清）。
+    # ⑧c 启用 AON overlay（预装 + isStatic=false，要显式 enable；状态存在 /data，幂等）
+    if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonoverlay" ] \
+            && [ ! -e "$MODDIR/.aonoverlay-on" ]; then
+        if cmd overlay enable --user 0 dev.tb378fc.aonoverlay >/dev/null 2>&1; then
+            : > "$MODDIR/.aonoverlay-on"
+            log "⑧c AON overlay 已启用（注视感知设置页应可见）"
+        fi
+    fi
+
     if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/aon.restarted" ] \
             && [ -x /odm/bin/hw/mifaced ] && pidof com.xiaomi.aon >/dev/null 2>&1; then
         kill -9 "$(pidof com.xiaomi.aon)" 2>/dev/null

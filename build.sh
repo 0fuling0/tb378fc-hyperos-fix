@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # TB378FC HyperOS 修复 —— 一键构建（KernelSU 模块包）
 #
-#   ./build.sh              构建 PenBridge.apk + penring（手势桥），并用仓库里现成的 payload 打包
+#   ./build.sh              构建 TbFix.apk + penring（手势桥），并用仓库里现成的 payload 打包
 #   ./build.sh --payload    额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
-#   ./build.sh --all        --payload（LSPosed 部分已并入 PenBridge，见 app/PenBridge）
+#   ./build.sh --all        --payload（LSPosed 部分已并入 TbFix，见 app/TbFix）
 #   ./build.sh --clean      删掉 out/ 与各构建中间目录
 #
 # 产物
-#   app/PenBridge/PenBridge.apk          （同时拷进 module/bin/）
+#   app/TbFix/TbFix.apk          （同时拷进 module/bin/）
 #   app/PenRing/penring                  （同时拷进 module/bin/）
 #   extras/PenStylusHook/PenStylusHook.apk（--hook）
 #   out/<id>-v<version>.zip              KernelSU 模块包（zip 根目录即模块根目录）
@@ -25,7 +25,7 @@ for a in "$@"; do
     --payload) DO_PAYLOAD=1 ;;
     --all)     DO_PAYLOAD=1 ;;
     --clean)
-      rm -rf "$OUT" "$HERE/app/PenBridge/build" "$HERE/app/PenBridge/PenBridge.apk"
+      rm -rf "$OUT" "$HERE/app/TbFix/build" "$HERE/app/TbFix/TbFix.apk"
       echo "cleaned"; exit 0 ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "未知参数: $a（-h 看用法）" >&2; exit 2 ;;
@@ -35,12 +35,12 @@ done
 MOD_ID=$(sed -n 's/^id=//p' "$MODULE/module.prop")
 MOD_VER=$(sed -n 's/^version=//p' "$MODULE/module.prop")
 
-# ---------- ① PenBridge.apk ----------
+# ---------- ① TbFix.apk ----------
 build_app() {
-  echo "== [1/4] PenBridge.apk"
-  bash "$HERE/app/PenBridge/build.sh"
-  cp -f "$HERE/app/PenBridge/PenBridge.apk" "$MODULE/bin/PenBridge.apk"
-  sha256sum "$MODULE/bin/PenBridge.apk" | cut -c1-16
+  echo "== [1/4] TbFix.apk"
+  bash "$HERE/app/TbFix/build.sh"
+  cp -f "$HERE/app/TbFix/TbFix.apk" "$MODULE/bin/TbFix.apk"
+  sha256sum "$MODULE/bin/TbFix.apk" | cut -c1-16
 }
 
 # ---------- ①b penring（手势桥守护，NDK 直接编） ----------

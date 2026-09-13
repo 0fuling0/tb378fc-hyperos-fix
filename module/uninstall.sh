@@ -2,10 +2,10 @@
 MODDIR=${0%/*}
 old=$(cat "$MODDIR/.monitor.lock/pid" 2>/dev/null)
 [ -n "$old" ] && kill "$old" 2>/dev/null
-pm uninstall --user 0 dev.tb378fc.stylus >/dev/null 2>&1
+pm uninstall --user 0 dev.tb378fc.fix >/dev/null 2>&1
 # 早期版本的包名，兼容从旧版升级后卸载的情况
 pm uninstall --user 0 com.aclaniakea.penwake >/dev/null 2>&1
-pm uninstall --user 0 dev.tb378fc.stylus.hook >/dev/null 2>&1
+pm uninstall --user 0 dev.tb378fc.fix.hook >/dev/null 2>&1
 pm uninstall --user 0 com.aclaniakea.penwake.hook >/dev/null 2>&1
 # 早期版本为了 MIUI 灵动胶囊设过这个属性，这里恢复默认（MIUI 读取时的默认值就是 false）
 setprop persist.sys.feature.xms.switcher false 2>/dev/null

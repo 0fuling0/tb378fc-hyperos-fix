@@ -107,6 +107,12 @@ if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
     fi
 fi
 
+# ------------------------------------------- ⑧c AON：把三个 com.miui.rom 的 bool 翻成 true
+# 目的：让「设置 → 视觉感知/注视感知」那一页重新出现（见 module/bin/aonoverlay.sh）。
+if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonoverlay" ]; then
+    MODDIR="$MODDIR" sh "$MODDIR/bin/aonoverlay.sh" 2>&1 | while read -r l; do log_msg "$l"; done
+fi
+
 # ------------------------------------------- ⑧b AON HAL：/odm/lib64 里补 libcamera2ndk.so
 # mifaced 起不来就没有 IAlwaysOn → AON app 拿不到 HAL → "注视感知"永远给不出结果。
 # 细节见 module/bin/aonlib.sh（幂等；可用 disable-aonlib 关掉）。同理不能 exit 0。

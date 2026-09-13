@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- LSPosed 作用域：只有这两个 App 需要钩子（画布焦点 + 笔尾=橡皮） -->
-    <array name="xposed_scope">
-        <item>com.miui.notes</item>
-        <item>com.miui.creation</item>
-    </array>
-</resources>

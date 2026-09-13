@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.tb378fc.fix"
+    android:versionCode="11"
+    android:versionName="3.1">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="30" />
+
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+
+    <application
+        android:label="TB378FC 修复"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:hasCode="true">
+        <!-- LSPosed：本 APK 同时是 Xposed 模块（画布焦点 + 笔尾=橡皮） -->
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+        <meta-data android:name="xposeddescription" android:value="TB378FC HyperOS 移植修复的 LSPosed 部分：①手写笔——笔记/小米创作里笔尾当橡皮、只在画布聚焦时振动；②注视感知（AON）——接管移植包里缺失的 HyperOSCustFeatureResolve 与 PMS 包名接口，让 AttentionManagerService 能拿到 com.xiaomi.aon" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+
+        <receiver
+            android:name=".WakeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.tb378fc.fix.WAKE" />
+                <action android:name="dev.tb378fc.fix.ATTACH" />
+            </intent-filter>
+        </receiver>
+
+
+        <activity
+            android:name=".WakeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+</manifest>

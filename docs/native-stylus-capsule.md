@@ -81,9 +81,9 @@ adb shell am broadcast \
 ### 3.2 触发模块那条路径（等于把笔吸上去时守护做的事）
 
 ```bash
-# root 侧守护 → PenBridge（会读线圈电量，再补一次 GATT 真值）
+# root 侧守护 → TbFix（会读线圈电量，再补一次 GATT 真值）
 adb shell su -c 'am broadcast --user 0 \
-  -n dev.tb378fc.stylus/.WakeReceiver -a dev.tb378fc.stylus.ATTACH \
+  -n dev.tb378fc.fix/.WakeReceiver -a dev.tb378fc.fix.ATTACH \
   --ei battery 88 --ei state 4'
 # 或者直接把磁吸状态机的边沿走一遍：吸附笔即可（attached 0 -> 1）
 ```
@@ -104,7 +104,7 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
        am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
          -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
          --ei battery <值> --ei state 4 --ei connect 5          ← 守护直发，不起 App 进程
-       + 转发 ATTACH(battery=-1, coil=<已显示值>) 给 PenBridge
+       + 转发 ATTACH(battery=-1, coil=<已显示值>) 给 TbFix
             └─ ① InputDevice.getBatteryState()（装了 hook 才有值）
                ② 都没有 → GATT 0x180F/0x2A19（实测热链路上只要 ~40ms）
                真值 != 已显示值才补弹一条
@@ -143,7 +143,7 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 | **线圈硬件握手**：`attached` 0→1 | 2.0 s | 2.0 s | ❌ 硬件，笔放上去后线圈要启动+握手，实测固定 ~2 s |
 | 检测到边沿 | 主循环 `sleep 1` → 最坏 1.0 s | `POLL_MS=200` + 内建 `read` → 最坏 0.2 s | ✅ 可调 `POLL_MS=100/50` |
 | 等线圈读出电量（`level` 变有效） | 被固定 `sleep 2` 掩盖 | ~0.5 s（`level` 在 `attached` 之后约 0.5 s 才有效） | ⚠️ 用缓存值可跳过 |
-| 发广播 | 先冷启动 PenBridge 再转发 → 0.3~1 s | 守护直发（`CAPSULE_DIRECT=1`）→ 0.2~0.4 s | ✅ 已优化 |
+| 发广播 | 先冷启动 TbFix 再转发 → 0.3~1 s | 守护直发（`CAPSULE_DIRECT=1`）→ 0.2~0.4 s | ✅ 已优化 |
 | **合计（从笔放上去算）** | **≈4~5 s**（用户感知 ~3 s） | **≈2.9 s** | 见下 |
 
 **想更快只剩两条路**（都还没做，见 README 的选项）：
@@ -167,7 +167,7 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 | `state` | int | `4` = 充电中（图标带⚡）；`2` = 未充电 | 本模块吸附时固定 `4` | 来自 MIPP 的充电 notify（`f11787A`：4/2） |
 | `connect` | int | `5` = 已连接 → **直接弹电量胶囊**；`0/1/3/4/7/8/9` 见 §1 映射表 | `5` | **只有 5 会直接弹**；`2` 仅在当前正显示"连接中"时才升级 |
 
-本模块内部还多一层 `dev.tb378fc.stylus.ATTACH`（守护 → App），参数：
+本模块内部还多一层 `dev.tb378fc.fix.ATTACH`（守护 → App），参数：
 
 | extra | 类型 | 取值 | 说明 |
 |---|---|---|---|
@@ -186,13 +186,13 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 | `CAPSULE_GATT` | `1` | 直发后再用系统 API / GATT 读真值，**不同**才补一条校正；`0` = 不补弹 |
 | `CAPSULE_FAST` | `1` | 边沿一到就用**上一次的线圈电量**先弹（~0.2s 出胶囊），1~2 秒后拿新值刷新；`0` = 等本次真值再弹（慢 1~2 秒） |
 
-### 电量从哪来（PenBridge 的取值顺序）
+### 电量从哪来（TbFix 的取值顺序）
 
 | 顺序 | 来源 | 谁读 | 成本 | 特点 |
 |---|---|---|---|---|
-| 1 | **`InputDevice.getBatteryState()`** | PenBridge（**公开 API，无需权限**） | **0 ms** | 自带 `getCapacity()` + `getStatus()`（充电状态），是**真值**。但要 LSPosed hook 把数字板与蓝牙笔关联起来；没装 hook 时 `isPresent()=false`，本类返回 null |
+| 1 | **`InputDevice.getBatteryState()`** | TbFix（**公开 API，无需权限**） | **0 ms** | 自带 `getCapacity()` + `getStatus()`（充电状态），是**真值**。但要 LSPosed hook 把数字板与蓝牙笔关联起来；没装 hook 时 `isPresent()=false`，本类返回 null |
 | 2 | `wls_tx/level` | `service.sh`（root） | **0 ms** | 反向无线充电线圈读数；吸附时准，**取下时保留上一次的值**，握手瞬间会短暂为 0 |
-| 3 | GATT `0x180F/0x2A19` | PenBridge（普通 App） | 实测热链路 **~40 ms**（冷启动 App 进程另加 0.3~0.5 s） | 只在上面两条都拿不到时才走；要连一次 BLE |
+| 3 | GATT `0x180F/0x2A19` | TbFix（普通 App） | 实测热链路 **~40 ms**（冷启动 App 进程另加 0.3~0.5 s） | 只在上面两条都拿不到时才走；要连一次 BLE |
 
 **关于"蓝牙读"的澄清**（别指望它更快）：
 
@@ -236,10 +236,10 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 | 文件 | 作用 |
 |---|---|
 | `module/service.sh` | `--monitor` 里按 `POLL_MS` 轮询 `attached` 的 0→1 边沿；`send_attach()` 读 `wls_tx/level` 后**直发** `STYLUS_STATE_SOC`（`CAPSULE_DIRECT=1`），再按需转发 `ATTACH` 做 GATT 校正；`prepare_stylus_settings()` 补两个引导标记 |
-| `app/PenBridge/src/…/WakeReceiver.java` | `ACTION_ATTACH`：按 ①系统 ②线圈 ③GATT 的顺序取值；`coil`/`battery` 两个 extra 决定"要不要立刻弹"，最终值等于已显示值就不补弹 |
-| `app/PenBridge/src/…/PenSystemBattery.java` | 用公开 API `InputDevice.getBatteryState()` 0 ms 取真值 + 充电状态（装了 hook 才有值） |
-| `app/PenBridge/src/…/Capsule.java` | 组装并发送 `STYLUS_STATE_SOC`（`battery/state/connect=5`），带范围校验 |
-| `app/PenBridge/src/…/PenBle.java` | `readBattery()`：GATT 连笔 → 读 `0x180F/0x2A19` → 断开，返回 `-1` 表示读不到 |
+| `app/TbFix/src/…/WakeReceiver.java` | `ACTION_ATTACH`：按 ①系统 ②线圈 ③GATT 的顺序取值；`coil`/`battery` 两个 extra 决定"要不要立刻弹"，最终值等于已显示值就不补弹 |
+| `app/TbFix/src/…/PenSystemBattery.java` | 用公开 API `InputDevice.getBatteryState()` 0 ms 取真值 + 充电状态（装了 hook 才有值） |
+| `app/TbFix/src/…/Capsule.java` | 组装并发送 `STYLUS_STATE_SOC`（`battery/state/connect=5`），带范围校验 |
+| `app/TbFix/src/…/PenBle.java` | `readBattery()`：GATT 连笔 → 读 `0x180F/0x2A19` → 断开，返回 `-1` 表示读不到 |
 | `module/config` | `CAPSULE` / `POLL_MS` / `CAPSULE_DIRECT` / `CAPSULE_GATT`；`disable-capsule` 标记只关胶囊、保留唤醒 |
 
 ---

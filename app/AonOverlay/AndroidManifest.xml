@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ⑧c 只做一件事：把 HyperOS 里三个 AON（注视感知）相关的 bool 翻成 true，
+  让"设置 → 视觉感知/注视感知"那一页不再被 removePreference 掉。
+  功能本身不依赖它（adaptive_sleep 自己就能触发检查），但没有这一页用户看不到/切换不了。
+
+  target 是 **com.miui.rom**（不是 android）—— HyperOS 这几个 bool 住在 MIUI 框架包里，
+  官方那份 /product/overlay/MiuiFrameworkResOverlay.apk 的 targetPackage 就是 com.miui.rom、
+  priority=100、isStatic=true。我们 priority 取 999 压过它。
+
+  必须放在**系统分区**的 overlay 目录（/product/overlay 等）：Android 11+ 起 /data 上的
+  overlay 只能改目标里声明成 <overlayable> 的资源，系统分区的不受这条限制。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.tb378fc.aonoverlay"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
+
+    <overlay
+        android:targetPackage="com.miui.rom"
+        android:priority="999"
+        android:isStatic="false" />
+
+    <application
+        android:hasCode="false"
+        android:label="TB378FC 注视感知开关" />
+</manifest>

@@ -31,7 +31,7 @@ HyperOS 的客户特性解析器写死读 `/mi_ext/product/etc/cust_features/dev
 
 移植包的 system_server 里这个服务不存在，所有 `getBoolean()` 调用都抛异常 → 一律取默认值 false。
 光有 ① 没用，因为读配置那一步本身就炸。
-→ PenBridge 的 LSPosed 钩子（作用域必须包含 **`android` 系统框架**）接管
+→ TbFix 的 LSPosed 钩子（作用域必须包含 **`android` 系统框架**）接管
 `HyperOSCustFeatureResolve.getBoolean` 与 PMS 的 `getSupportAonServicePackageName` /
 `getAttentionServicePackageName`，返回 `com.xiaomi.aon`。
 

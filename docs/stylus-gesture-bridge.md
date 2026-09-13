@@ -152,7 +152,7 @@ settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
    **坑**：jadx 会把希腊字母转成 ASCII 写文件名（`Iι11lii` → `I11lii.java`），照抄文件名 `findClass` 找不到类；
    Java 里要写 `"fc.I\u03b911lii"`（`build.sh` 的 javac 已加 `-encoding UTF-8`）。
 
-### 实现（`PenBridgeHook`）
+### 实现（`TbFixHook`）
 
 1. `MotionEvent.getToolType(int)` → 笔尾在范围内返回 `TOOL_TYPE_ERASER`（第一层保险）
 2. `fc.Iι11lii` 的**所有构造器** → 笔尾在范围内把两个 eraser 布尔（第 7、10 个参数）置 `true`
@@ -163,7 +163,7 @@ settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
 ### 验证 / 继续调
 
 ```bash
-adb logcat -s PenBridgeHook:*
+adb logcat -s TbFixHook:*
 #   tail receiver registered / tail=true -> TOOL_TYPE_ERASER
 #   找到笔状态类 fc.Iι11lii / hook fc.I11lii ok
 #   I11lii ctor touchType=TOUCH_MOVE … tail=true
@@ -200,7 +200,7 @@ adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/brush.log'   # wave=3
 ## 7. 构建 / 安装 / 自检
 
 ```bash
-./build.sh                 # 会同时构建 PenBridge.apk 与 bin/penring
+./build.sh                 # 会同时构建 TbFix.apk 与 bin/penring
 # 单独构建：
 bash app/PenRing/build.sh  # 需要 ANDROID_NDK_HOME（默认 /opt/android-ndk）
 ```
@@ -331,7 +331,7 @@ settings-sync 2687 次 / 2.5 小时 ≈ 每 3.3 秒一次     ← 每次都是�
 
 | 条件 | 动作 |
 |---|---|
-| **主判据**：`attached=1` 且 `charge_state` 曾为 1、现在为 0 且持续 ≥ `REST_IDLE`（默认 20）秒 | 进入休眠档：写 `pen.rest=1`；发一次 `--brushstop` 清掉可能 latch 的 CON 波形；广播 `dev.tb378fc.stylus.REST --ei on 1` |
+| **主判据**：`attached=1` 且 `charge_state` 曾为 1、现在为 0 且持续 ≥ `REST_IDLE`（默认 20）秒 | 进入休眠档：写 `pen.rest=1`；发一次 `--brushstop` 清掉可能 latch 的 CON 波形；广播 `dev.tb378fc.fix.REST --ei on 1` |
 | **兜底判据**：`attached=1` 且线圈电量 ≥ `REST_FULL`（默认 99） | 同上（有的笔端在 100% 之前就停充，或 `charge_state` 读不到时用） |
 | 休眠档中 | 不发任何唤醒/设置同步；胶囊只走本地直发、不再让 App 走 GATT 读笔；`brush_send` 跳过非停止帧；线圈电量/充电状态轮询降到 `REST_POLL`（60）秒 |
 | 笔取下，或线圈**重新给笔补电**（`charge_state=1` 且电量 < `REST_FULL`） | 退出休眠档：`pen.rest=0`，广播 `REST on 0`，下一次设置同步会把真值补发一次 |
