@@ -133,6 +133,8 @@ ATT=/sys/class/power_supply/wls_tx/attached
 # ⑤ 胶囊：反向无线充电线圈看到的笔电量/充电状态（root 才读得到）
 WLS_LEVEL=/sys/class/power_supply/wls_tx/level
 WLS_CHG=/sys/class/power_supply/wls_tx/charge_state
+# ⑨ 休眠档状态文件（brushwatch 是另一个进程，看不见 monitor 的变量，靠这个文件判断）
+PEN_REST_FILE="$MODDIR/pen.rest"
 PKG=dev.tb378fc.stylus
 RCV="$PKG/.WakeReceiver"
 APK="$MODDIR/bin/PenBridge.apk"
@@ -141,6 +143,8 @@ A_HAPTIC=dev.tb378fc.stylus.HAPTIC
 A_ATTACH=dev.tb378fc.stylus.ATTACH
 # ⑤ 原生胶囊广播（发给 SecurityCoreAdd）
 A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
+# ⑨ 休眠档广播：告诉 App 断掉"留给下一条手势"的缓存 BLE 连接
+A_REST=dev.tb378fc.stylus.REST
 SOC_RCV=com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
 
 # ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
@@ -222,6 +226,12 @@ BRUSH_LASSO_WAVE=36
 # 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
+# ⑨ 休眠档：吸附在平板上且已充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
+#    并让 App 断掉缓存 BLE 连接，让笔真正睡下去；取下或电量掉到 REST_RESUME 以下立刻恢复。
+PEN_REST=1
+REST_FULL=99          # 线圈报的电量 ≥ 此值且吸附 → 进入休眠
+REST_RESUME=95        # 电量 < 此值（或取下）→ 退出休眠
+REST_POLL=60          # 休眠期间线圈电量轮询间隔（秒）
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -257,8 +267,8 @@ penring_alive() {
 SLIDE_BITS=$(( (GESTURE_SLIDE_UP >= 0 ? 4 : 0) + (GESTURE_SLIDE_DOWN >= 0 ? 8 : 0) ))
 pen_mask=0
 pen_lvl=3
-last_mask=""
-last_lvl=""
+sync_last_mask=""
+sync_last_lvl=""
 
 pen_sync_read() {
     local dbl pinch adj lvl
@@ -285,10 +295,16 @@ sync_pen_settings() {
     case "$SETTINGS_SYNC" in 0|false|no|off) return 0 ;; esac
     [ -x "$PENRING_BIN" ] || return 0
     pen_sync_read
-    if [ "$pen_mask" != "$last_mask" ] || [ "$pen_lvl" != "$last_lvl" ]; then
+    # 休眠档：笔在平板上待机，别发任何东西去吵它。这里**故意不记账** —— 恢复后下一次
+    # 调用会看到"和上次不一致"从而补发一次真值。
+    pen_rest_on && return 1
+    # 注意：状态变量必须独立命名。曾经这里用 last_mask/last_lvl，而 monitor 主循环里
+    # last_lvl 是"无线线圈电量"（0..100）→ pen_lvl(1..5) 与它永远不相等 → 每 3 秒重发一次
+    # 唤醒广播（实测 1100+ 次），既费电又和胶囊/看护抢 BLE。
+    if [ "$pen_mask" != "$sync_last_mask" ] || [ "$pen_lvl" != "$sync_last_lvl" ]; then
         log "settings->pen mask=$pen_mask squeeze=$pen_lvl (双击=$([ $((pen_mask & 1)) -ne 0 ] && echo on || echo off) 轻捏=$([ $((pen_mask & 16)) -ne 0 ] && echo on || echo off))"
-        last_mask="$pen_mask"
-        last_lvl="$pen_lvl"
+        sync_last_mask="$pen_mask"
+        sync_last_lvl="$pen_lvl"
         send_extra "$A_WAKE" "settings-sync" --ei wake 0 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
         return 0
     fi
@@ -411,6 +427,11 @@ brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.stylus.TAIL --ei down 
 brush_send() {
     local wave="$1" why="$2" setbase="$3" now tailin
     [ -n "$wave" ] || return 0
+    # 休眠档：笔在平板上，别发波形（wave=0 的停止帧仍允许，用来清掉可能 latch 住的波形）
+    if [ "$wave" != "0" ] && pen_rest_on; then
+        brush_log "skip wave=$wave ($why)：休眠档（吸附已充满）"
+        return 0
+    fi
     now=$(brush_now)
     tailin=$(cat "$BRUSH_TAIL" 2>/dev/null)
     brush_log "send? wave=$wave now=${now:-空} base=$([ -n "$setbase" ] && echo yes || echo no) tail=${tailin:-0} why=$why"
@@ -601,6 +622,16 @@ brushwatch_ensure() {
     log "brushwatch started pid=$(cat "$MODDIR/brush.pid" 2>/dev/null)"
 }
 
+# ⑨ 休眠档：pen_rest_on 读状态文件（任何进程都能问"现在是不是休眠档"）
+pen_rest_on()      { [ "$(cat "$PEN_REST_FILE" 2>/dev/null)" = "1" ]; }
+pen_rest_mark()    { echo "$1" > "$PEN_REST_FILE" 2>/dev/null; }
+pen_rest_enabled() {
+    [ -e "$MODDIR/disable-rest" ] && return 1
+    case "$PEN_REST" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
+}
+# 休眠档开着时不允许别的动作误判：显式提供"现在该不该静默"
+pen_quiet() { pen_rest_enabled && pen_rest_on; }
+
 capsule_direct() {
     case "$CAPSULE_DIRECT" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
 }
@@ -716,6 +747,11 @@ sensor_capsule() {
         else
             log "ERROR capsule send failed battery=$batt"
         fi
+    fi
+    # 休眠档：直发（本地广播，不碰笔）已经弹过了，就别再让 App 去连笔读电量（那会把笔吵醒）
+    if pen_rest_on; then
+        log "capsule: 休眠档跳过 GATT 校正 battery=$batt"
+        return 0
     fi
     # 交给 PenBridge：
     #   a) 直发成功 + 开了 GATT 校正 → battery=-1（"已弹过，别重复弹"）+ coil=已显示值
@@ -842,14 +878,37 @@ case "$1" in
     exit 0
     ;;
 
+--rest)
+    # 手工强制休眠档（排障/测试用）：sh service.sh --rest 1 | --rest 0
+    case "$2" in 1|on) pen_rest_mark 1 ;; *) pen_rest_mark 0 ;; esac
+    send_extra "$A_REST" "rest $2" --ei on "$([ "$2" = 1 ] && echo 1 || echo 0)"
+    log "rest 手工置为 $(cat "$PEN_REST_FILE" 2>/dev/null)"
+    exit 0
+    ;;
+
+--restcheck)
+    # 用给定的 att/lvl 走一遍休眠判定（不改状态）：sh service.sh --restcheck 1 100
+    pen_rest_enabled || { echo "PEN_REST=0：休眠档关闭"; exit 0; }
+    if [ "$2" = 1 ] && [ "$3" -ge "$REST_FULL" ]; then
+        echo "→ 进入休眠（吸附且 $3 ≥ $REST_FULL）"
+    elif [ "$2" = 0 ]; then
+        echo "→ 不休眠（已取下）"
+    elif [ "$3" -lt "$REST_RESUME" ]; then
+        echo "→ 不休眠/退出（$3 < $REST_RESUME）"
+    else
+        echo "→ 保持现状（吸附，电量 $3 在 $REST_RESUME~$((REST_FULL-1)) 之间）"
+    fi
+    exit 0
+    ;;
+
 --syncsettings)
     # ⑥ 手动跑一次"设置 → 笔"同步（排障用；monitor 每 2 秒自己也会跑）
     pen_sync_read
-    last_mask=""; last_lvl=""
+    sync_last_mask=""; sync_last_lvl=""
     if sync_pen_settings; then
         log "syncsettings: mask=$pen_mask squeeze=$pen_lvl sent"
     else
-        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl（未下发：可能 SETTINGS_SYNC=0 或 penring 不在）"
+        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl（未下发：SETTINGS_SYNC=0 / penring 不在 / 正处于⑨休眠档）"
     fi
     exit 0
     ;;
@@ -971,6 +1030,10 @@ case "$1" in
     now_sec=0
     refresh_at=0
     refresh_deadline=0
+    lvl_win=0          # "全速读线圈电量"的剩余秒数（吸附边沿后开窗）
+    pen_rest=0         # ⑨ 休眠档当前状态（文件里也写一份，给别的进程看）
+    pen_rest_enabled && [ "$REST_POLL" -ge 5 ] 2>/dev/null || REST_POLL=5
+    pen_rest_mark 0
     if capsule_enabled; then
         prepare_stylus_settings
         log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT fast=$CAPSULE_FAST"
@@ -995,10 +1058,50 @@ case "$1" in
             # 看护自愈：monitor 是唯一常驻不退出的循环，penring / brushwatch 若被杀掉/崩溃
             # （历史事故：函数整段丢失导致开机后静默不启动）在这里两秒内重生一次。
             if [ $((tick % 2)) -eq 1 ]; then penring_ensure; brushwatch_ensure; fi
+            [ "$lvl_win" -gt 0 ] && lvl_win=$((lvl_win-1))
         fi
-        att=$(read_att "$last_att")
-        lvl=$(read_level)
-        if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
+        # attached 每轮都读（边沿检测靠它）。用内建 read 直接写变量：原来写成 $(read_att) 会让
+        # 每轮 fork 一个子 shell，而"读一次 wls_tx 属性"本身就会让内核 Qi 驱动重发属性。
+        att=""
+        read -r att < "$ATT" 2>/dev/null
+        case "$att" in 0|1) ;; *) att=$last_att ;; esac
+
+        # 线圈电量按需读：每次读 wls_tx/level 都会触发内核 Qi 属性重发 →
+        # MiuiChargeManager 再 notify 一次电池状态 → 电池图标闪（实测每 200ms 一读时每秒十几次）。
+        #   lvl_win>0（刚吸附/线圈启动后 8 秒）：每 ~1 秒一次，尽快拿到真值弹胶囊
+        #   吸附稳定：每 ~2 秒一次
+        #   未吸附：每 ~10 秒兜底一次（认线圈启动边沿）
+        lvl_read=0
+        if [ "$pen_rest" = 1 ]; then
+            # 休眠档：线圈电量降到 REST_POLL 秒一次（只是用来发现"该醒了"）
+            [ $((sub % $((REST_POLL * 5)))) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+        elif [ "$lvl_win" -gt 0 ]; then
+            [ $((sub % 5)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+        elif [ "$att" = 1 ]; then
+            [ $((sub % 10)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+        else
+            [ $((sub % 50)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+        fi
+        [ "$lvl_read" = 0 ] && lvl=$last_lvl
+        if [ "$lvl_read" = 1 ] && [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
+
+        # ⑨ 休眠档状态机：吸附且充满 → 让笔休眠；取下或电量掉下来 → 恢复
+        if pen_rest_enabled; then
+            if [ "$pen_rest" != 1 ]; then
+                if [ "$lvl_read" = 1 ] && [ "$att" = 1 ] && [ "$lvl" -ge "$REST_FULL" ]; then
+                    pen_rest=1; pen_rest_mark 1; lvl_win=0
+                    log "pen rest ON: 吸附且电量=$lvl ≥ $REST_FULL → 停唤醒/停胶囊/断 BLE"
+                    /system/bin/sh "$0" --brushstop >/dev/null 2>&1   # 清掉可能 latch 住的 CON 波形
+                    send_extra "$A_REST" "rest-on" --ei on 1
+                fi
+            else
+                if [ "$att" = 0 ] || { [ "$lvl_read" = 1 ] && [ "$lvl" -ge 0 ] && [ "$lvl" -lt "$REST_RESUME" ]; }; then
+                    pen_rest=0; pen_rest_mark 0
+                    log "pen rest OFF: att=$att 电量=$lvl (本轮读到=$lvl_read) → 恢复唤醒/胶囊"
+                    send_extra "$A_REST" "rest-off" --ei on 0
+                fi
+            fi
+        fi
 
         # 取下：发唤醒 + 同步笔端手势位/力度，并把胶囊调度清掉。
         # **必须同时清空 shown** —— 否则下一次吸附时"新电量 == 上次显示过的值"（比如笔一直是 100%），
@@ -1017,9 +1120,11 @@ case "$1" in
 
         if capsule_enabled; then
             # 边沿 A：线圈刚启动（level 1..100 -> 0）—— 实测比 attached 早约 2 秒
-            if [ "$last_att" = 0 ] && [ "$att" = 0 ] && [ "$last_lvl" -ge 1 ] && [ "$lvl" = 0 ] \
+            if [ "$last_att" = 0 ] && [ "$att" = 0 ] && [ "$lvl_read" = 1 ] \
+                    && [ "$last_lvl" -ge 1 ] && [ "$lvl" = 0 ] \
                     && [ "$refresh_deadline" = 0 ]; then
                 log "coil-start edge (cached=$last_good)"
+                lvl_win=8                            # 线圈刚启动 → 开窗全速读电量
                 if capsule_fast && [ "$last_good" -ge 1 ]; then
                     sensor_capsule "$last_good"      # 抢跑：先用上次的值弹一条
                 fi
@@ -1034,6 +1139,7 @@ case "$1" in
                     fi
                     refresh_at=$now_sec
                     refresh_deadline=$((now_sec + 8))
+                    lvl_win=8                        # 吸附成功 → 开窗全速读电量
                 fi
                 tick=0
             fi

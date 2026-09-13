@@ -309,3 +309,58 @@ stderr 也重定向到同一个 `brush.log` → 每条日志重复两遍。现�
 - `action.sh`（KernelSU「操作」）里的 ① 是 **supervisor** 的 pid，不反映 brushwatch。
 - 判断看护是否"真活着"要看两处：`ps` 里有 `service.sh --brushwatch` + `penring --watch`，
   并且 `brush.log` 里有 `watch: 盯住 /data/data/com.miui.creation/files`（挂上了监听才算活）。
+
+---
+
+## 9. 休眠档：吸附在平板上且充满 → 让笔真睡
+
+### 起因
+
+实测夜里把笔吸在平板上，早上电量掉到 83%。日志量化到原因：
+
+```
+settings-sync 2687 次 / 2.5 小时 ≈ 每 3.3 秒一次     ← 每次都是一条 BLE {5,5} 唤醒命令
+```
+
+那个 spam 本身是另一个 bug（`sync_pen_settings` 把 `last_lvl` 当成"上次轻捏力度"，
+而 monitor 主循环里 `last_lvl` 是无线线圈电量 0..100，两者永不相等 → 每次都判定"设置变了"，
+见 §8.3 的命名教训）。修完之后周期性唤醒只剩"开机一次"和"取下时一次"，
+但**只要笔还吸在平板上，就没有理由让它一直保持可唤醒状态** —— 于是加了这一档。
+
+### 行为
+
+| 条件 | 动作 |
+|---|---|
+| `attached=1` 且线圈电量 ≥ `REST_FULL`（默认 99） | 进入休眠档：写 `pen.rest=1`；发一次 `--brushstop` 清掉可能 latch 的 CON 波形；广播 `dev.tb378fc.stylus.REST --ei on 1` |
+| 休眠档中 | 不发任何唤醒/设置同步；胶囊只走本地直发、不再让 App 走 GATT 读笔；`brush_send` 跳过非停止帧；线圈电量轮询降到 `REST_POLL`（60）秒 |
+| 笔取下，或电量 < `REST_RESUME`（默认 95） | 退出休眠档：`pen.rest=0`，广播 `REST on 0`，下一次设置同步会把真值补发一次 |
+
+App 侧（`PenBle.restMode`）收到广播后**立刻断掉"留给下一条手势"的那条缓存 GATT 连接**
+（`sHGatt`）—— 那条连接平时是为了让下一条手势 ~20ms 就能写下去才留着的，
+但笔都躺在平板上充电了，留着它只会让笔的控制器进不了最深那档低功耗。之后有手势/波形时
+`quickHaptic` 会自然重连，用户无感。
+
+开关：`config` 里 `PEN_REST=0`，或标记文件 `disable-rest`。
+
+### 配置与排障
+
+```sh
+M=/data/adb/modules/tb378fc_hyperos_fix
+# 判定逻辑自测（不改状态、不发广播）
+sh $M/service.sh --restcheck 1 100     # → 进入休眠（吸附且 100 ≥ 99）
+sh $M/service.sh --restcheck 1 97      # → 保持现状（95~98 之间）
+sh $M/service.sh --restcheck 0 100     # → 不休眠（已取下）
+# 手工强制/解除（真机验证 App 断连、波形停止用）
+sh $M/service.sh --rest 1 ; cat $M/pen.rest ; sh $M/service.sh --rest 0
+# 看它有没有真的进档（自动进入时）
+grep "pen rest" $M/wake.log | tail
+logcat -d | grep -E "PenWake.*rest" | tail    # 期望：rest: dropped idle gatt link=true/false
+```
+
+### 为什么不做"把线圈关掉"
+
+笔的充电线圈由**联想 vendor 的充电驱动**管（`wls_tx` 挂在 `qcom,pmic_glink` 的
+`battery_charger` 下，内核日志里的 `Lenovo Qi get property` 就是它），HyperOS 只通过
+`vendor.xiaomi.hardware.micharge.IMiCharge` 读状态。所以"充满后断线圈"不该由我们盲写
+`wls_tx/cmd` 去做（写坏要重启才恢复）；这一档只关掉**我们自己**制造的活动，
+让驱动和笔固件按它原本的逻辑收尾。

@@ -99,3 +99,11 @@ BRUSH_ERASER_STATES="7"
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 # 退出应用/离开画布后自动停波形
 BRUSH_EXIT_CHECK=1
+
+# ⑨ 休眠档：吸附在平板上且已充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
+#    并让 App 断掉"留给下一条手势"的缓存 BLE 连接，让笔真正睡下去（不再被每几秒吵醒）。
+#    取下、或电量掉到 REST_RESUME 以下 → 立刻恢复。每天夜里都吸在平板上时最有用。
+PEN_REST=1
+REST_FULL=99          # 线圈报的电量 ≥ 此值且吸附 → 进入休眠
+REST_RESUME=95        # 电量 < 此值（或取下）→ 退出休眠
+REST_POLL=60          # 休眠期间线圈电量轮询间隔（秒）

@@ -188,6 +188,25 @@ public final class PenBle {
                 new Haptic(type, wave, level, friction, ms), true);
     }
 
+    /**
+     * ⑨ 休眠档：吸附在平板上且已充满。
+     *
+     * 振动/手势是"用的时候"才需要的东西，笔都躺在平板上充电了，没有理由还挂着一条 BLE 连接
+     * （连接一挂着，笔的控制器就不会进最深的那档低功耗）。这里把缓存连接立刻断掉；
+     * 之后有手势/波形时 quickHaptic 会自然重连。
+     */
+    public static void restMode(boolean on) {
+        if (!on) return;
+        BluetoothGatt g = sHGatt;
+        clearHapticCache();
+        if (sHHandler != null) sHHandler.removeCallbacksAndMessages(null);
+        if (g != null) {
+            try { g.disconnect(); } catch (Throwable ignored) { }
+            try { g.close(); } catch (Throwable ignored) { }
+        }
+        Log.i(TAG, "rest: dropped idle gatt link=" + (g != null));
+    }
+
     static void clearHapticCache() {
         sHGatt = null;
         sHCon = null;

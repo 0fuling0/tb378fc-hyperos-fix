@@ -28,6 +28,9 @@ public final class WakeReceiver extends BroadcastReceiver {
     /** 手势触感：让笔按某个波形振一下（by penring） */
     public static final String ACTION_HAPTIC = "dev.tb378fc.stylus.HAPTIC";
 
+    /** ⑨ 休眠档：吸附在平板上且已充满 —— 关掉缓存的 BLE 连接，让笔进低功耗 */
+    public static final String ACTION_REST = "dev.tb378fc.stylus.REST";
+
     @Override
     public void onReceive(Context context, Intent intent) {
         final PendingResult pending = goAsync();
@@ -35,6 +38,23 @@ public final class WakeReceiver extends BroadcastReceiver {
         final String action = intent == null ? "" : String.valueOf(intent.getAction());
         Log.i(PenBle.TAG, "rx " + action + " t=" + System.currentTimeMillis());
         final String mac = intent == null ? null : intent.getStringExtra("mac");
+
+        if (ACTION_REST.equals(action)) {
+            final int on = intent.getIntExtra("on", 0);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        PenBle.restMode(on == 1);
+                    } catch (Throwable t) {
+                        Log.e(PenBle.TAG, "rest failed", t);
+                    } finally {
+                        try { pending.finish(); } catch (Throwable ignored) { }
+                    }
+                }
+            }, "penrest-rx").start();
+            return;
+        }
 
         if (ACTION_ATTACH.equals(action)) {
             // battery：要立刻弹的电量（守护直发模式下传 -1，表示"已经弹过了，别重复弹"）
