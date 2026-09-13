@@ -207,7 +207,6 @@ public class TbFixHook implements IXposedHookLoadPackage {
         }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
-        hookTouchTarget(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
@@ -223,71 +222,6 @@ public class TbFixHook implements IXposedHookLoadPackage {
      * 这里先把 ACTION_DOWN 的 View 类名打出来（每个类名首见一条 + 前 30 条明细），
      * 认出画布类名后就能用它做闸门（只对落在画布上的笔迹开触感）。
      */
-    private static final java.util.Set<String> sSeenView = new java.util.HashSet<>();
-    private static boolean sTreeDumped = false;
-
-    /** 把 View 树打出来（类名 / 尺寸 / id / 可见性），用来认出画布与工具栏 */
-    private static void dumpTree(android.view.View v, int depth, String pad) {
-        if (v == null || depth > 8) return;
-        try {
-            int w = v.getWidth(), h = v.getHeight();
-            if (w > 40 && h > 40) {          // 跳过装饰性小 View，日志别太吵
-                Log.i(TAG, "⑪ tree" + pad + v.getClass().getName()
-                        + " " + w + "x" + h
-                        + " @" + v.getLeft() + "," + v.getTop()
-                        + " id=" + v.getId()
-                        + " vis=" + (v.getVisibility() == android.view.View.VISIBLE ? "V" : "x"));
-            }
-            if (v instanceof android.view.ViewGroup) {
-                android.view.ViewGroup g = (android.view.ViewGroup) v;
-                for (int i = 0; i < g.getChildCount(); i++) {
-                    dumpTree(g.getChildAt(i), depth + 1, pad + "  ");
-                }
-            }
-        } catch (Throwable ignored) { }
-    }
-    private static int sTouchLogs = 0;
-    private void hookTouchTarget(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            // 钩叶子 View 的 onTouchEvent：ViewGroup 会覆盖 dispatchTouchEvent，
-            // 真正"吃掉"这一下触摸的是实现 onTouchEvent 的那个 View（画布 / 按钮 / 色条）。
-            XposedBridge.hookAllMethods(android.view.View.class, "onTouchEvent",
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            try {
-                                MotionEvent e = (MotionEvent) p.args[0];
-                                if (e == null) return;
-                                int act = e.getActionMasked();
-                                if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) {
-                                    return;                 // 抬手交给静音窗口决定何时恢复
-                                }
-                                // DOWN 与 MOVE 都记：在色条/工具栏上滑动时不断续期静音
-                                if (act != MotionEvent.ACTION_DOWN && act != MotionEvent.ACTION_MOVE) return;
-                                android.view.View v = (android.view.View) p.thisObject;
-                                String cn = v.getClass().getName();
-                                if (sSeenView.add(cn) || sTouchLogs < 40) {
-                                    sTouchLogs++;
-                                    Log.i(TAG, "⑪ touch DOWN view=" + cn
-                                            + " tool=" + e.getToolType(0)
-                                            + " size=" + v.getWidth() + "x" + v.getHeight()
-                                            + " id=" + v.getId());
-                                }
-                                noteControlTouch(v);
-                                // 第一次触摸时把整棵 View 树 dump 一次 —— 用来认出"画布"那一个
-                                // （手指事件常被 App 拒掉、不落到画布上，所以光看 DOWN 的类名认不出来）
-                                if (!sTreeDumped) {
-                                    sTreeDumped = true;
-                                    dumpTree(v.getRootView(), 0, "  ");
-                                }
-                            } catch (Throwable ignored) { }
-                        }
-                    });
-            Log.i(TAG, "⑪ 触摸目标探测钩子已装");
-        } catch (Throwable t) {
-            Log.w(TAG, "⑪ hook touch target failed", t);
-        }
-    }
-
     /**
      * ⑫ 设置里改笔参数 → **立刻**让 App 下发 {8,6,mask} / {8,5,level}（原来要等根侧 2 秒轮询）。
      *
@@ -345,71 +279,6 @@ public class TbFixHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) { }
         }
         Log.i(TAG, "⑫ 设置写入钩子已装（改笔参数即时下发）");
-    }
-
-    /**
-     * ⑪ "这一下是不是落在控件上"。
-     *
-     * 实测（真笔 + dumpsys activity top）：
-     *   画布 com.miui.handwirting.common.MiuiHandWritingView / SurfaceView **不经过 Java 触摸回调**
-     *   —— 真笔在画布上画时，onTouchEvent 一条都不打；能打出来的只有控件（工具栏 ImageView/
-     *   LinearLayout、色条上的 ColorSelectView）。
-     * 所以反过来判：**凡是能在这个钩子里看到的笔触摸，就是控件触摸** → 立刻"静音"，
-     * 静音窗口（MUTE_MS，滑动会不断续期）内不发触感；窗口过后恢复"在落笔"。
-     * 画布笔迹因此天然落在"没有控件触摸"的时间段里。
-     *
-     * 加一个尺寸保险：万一某个 App 的画布也走 onTouchEvent，它通常占大半屏 → 不算控件。
-     */
-    private static final long CTRL_MUTE_MS = 1500;
-    private static volatile long sMuteUntil = 0;
-    private static final android.os.Handler sHandler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
-    private static final Runnable sUnmute = new Runnable() {
-        @Override public void run() {
-            if (android.os.SystemClock.uptimeMillis() >= sMuteUntil) writeStroke(true);
-        }
-    };
-
-    private static boolean looksLikeControl(android.view.View v) {
-        try {
-            int sw = v.getRootView() == null ? 0 : v.getRootView().getWidth();
-            int sh = v.getRootView() == null ? 0 : v.getRootView().getHeight();
-            if (sw <= 0 || sh <= 0) return true;
-            return v.getWidth() < sw * 3 / 5 && v.getHeight() < sh * 3 / 5;
-        } catch (Throwable t) {
-            return true;
-        }
-    }
-
-    private static void noteControlTouch(android.view.View v) {
-        if (!looksLikeControl(v)) return;             // 大半屏的视图当画布，不静音
-        sMuteUntil = android.os.SystemClock.uptimeMillis() + CTRL_MUTE_MS;
-        writeStroke(false);
-        sHandler.removeCallbacks(sUnmute);
-        sHandler.postDelayed(sUnmute, CTRL_MUTE_MS + 50);
-    }
-
-    /** 把"正在落笔"写进 penstate（模块读它 + BTN_TOUCH 一起决定要不要开触感） */
-    private static volatile boolean sStroke = false;
-    private static void writeStroke(boolean stroke) {
-        if (stroke == sStroke) return;
-        sStroke = stroke;
-        Log.i(TAG, "⑪ stroke=" + stroke);
-        writePenState();
-    }
-
-    private static void writePenState() {
-        try {
-            Context c = sApp;
-            if (c == null) return;
-            File f = new File(c.getFilesDir(), "penstate");
-            FileOutputStream out = new FileOutputStream(f, false);
-            out.write((sCanvas ? "canvas=1" : "canvas=0").getBytes());
-            out.write(("\nstroke=" + (sStroke ? 1 : 0) + "\n").getBytes());
-            out.close();
-        } catch (Throwable t) {
-            Log.w(TAG, "write penstate failed", t);
-        }
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */
@@ -499,20 +368,13 @@ public class TbFixHook implements IXposedHookLoadPackage {
         sCanvas = canvas;
         if (!changed) return;
         Log.i(TAG, "canvas=" + canvas + " (" + why + ")");
-        if (canvas) {
-            // 进画布先假定"在落笔"；真去点控件时 noteControlTouch 会把它压下去又恢复
-            sMuteUntil = 0;
-            sHandler.removeCallbacks(sUnmute);
-            sHandler.postDelayed(new Runnable() {
-                @Override public void run() { writeStroke(true); }
-            }, 400);
-        } else {
-            writeStroke(false);
-        }
         try {
             Context c = sApp;
             if (c == null) return;
-            writePenState();
+            File f = new File(c.getFilesDir(), "penstate");
+            FileOutputStream out = new FileOutputStream(f, false);
+            out.write((canvas ? "canvas=1" : "canvas=0").getBytes());
+            out.close();
         } catch (Throwable t) {
             Log.w(TAG, "write penstate failed", t);
         }
