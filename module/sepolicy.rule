@@ -1,0 +1,15 @@
+# ⑧b AON HAL（mifaced）需要的 SELinux 规则。域是 hal_miface_default，移植包的策略里缺这几条，
+# 表现是一个比一个隐蔽：先是读不到配置、然后是 camera worker 子进程直接 127 退出（前摄永远不开）。
+# KernelSU 开机应用本文件；也可热打：ksud sepolicy patch 'allow ...'（注意是 magiskpolicy 语法，
+# 没有冒号、没有分号）。
+
+# 1) 读 /mi_ext/product/etc/cust_features/*.xml（模块 bind 过去的，上下文是 system_file）
+allow hal_miface_default system_file file { getattr open read map }
+
+# 2) camera worker = 重新 exec 自己跑 --camera-worker。缺这条会：
+#    avc: denied { execute_no_trans } for path="/odm/bin/hw/mifaced"
+#    → 子进程 exit(127)，前摄永远打不开，attention 恒为"无人注视"
+allow hal_miface_default hal_miface_default_exec file { execute execute_no_trans }
+
+# 3) camera worker 线程要读一个 vendor 属性文件（frc）
+allow hal_miface_default vendor_frc_prop file { getattr open read map }

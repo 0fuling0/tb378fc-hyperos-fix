@@ -51,23 +51,26 @@ if [ -e "$LOCK/pid" ]; then
     rm -rf "$LOCK" 2>/dev/null
 fi
 
-[ -e "$MODDIR/disable-powerkeeper" ] && { log_msg "PowerKeeper patch disabled by marker"; exit 0; }
-[ -f "$PAYLOAD" ] || { log_msg "PowerKeeper payload missing"; exit 0; }
-[ -f "$TARGET" ] || { log_msg "PowerKeeper target missing"; exit 0; }
-
-chown 0:0 "$PAYLOAD" 2>/dev/null
-chmod 0644 "$PAYLOAD" 2>/dev/null
-chcon u:object_r:system_file:s0 "$PAYLOAD" 2>/dev/null
-
-if grep -q " $TARGET " /proc/mounts 2>/dev/null; then
+# 注意：这一段**不能 exit 0** —— 以前这里每个失败分支都直接 exit，结果只要 PowerKeeper
+# 的 payload 缺失/已挂载，后面的 ⑧ AON 与 ⑧b libcamera2ndk 就整段被跳过（跨修复项的隐蔽耦合）。
+# 现在改成条件分支，脚本只有一个结尾 exit 0。
+if [ -e "$MODDIR/disable-powerkeeper" ]; then
+    log_msg "PowerKeeper patch disabled by marker"
+elif [ ! -f "$PAYLOAD" ]; then
+    log_msg "PowerKeeper payload missing"
+elif [ ! -f "$TARGET" ]; then
+    log_msg "PowerKeeper target missing"
+elif grep -q " $TARGET " /proc/mounts 2>/dev/null; then
     log_msg "PowerKeeper patch already mounted"
-    exit 0
-fi
-
-if mount -t none -o bind "$PAYLOAD" "$TARGET" 2>/dev/null; then
-    log_msg "PowerKeeper patch mounted ($(sha256sum "$PAYLOAD" 2>/dev/null | cut -c1-16))"
 else
-    log_msg "ERROR PowerKeeper bind mount failed"
+    chown 0:0 "$PAYLOAD" 2>/dev/null
+    chmod 0644 "$PAYLOAD" 2>/dev/null
+    chcon u:object_r:system_file:s0 "$PAYLOAD" 2>/dev/null
+    if mount -t none -o bind "$PAYLOAD" "$TARGET" 2>/dev/null; then
+        log_msg "PowerKeeper patch mounted ($(sha256sum "$PAYLOAD" 2>/dev/null | cut -c1-16))"
+    else
+        log_msg "ERROR PowerKeeper bind mount failed"
+    fi
 fi
 
 # ---------------------------------------------------------------- ⑧ AON / 注视感知
@@ -100,6 +103,13 @@ if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
     else
         log_msg "⑧ ERROR mi_ext cust_features 挂载失败"
     fi
+fi
+
+# ------------------------------------------- ⑧b AON HAL：/odm/lib64 里补 libcamera2ndk.so
+# mifaced 起不来就没有 IAlwaysOn → AON app 拿不到 HAL → "注视感知"永远给不出结果。
+# 细节见 module/bin/aonlib.sh（幂等；可用 disable-aonlib 关掉）。同理不能 exit 0。
+if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonlib" ]; then
+    MODDIR="$MODDIR" sh "$MODDIR/bin/aonlib.sh" 2>&1 | while read -r l; do log_msg "$l"; done
 fi
 
 exit 0

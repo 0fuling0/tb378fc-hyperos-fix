@@ -25,7 +25,7 @@
 | ⑦ | **笔刷触感跟着 App 走** | 读笔记/小米创作的 `creation_shpref.xml` 里 `current_brush`（根可读），切换笔刷就发一次 CON 波形（32 圆珠笔/33 铅笔/34 马克笔/35 橡皮/36 联想笔刷…），笔自己按这个手感持续振；笔尾（`BTN_TOOL_RUBBER`）靠近自动切 35、回笔尖再切回当前笔刷；退出应用（`topResumedActivity`）自动停 | `config` 里 `BRUSH=0` 或标记文件 `disable-brush` |；看护的启动/自愈/单实例机制与排障见 **`docs/stylus-gesture-bridge.md` §8**
 | ⑨ | **吸附已满 → 笔休眠** | 笔吸在平板上且**线圈报的 `charge_state` 由 1 变 0 并持续 `REST_IDLE`（默认 20）秒**（= 充完了）进入"休眠档"，电量 ≥ `REST_FULL`(99) 作兜底：停掉一切对笔的主动动作（唤醒广播 / 胶囊的 GATT 校正 / CON 波形），并广播 `dev.tb378fc.stylus.REST` 让 PenBridge 断掉"留给下一条手势"的缓存 BLE 连接；线圈电量轮询降到 `REST_POLL` 秒一次。取下、或线圈又重新开始充电（`chg=1`）立刻恢复。（起因：夜里吸附着掉电——旧 bug 每 3 秒发一条 BLE 唤醒命令，笔整夜进不了深睡） | `config` 里 `PEN_REST=0` 或标记文件 `disable-rest` |
 
-| ⑧ | **注视感知（AON）** | 把 `/product/etc/cust_features` 用 tmpfs+bind mount 盖到 HyperOS 写死的 `/mi_ext/product/etc/cust_features`（`/` 是 erofs 只读，必须先用 tmpfs），让 `config_supported_aon_devices=true` → PMS 返回 `com.xiaomi.aon` → AttentionManagerService 能起来 | 标记文件 `disable-aon` |
+| ⑧ | **注视感知（AON）** | 四步：①tmpfs+bind 把 cust_features 盖到 `/mi_ext`（`/` 是 erofs 只读）并注入 `config_supported_aon_devices=true`；②LSPosed 钩住没注册的 `HyperOSCustFeatureResolve` 与 PMS 包名接口；③`/odm/lib64` 里补 `libcamera2ndk.so`（借 `/vendor/lib64/libcamera2ndk_vendor.so`，否则 mifaced 链接失败）；④三条 SELinux 规则（含 **camera worker 自我 exec**，缺它前摄永远不开、结果恒为"无人注视"）。链路：mifaced → 前摄 → 人脸检测 → `ATTENTION_SUCCESS_PRESENT` → `AttentionDetector: onSuccess: 1` | `disable-aon` / `disable-aonlib`；细节见 **`docs/aon-attention.md`** |
 
 原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
 ⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，
