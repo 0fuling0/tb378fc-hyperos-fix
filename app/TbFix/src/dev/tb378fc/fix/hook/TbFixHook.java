@@ -207,12 +207,41 @@ public class TbFixHook implements IXposedHookLoadPackage {
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
         hookToolType(lpparam);
+        hookButtonState(lpparam);
         hookStylusState(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
         tryRegisterReceiver();
         Log.i(TAG, "hooked " + pkg + " (api=" + Build.VERSION.SDK_INT + ")");
+    }
+
+    /**
+     * 0) 诊断用：记 App 看到的按键位。
+     *    很多 App 判"笔尾/侧键当橡皮"用的是按钮约定（BUTTON_STYLUS_PRIMARY = 32）而不是
+     *    TOOL_TYPE_ERASER。实测本机 framework 在笔尾时会报 toolType=4(ERASER)，
+     *    但按钮位一直是 0 —— 如果 App 认的是按钮，就还差这一位。
+     *    只在值变化时打日志（getButtonState 是热路径）。
+     */
+    private static int sLastButton = Integer.MIN_VALUE;
+    private void hookButtonState(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            XposedHelpers.findAndHookMethod(MotionEvent.class, "getButtonState", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    try {
+                        int bs = (Integer) p.getResult();
+                        if (bs != sLastButton) {
+                            sLastButton = bs;
+                            Log.i(TAG, "buttonState -> " + bs + " (STYLUS_PRIMARY="
+                                    + MotionEvent.BUTTON_STYLUS_PRIMARY + ") tail=" + sTailDown);
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            });
+            Log.i(TAG, "hook getButtonState ok");
+        } catch (Throwable t) {
+            Log.w(TAG, "hook getButtonState failed", t);
+        }
     }
 
     /** 1) 笔尾靠近 → 对 App 来说就是"橡皮工具" */
