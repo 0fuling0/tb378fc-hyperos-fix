@@ -84,6 +84,7 @@ public final class PenBle {
     static final int MODE_WAKE = 0;
     static final int MODE_BATTERY = 1;
     static final int MODE_HAPTIC = 2;
+    static final int MODE_SCREEN = 3;
 
     /* ---- 手势触感：连接缓存 ----
      * 每次振动都重新 connect+discover 要 0.3~1s，振感就迟了；所以第一次连上之后
@@ -205,6 +206,20 @@ public final class PenBle {
             try { g.close(); } catch (Throwable ignored) { }
         }
         Log.i(TAG, "rest: dropped idle gatt link=" + (g != null));
+    }
+
+    /** ⑬ 屏幕亮/灭要发的那一帧的第二个字节（模块按 SCREEN_SWAP 算好） */
+    private static volatile int sScreenFrame = 1;
+
+    /**
+     * ⑬ 屏幕亮/灭时告诉笔：ZUX `buildScreenOnOffCmd` → `{5,frame}`。
+     * 只有 App 有 BLE 栈，所以模块读到屏幕边沿后广播过来，由这里发。
+     */
+    public static Result screen(Context ctx, int frame) {
+        sScreenFrame = frame;
+        Result r = session(ctx, null, MODE_SCREEN, false, -1, -1, null, false);
+        Log.i(TAG, "screen frame {5," + frame + "} " + r);
+        return r;
     }
 
     /** 最近一次已知的 {8,6,mask}（模块通过 WAKE 下发）。设置改了要即时下发时，在它基础上只调两位。 */
@@ -380,6 +395,14 @@ public final class PenBle {
                     BluetoothGattCharacteristic c = s == null ? null : s.getCharacteristic(CH_FE41);
                     res.sawFe41 = c != null;
                     if (c == null) { say(log, "no fe41"); g.disconnect(); return; }
+                    if (mode == MODE_SCREEN) {
+                        // ⑬ 屏幕状态：ZUX buildScreenOnOffCmd → {5,frame}（2=亮 / 1=灭，模块算好）
+                        res.hapticSent = writeCmd(log, g, c, new byte[]{5, (byte) (sScreenFrame & 0xFF)});
+                        say(log, "screen {5," + sScreenFrame + "} -> " + res.hapticSent);
+                        SystemClock.sleep(150);
+                        g.disconnect();
+                        return;
+                    }
                     if (wake) res.wakeSent = writeWake(log, g, c);
                     if (touchfilmMask >= 0) {
                         SystemClock.sleep(200);

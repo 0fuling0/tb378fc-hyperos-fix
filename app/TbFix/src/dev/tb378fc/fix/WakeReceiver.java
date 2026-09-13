@@ -34,6 +34,9 @@ public final class WakeReceiver extends BroadcastReceiver {
     /** ⑫ 设置进程（LSPosed 钩子）改了笔参数时发来的"立刻下发"请求 */
     public static final String ACTION_CFG = "dev.tb378fc.fix.CFG";
 
+    /** ⑬ 屏幕亮/灭：模块读到边沿后让 App 发 {5,2}/{5,1} 告诉笔 */
+    public static final String ACTION_SCREEN = "dev.tb378fc.fix.SCREEN";
+
     @Override
     public void onReceive(Context context, Intent intent) {
         final PendingResult pending = goAsync();
@@ -56,6 +59,22 @@ public final class WakeReceiver extends BroadcastReceiver {
                     }
                 }
             }, "penrest-rx").start();
+            return;
+        }
+
+        if (ACTION_SCREEN.equals(action)) {
+            final int frame = intent.getIntExtra("frame", 1);
+            new Thread(new Runnable() {
+                @Override public void run() {
+                    try {
+                        PenBle.screen(app, frame);
+                    } catch (Throwable t) {
+                        Log.e(PenBle.TAG, "screen frame failed", t);
+                    } finally {
+                        try { pending.finish(); } catch (Throwable ignored) { }
+                    }
+                }
+            }, "penscreen-rx").start();
             return;
         }
 

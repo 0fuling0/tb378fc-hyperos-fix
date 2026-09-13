@@ -145,6 +145,8 @@ A_ATTACH=dev.tb378fc.fix.ATTACH
 A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
 # ⑨ 休眠档广播：告诉 App 断掉"留给下一条手势"的缓存 BLE 连接
 A_REST=dev.tb378fc.fix.REST
+# ⑬ 屏幕状态交给 App 发（只有 App 有 BLE 栈）
+A_SCREEN=dev.tb378fc.fix.SCREEN
 SOC_RCV=com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
 
 # ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
@@ -226,6 +228,9 @@ BRUSH_LASSO_WAVE=36
 # 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
+# ⑬ 屏幕亮/灭时告诉笔（ZUX {5,2}=亮 / {5,1}=灭；SCREEN_SWAP=1 互换）
+SCREEN_CMD=1
+SCREEN_SWAP=0
 # ⑨ 休眠档：吸附在平板上且已充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
 #    并让 App 断掉缓存 BLE 连接，让笔真正睡下去；取下或电量掉到 REST_RESUME 以下立刻恢复。
 PEN_REST=1
@@ -881,6 +886,44 @@ case "$1" in
     exit 0
     ;;
 
+--json)
+    # WebUI 读"生效值"（含默认与 config 覆盖）：sh service.sh --json
+    printf '{"BRUSH":%s,"BRUSH_ERASER":%s,"BRUSH_DEFAULT_WAVE":%s,"BRUSH_AI_WAVE":%s,' \
+        "${BRUSH:-1}" "${BRUSH_ERASER:-35}" "${BRUSH_DEFAULT_WAVE:-36}" "${BRUSH_AI_WAVE:-36}"
+    printf '"BRUSH_LASSO_WAVE":%s,"BRUSH_ON_TOUCH_REMOVED":0,' "${BRUSH_LASSO_WAVE:-36}"
+    printf '"GESTURE":%s,"GESTURE_RING":%s,"GESTURE_DOUBLE":%s,"GESTURE_SLIDE_UP":%s,' \
+        "${GESTURE:-1}" "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
+    printf '"GESTURE_SLIDE_DOWN":%s,"GESTURE_TAIL":%s,' "${GESTURE_SLIDE_DOWN:-197}" "${GESTURE_TAIL:-92}"
+    printf '"SCREEN_CMD":%s,"SCREEN_SWAP":%s,' "${SCREEN_CMD:-1}" "${SCREEN_SWAP:-0}"
+    printf '"CAPSULE":%s,"PEN_REST":%s,"SETTINGS_SYNC":%s,' "${CAPSULE:-1}" "${PEN_REST:-1}" "${SETTINGS_SYNC:-1}"
+    printf '"BRUSH_MAP":"%s"}\n' "${BRUSH_MAP:-}"
+    exit 0
+    ;;
+
+--set)
+    # WebUI 写配置：sh service.sh --set KEY VALUE
+    # 只改 config 里那一行（没有就追加），然后重启一次守护让新值生效。
+    _k="$2"; _v="$3"
+    case "$_k" in
+        ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
+    esac
+    if grep -q "^$_k=" "$CFG" 2>/dev/null; then
+        _tmp="$CFG.tmp.$$"
+        sed "s|^$_k=.*|$_k=$_v|" "$CFG" > "$_tmp" && mv -f "$_tmp" "$CFG"
+    else
+        echo "$_k=$_v" >> "$CFG"
+    fi
+    log "config: $_k=$_v（重启守护生效）"
+    # 重启：杀掉自己这一轮的看护进程，再重新拉起（KernelSU 的 service.sh 只在开机跑一次）
+    for _p in $(ps -A -o PID,ARGS | awk -v me="$$" '$1+0 != me+0 && /tb378fc_hyperos_fix/ {print $1}'); do
+        kill -9 "$_p" 2>/dev/null
+    done
+    sleep 1
+    rm -rf "$MODDIR/brush.lock" 2>/dev/null
+    setsid /system/bin/sh "$MODDIR/service.sh" >/dev/null 2>&1 </dev/null &
+    exit 0
+    ;;
+
 --rest)
     # 手工强制休眠档（排障/测试用）：sh service.sh --rest 1 | --rest 0
     case "$2" in 1|on) pen_rest_mark 1 ;; *) pen_rest_mark 0 ;; esac
@@ -1053,6 +1096,7 @@ case "$1" in
     refresh_at=0
     refresh_deadline=0
     lvl_win=0          # "全速读线圈电量"的剩余秒数（吸附边沿后开窗）
+    last_screen=-1     # ⑬ 上一次读到的屏幕状态（1=灭 2=亮）
     pen_rest=0         # ⑨ 休眠档当前状态（文件里也写一份，给别的进程看）
     chg_seen=0         # ⑨ 本次吸附期间有没有见过 chg=1（见过才算"充过电"）
     chg_last=0         # ⑨ 最后一次见到 chg=1 的时刻（now_sec）
@@ -1084,6 +1128,25 @@ case "$1" in
             # （历史事故：函数整段丢失导致开机后静默不启动）在这里两秒内重生一次。
             if [ $((tick % 2)) -eq 1 ]; then penring_ensure; brushwatch_ensure; fi
             [ "$lvl_win" -gt 0 ] && lvl_win=$((lvl_win-1))
+
+            # ⑬ 屏幕亮/灭 → 告诉笔（debug.tracing.screen_state：1=灭 2=亮）
+            if case "$SCREEN_CMD" in 0|false|no|off) false ;; *) true ;; esac; then
+                sc=$(getprop debug.tracing.screen_state 2>/dev/null)
+                case "$sc" in 1|2) ;;
+                    *) sc="" ;;
+                esac
+                if [ -n "$sc" ] && [ "$sc" != "$last_screen" ]; then
+                    prev=$last_screen
+                    last_screen=$sc
+                    if [ "$prev" != "-1" ]; then
+                        if [ "$sc" = "2" ]; then frame=2; what=screen-on; else frame=1; what=screen-off; fi
+                        case "$SCREEN_SWAP" in 1|true|yes|on) [ "$frame" = 2 ] && frame=1 || frame=2 ;; esac
+                        send_extra "$A_SCREEN" "$what" --ei frame "$frame"
+                    else
+                        log "screen state 初始 = $sc（不发指令）"
+                    fi
+                fi
+            fi
         fi
         # attached 每轮都读（边沿检测靠它）。用内建 read 直接写变量：原来写成 $(read_att) 会让
         # 每轮 fork 一个子 shell，而"读一次 wls_tx 属性"本身就会让内核 Qi 驱动重发属性。
