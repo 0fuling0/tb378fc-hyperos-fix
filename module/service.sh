@@ -203,12 +203,6 @@ GESTURE_SLIDE_DOWN=197
 GESTURE_TAIL=92
 # ⑥ 把"设置 → 手写笔"里的双击开关/轻捏开关/轻捏力度实时路由给笔（1 = 开，默认）
 SETTINGS_SYNC=1
-# ⑩ 笔尾 = 橡皮：笔尾靠近/离开时各注入一次"双击键"（195），让 MIUI 执行"笔刷/橡皮切换"。
-#    MIUI 的笔快捷键动作表在 com.miui.securitycore 的 integer 资源里：
-#      0=关闭触控膜  1=笔刷/橡皮切换  2=切回上一支笔  3=调色盘  4=笔刷参数  5=快捷功能
-#    要把"双击"设为 1，这个功能才有效（设置 → 手写笔 → 双击 → 笔刷/橡皮切换）。
-#    只在画布聚焦（笔记/小米创作在前台）时才注入，且休眠档里不动。
-TAIL_TAP_ERASER=1
 # ⑦ 笔刷触感：读笔记/小米创作的当前笔刷，给笔发一次 CON 波形（笔自己就持续按这个手感振）
 BRUSH=1
 BRUSH_APPS="com.miui.notes com.miui.creation"
@@ -427,23 +421,6 @@ brush_canvas() {
 }
 
 # 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
-# ⑩ 笔尾当橡皮：注入一次双击键，让 MIUI 跑"笔刷/橡皮切换"那条动作
-tail_tap_eraser() {
-    case "$TAIL_TAP_ERASER" in 1|true|yes|on) ;; *) return 0 ;; esac
-    [ -x "$PENRING_BIN" ] || return 0
-    pen_rest_on && return 0
-    if ! brush_canvas; then
-        brush_log "tail-tap 跳过：画布未聚焦"
-        return 0
-    fi
-    # 先让 App 处理完"笔尾"广播（它收到后会开一个 1.2 秒的窗口：把双击动作临时当 1 处理），
-    # 再注入双击键 —— 这样借用 App 自己的"切橡皮"代码，而用户真实双击的设置值不受影响。
-    sleep 0.2
-    "$PENRING_BIN" --moddir "$MODDIR" --key "$GESTURE_DOUBLE" >/dev/null 2>&1
-    brush_log "tail-tap: 注入 $GESTURE_DOUBLE（App 侧临时按 1=笔刷/橡皮切换 处理）"
-}
-
-brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.fix.TAIL --ei down "$1" >/dev/null 2>&1 & }
 
 # $1 波形（0 = 停）；$2 原因；$3 非空表示"这是当前笔刷的基准波形"
 brush_send() {
@@ -576,7 +553,6 @@ brush_watch_loop() {
                         case "$line" in
                             *" penstate")
                                 if brush_canvas; then
-                                    brush_tell_hooks "$(brush_tail_in && echo 1 || echo 0)"
                                     # 每次进入画布都重扫一遍（不同笔记本可能记着不同笔刷），
                                     # 然后按当前笔刷下发波形
                                     brush_scan_apps
@@ -587,15 +563,11 @@ brush_watch_loop() {
                         esac ;;
                     "TAIL down")
                         echo 1 > "$BRUSH_TAIL"
-                        brush_tell_hooks 1
-                        tail_tap_eraser
                         if [ -n "$(brush_base)" ]; then
                             brush_send "$BRUSH_ERASER" "tail(eraser) in range"
                         fi ;;
                     "TAIL up")
                         echo 0 > "$BRUSH_TAIL"
-                        brush_tell_hooks 0
-                        tail_tap_eraser
                         if [ -n "$(brush_base)" ]; then
                             brush_send "$(brush_base)" "tip back"
                         fi ;;
@@ -906,14 +878,6 @@ case "$1" in
 
     brush_watch_loop
     rmdir "$BRUSH_LOCK" 2>/dev/null
-    exit 0
-    ;;
-
---penkey)
-    # 往虚拟笔注入一次原始键（排障/复用）：sh service.sh --penkey 195
-    #   195 = MIUI 眼里的"双击"，194 = 轻捏，196/197 = 上滑/下滑，92 = 截图键
-    "$PENRING_BIN" --moddir "$MODDIR" --key "$2" 2>&1 | tail -3
-    log "penkey 注入 $2"
     exit 0
     ;;
 

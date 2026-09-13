@@ -127,75 +127,46 @@ settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
 
 （`lwky_touchfeature` 那个假 HAL **不要停**：MIUI 的 `ITouchFeature.setTouchMode()` 需要它返回成功。）
 
-## 6. 笔尾 = 橡皮：在 App 里挂钩子（LSPosed）
+## 6. 笔尾 = 橡皮：结论是"小米这两个 App 里做不到"，已放弃
 
-**问题**：翻到橡皮端时，小米笔记/小米创作**不会自己把工具切成橡皮**（也就没有"翻回来变笔刷"）。
-我们这边是好的（`penring` 读 `BTN_TOOL_RUBBER`、波形 35 ↔ 当前笔刷），缺的是"App 自己也认"。
+**目标**：翻到橡皮端时 App 自己也把工具切成橡皮。
 
-**为什么 App 不认**：它不看 `MotionEvent.getToolType()`（我们覆盖成 `TOOL_TYPE_ERASER` 它也不理），
-而是用**自己的笔状态对象** + MIUI 的笔状态。证据：
+**今天查到的真相**（早先那版"判定在 native 层、Java 钩子不可行"的说法不准确，已作废）：
 
-| 发现 | 证据 |
+| 事实 | 证据 |
 |---|---|
-| App 混淆，笔状态类 `fc.Iι11lii`（真实类名带希腊字母 ι U+03B9） | `dexdump`: `'Lfc/Iι11lii;'`；字段名如 `f2860I11IIil` |
-| 它的 `toString` 能对上语义 | `, isEraser=` / `, isTouchEraser=` / `, postureDegree=` |
-| 构造参数含工具枚举 `gc.Iiliill touchType`（常量名混淆，但 **toString 可读**） | 运行时 `I11lii ctor touchType=TOUCH_MOVE …` |
-| 该构造器**每个笔事件都调用** | 按下时日志每几十毫秒一条 → 改写即时生效 |
+| 内核/框架**本来就报**橡皮端 | `getevent`：`BTN_TOOL_RUBBER DOWN/UP`；App 里 `MotionEvent.getToolType()` 实测返回 **4 = TOOL_TYPE_ERASER** |
+| App 是**在 Java 层**读 tool type 的 | 钩子里能收到 `getToolType` 调用（`com.miui.notes`），"无条件改成 ERASER 会把绘制搞坏"也说明它确实按这个值决定工具 |
+| 但**笔记不吃这一套** | 框架报 ERASER(4) 时笔记照样出墨（它认的是别的约定） |
+| **创作更糟** | 框架报 ERASER(4) 时它进了橡皮分支但绘制管线卡住 —— 既不画也不擦 |
+| 伪造 `BUTTON_STYLUS_PRIMARY(32)`（含 `getActionButton`） | 两个 App 依旧出墨 —— 绘制在 native 里读原始 InputEvent，Java 层改的位到不了 |
+| MIUI 自己的"笔快捷键动作表"存在 | `com.miui.securitycore` 的 integer 资源（中文串是 UTF-16，`strings` 查不到，要 `aapt dump --values`）：`0=关闭触控膜 1=笔刷/橡皮切换 2=切回上一支笔 3=调色盘 4=笔刷参数 5=快捷功能` |
+| 但那条动作**只能被"笔快捷键"触发** | `stylus_double_click_status` 由框架(`miui-services.jar`)＋**App 自己**读；执行方是 App。想用它就得把双击设置改成 1 —— 那会破坏用户原本的双击功能（当前是 4=笔刷参数），用户明确不接受 |
 
-### 定位方法（可复现）
+**试过并已全部撤掉的方案**（代码已清理干净）：
 
-1. `unzip -l Creation.apk` 列 `classes*.dex`，**逐个** `unzip -p` 抽出 ——
-   别用 `unzip -p "classes*.dex"`（会把多个 dex 拼成一个，`dexdump` 只读第一个；`isEraser` 在 classes4）
-2. 逐 dex `strings | grep -cE "isEraser|MiuiStylusPosture"` 命中 classes2/classes4
-3. `dexdump -d <dex> | awk '/Class descriptor/{c=$4} /isEraser/{print c; exit}'`
-4. `jadx --single-class <类>` 看逻辑。
-   **坑**：jadx 会把希腊字母转成 ASCII 写文件名（`Iι11lii` → `I11lii.java`），照抄文件名 `findClass` 找不到类；
-   Java 里要写 `"fc.I\u03b911lii"`（`build.sh` 的 javac 已加 `-encoding UTF-8`）。
+1. `getToolType` 无条件/按笔尾报 `ERASER` —— 笔记不理、创作卡住
+2. 伪造 `getButtonState/getActionButton = BUTTON_STYLUS_PRIMARY(32)` —— 两个 App 都照画出墨
+3. 笔尾靠近 → 注入双击键（195）＋把双击设置改成 1 —— 能借用 App 的切橡皮代码，但**破坏双击**，用户否掉
+4. 注入瞬间只在 App 进程里把 `stylus_double_click_status` 伪装成 1（1.2 秒窗口）—— 用户叫停，未验证，代码已撤
 
-### 实现（`TbFixHook`）
+**结论**：小米焦点触控笔本身**没有笔尾橡皮**，MIUI 只为它实现了"侧键/快捷键→切笔"，所以笔记/创作里没有"橡皮端"这条路径可走。
 
-1. `MotionEvent.getToolType(int)` → 笔尾在范围内返回 `TOOL_TYPE_ERASER`（第一层保险）
-2. `fc.Iι11lii` 的**所有构造器** → 笔尾在范围内把两个 eraser 布尔（第 7、10 个参数）置 `true`
-3. 日志（前 5 次 + 笔尾按下时）：`I11lii ctor touchType=.. bool7=.. posture=.. int9=.. bool10=.. tail=..`
-
-作用域 `com.miui.notes` / `com.miui.creation`；改完需 **LSPosed 启用 + 重启这两个 App**。
-
-### 验证 / 继续调
+**保留的**：笔尾靠近 → 我们自己给笔发波形 35（橡皮手感）、翻回笔尖恢复当前笔刷（见 §7），
+以及排障用的注入原语：
 
 ```bash
-adb logcat -s TbFixHook:*
-#   tail receiver registered / tail=true -> TOOL_TYPE_ERASER
-#   找到笔状态类 fc.Iι11lii / hook fc.I11lii ok
-#   I11lii ctor touchType=TOUCH_MOVE … tail=true
-adb shell su -c 'cat /data/adb/modules/tb378fc_hyperos_fix/brush.log'   # wave=35 / tip back
+M=/data/adb/modules/tb378fc_hyperos_fix
+$M/bin/penring --moddir $M --key 195     # 往 type-8 虚拟笔注入一次原始键（195=双击/194=轻捏/196,197=上下滑/92=笔尾键）
 ```
 
-### 实测踩坑（重要）
+**如果将来要重开这条线**，两个候选方向：
 
-1. **`touchType` 不是"工具"，是"触摸阶段"**：`gc.Iiliill` 的常量 toString 是
-   `TOUCH_DOWN / TOUCH_MOVE / TOUCH_UP / TOUCH_HOVER / TOUCH_HOVER_EXIT / TOUCH_SHAPE / TOUCH_SHAPE_UP / TOUCH_CLEAN`
-   —— 所以橡皮不在这里。
-2. **不能强行把两个 eraser 布尔改成 true**（`FORCE_ERASER` 默认已关）：
-   实测笔尾滑动会**既不画也不擦**，抬手时按轨迹补一笔 —— 因为 `isEraser` 必须与
-   "橡皮端的坐标/几何"配套，只改标志位会让 App 的绘制状态机错乱。
-3. **下一步定位上游 producer**：构造 `fc.Iι11lii` 的调用链（日志里的 `producer stack`）是
-   `ud.lιIil11` → `he.ll1ιι11i` → …（同样混淆）。要读 `ud.lιIil11` 看它怎么算出 `isEraser`
-   （大概是从 MIUI 的笔状态/InputDevice 读的），然后**只钩那个来源**。
-
-
-### 最终结论（2026-09-13）：App 的橡皮判定在 native，Java hook 修不了
-
-- 决定性实测：`MotionEvent.getToolType()` 改成"前 10 次无条件记录"后，用笔尖碰屏 + 翻笔尾
-  → **一条日志都没有** ⇒ App 不调 Java 层，native 直接读 NDK 事件数据
-- 上游链路：`ud.lIil11.m15546I111ll(..., boolean z /*eraser*/, ...)` ←
-  `p240lii1II.I11lii`（TAG=`MiuiStylusPosture`）← 门面 `l1Ilili.I11IIil`
-  （`getDegree`/`setPreviewBrush`/`Iiliill(MotionEvent)`）+ `xc.engine.cbridge.SStore`（native）
-- 排除项：日志里 `StylusModule.onUpdateToolType … tool type = 0` 是 **GBoard** 的，不是笔记/创作
-- 因此剩下两条路：
-  1. 给 MIUI 姿态通道喂真数据 —— 改我们自己的假 HAL `/system/lwky/touchfeature_hal.jar`，
-     实现 `ITouchFeature.registerCallback` → `onTouchModeChanged`（mode `20036` 姿态）；
-     需要逆向 modeData 的字节布局，工作量中高、成功率不确定
-  2. 接受现状：**笔端手感**跟着笔尾切（35 ↔ 当前笔刷，已实测），但 **App 工具图标不会自动切**
+1. **输入层**：penring 抓住 `/dev/input/event5`（`EVIOCGRAB`），造一个同能力的虚拟数字化器
+   （ABS_X/Y/PRESSURE/TILT、`INPUT_PROP_DIRECT`）把事件原样转发，并在笔尾感应时附加 `BTN_STYLUS`
+   —— 这是唯一能让 native 绘制路径看到"侧键按下"的办法；代价：可能影响笔迹/压感/防误触，必须做成可一键回退。
+2. **继续挖 App 内部**：找到笔记里"切橡皮"那段（它读 `stylus_double_click_status` 后执行），
+   直接调用它 —— 需要在 App 进程里定位那个方法（混淆，得靠 jadx + 运行时探测）。
 
 ## 7. 构建 / 安装 / 自检
 

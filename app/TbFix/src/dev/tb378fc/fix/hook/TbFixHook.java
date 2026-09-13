@@ -9,7 +9,6 @@ import android.content.res.Resources;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.widget.PopupWindow;
@@ -24,33 +23,29 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * TbFix 的 LSPosed 部分（作用域：笔记 / 小米创作）。
+ * TbFix 的 LSPosed 部分。作用域与各自职责：
  *
- * 为什么需要在 App 进程里挂钩子：这两件事只有 App 自己知道 ——
+ *   笔记 / 小米创作（App 进程）
+ *     "焦点在画布才开波形"：画布是否可写只有 App 自己知道（弹窗/面板打开时不该振）。
+ *     这里盯 Activity 的窗口焦点 + Dialog/PopupWindow 的显示隐藏，把结论写进
+ *     files/penstate —— 根侧守护读它决定要不要继续发 CON 波形。
  *
- * 1) 笔尾（橡皮端）靠近时，"是不是橡皮"是 MIUI 下发给 App 的状态
- *    （App 里能看到 `MiuiStylusPosture` / `isEraser=`，框架里是 `isEraserType`），
- *    联想笔永远进不了那个状态，所以 App 从不切成橡皮。
- *    这里把 {@code MotionEvent.getToolType(int)} 改成：只要笔尾在感应范围内就报
- *    {@code TOOL_TYPE_ERASER} → App 自己的橡皮逻辑生效，翻回笔尖自然又切回笔刷。
- *    笔尾状态由根侧守护广播 {@link #ACTION_TAIL} 送进来（penring 读 BTN_TOOL_RUBBER）。
+ *   设置 com.android.settings
+ *     「视觉感知 / 注视感知」那一页的可见性：移植包把 com.miui.rom 里三个 AON bool
+ *     写成 false，这里按资源名放行 getBoolean（不动系统分区，详见 docs/aon-attention.md）。
  *
- * 2) "焦点在画布才开波形"：画布是否可写只有 App 知道（弹窗/面板打开时不该振）。
- *    这里盯 Activity 的窗口焦点 + Dialog/PopupWindow 的显示隐藏，把结论写进
- *    files/penstate（根侧守护读它决定要不要继续发 CON 波形）。
+ *   android（system_server）
+ *     注视感知的两道门：接管移植包里没注册的 HyperOSCustFeatureResolve，
+ *     以及 PMS 的 getSupportAonServicePackageName / getAttentionServicePackageName。
  *
  * 一切都包在 try/catch 里：hook 挂了也绝不能让 App 崩。
  */
 public class TbFixHook implements IXposedHookLoadPackage {
 
     static final String TAG = "TbFixHook";
-    /** 根侧守护 → hook：笔尾（橡皮端）进/出感应范围，extra "down"=1/0 */
-    static final String ACTION_TAIL = "dev.tb378fc.fix.TAIL";
-    /** 根侧守护 → hook：笔尖也离开了（可选，用于收尾） */
+    /** 根侧守护 → hook：强制重算一次画布焦点 */
     static final String ACTION_FORCE_FOCUS = "dev.tb378fc.fix.FOCUS";
 
-    /** 笔尾是否在感应范围内（由广播维护） */
-    private static volatile boolean sTailDown = false;
     /** 当前 App 是否处于"可以写字"的状态（前台 + 没有弹窗/面板） */
     private static volatile boolean sCanvas = false;
     /** 当前 Activity 是不是编辑器/画布（只有它算"可写"，首页/列表一律禁） */
@@ -60,7 +55,7 @@ public class TbFixHook implements IXposedHookLoadPackage {
     private static int sPopups = 0;
     /** 广播接收器只能注册一次；注册时机推迟到拿到 Context（第一次 onResume） */
     private static volatile boolean sReceiverReady = false;
-    private static BroadcastReceiver sTailReceiver;
+    private static BroadcastReceiver sFocusReceiver;
 
     /** 注视感知（AON）：这个移植包没注册 HyperOSCustFeatureResolve 服务，
      *  所有 getBoolean 都会抛异常→返回默认 false→PMS 的 config_supported_aon_devices 门永远过不去。
@@ -207,225 +202,11 @@ public class TbFixHook implements IXposedHookLoadPackage {
         }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
-        hookToolType(lpparam);
-        hookButtonState(lpparam);
-        hookSettingsSpoof(lpparam);
-        hookStylusState(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
         tryRegisterReceiver();
         Log.i(TAG, "hooked " + pkg + " (api=" + Build.VERSION.SDK_INT + ")");
-    }
-
-    /**
-     * 0) 诊断用：记 App 看到的按键位。
-     *    很多 App 判"笔尾/侧键当橡皮"用的是按钮约定（BUTTON_STYLUS_PRIMARY = 32）而不是
-     *    TOOL_TYPE_ERASER。实测本机 framework 在笔尾时会报 toolType=4(ERASER)，
-     *    但按钮位一直是 0 —— 如果 App 认的是按钮，就还差这一位。
-     *    只在值变化时打日志（getButtonState 是热路径）。
-     */
-    private static int sLastButton = Integer.MIN_VALUE;
-
-    /**
-     * 笔尾（橡皮端）改写成"小米笔侧键"约定：{@code toolType=STYLUS(2) + BUTTON_STYLUS_PRIMARY(32)}。
-     *
-     * 为什么不用框架原生的 ERASER(4)：实测这台机器上框架**已经**会报 4，但两个 App 都不吃这套 ——
-     *   笔记：报 4 时照样出墨（它认按钮约定，小米笔本来就是"侧键=橡皮"）
-     *   创作：报 4 时进了橡皮分支但绘制管线卡住（既不画也不擦）
-     * 所以改成按钮约定，并把 4 藏起来（避免再触发那条坏路径）。
-     * 想回到"原样透传 ERASER"就把这个常量改成 false 重新构建。
-     */
-    private static final boolean TAIL_AS_STYLUS_BUTTON = true;
-    /** 最近一次 getToolType 的**原始**返回值（改写前），给 getButtonState/getActionButton 用 */
-    private static volatile int sOrigTool = MotionEvent.TOOL_TYPE_UNKNOWN;
-    private void hookButtonState(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            XposedHelpers.findAndHookMethod(MotionEvent.class, "getButtonState", new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
-                    try {
-                        int bs = (Integer) p.getResult();
-                        if (TAIL_AS_STYLUS_BUTTON && sOrigTool == MotionEvent.TOOL_TYPE_ERASER) {
-                            int want = bs | MotionEvent.BUTTON_STYLUS_PRIMARY;
-                            if (want != bs) {
-                                p.setResult(want);
-                                bs = want;
-                            }
-                        }
-                        if (bs != sLastButton) {
-                            sLastButton = bs;
-                            Log.i(TAG, "buttonState -> " + bs + " (STYLUS_PRIMARY="
-                                    + MotionEvent.BUTTON_STYLUS_PRIMARY + ") origTool="
-                                    + sOrigTool + " tail=" + sTailDown);
-                        }
-                    } catch (Throwable ignored) { }
-                }
-            });
-            Log.i(TAG, "hook getButtonState ok");
-        } catch (Throwable t) {
-            Log.w(TAG, "hook getButtonState failed", t);
-        }
-        // 有些 App 读的是"动作按钮"（ACTION_DOWN/POINTER_DOWN 上的 actionButton）
-        try {
-            XposedHelpers.findAndHookMethod(MotionEvent.class, "getActionButton", new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!TAIL_AS_STYLUS_BUTTON) return;
-                        if (sOrigTool != MotionEvent.TOOL_TYPE_ERASER) return;
-                        MotionEvent ev = (MotionEvent) p.thisObject;
-                        int a = ev.getActionMasked();
-                        if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
-                            p.setResult(MotionEvent.BUTTON_STYLUS_PRIMARY);
-                        }
-                    } catch (Throwable ignored) { }
-                }
-            });
-            Log.i(TAG, "hook getActionButton ok");
-        } catch (Throwable t) {
-            Log.w(TAG, "hook getActionButton failed", t);
-        }
-    }
-
-    /** 1) 笔尾靠近 → 对 App 来说就是"橡皮工具" */
-    private void hookToolType(XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            XposedHelpers.findAndHookMethod(MotionEvent.class, "getToolType", int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            int orig = (Integer) param.getResult();
-                            sOrigTool = orig;
-                            // 只在"框架报的不是 STYLUS"时记一条（排查用；2=STYLUS 4=ERASER）
-                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 8) {
-                                sToolLogs++;
-                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown
-                                        + " -> " + (TAIL_AS_STYLUS_BUTTON ? "STYLUS+按钮" : "ERASER"));
-                            }
-                            if (TAIL_AS_STYLUS_BUTTON) {
-                                // 笔尾：藏掉 ERASER，改成 STYLUS（配合下面的主按钮位）
-                                if (orig == MotionEvent.TOOL_TYPE_ERASER) {
-                                    param.setResult(MotionEvent.TOOL_TYPE_STYLUS);
-                                }
-                                return;
-                            }
-                            if (!sTailDown) return;
-                            if (orig == MotionEvent.TOOL_TYPE_STYLUS || orig == MotionEvent.TOOL_TYPE_ERASER) {
-                                param.setResult(MotionEvent.TOOL_TYPE_ERASER);
-                            }
-                        }
-                    });
-            Log.i(TAG, "hook getToolType ok");
-        } catch (Throwable t) {
-            Log.e(TAG, "hook getToolType failed", t);
-        }
-    }
-
-    /**
-     * 1b) 小米创作/笔记的"笔状态"数据类 `fc.I11lii`：
-     *     混淆后字段名不可读，但它的 toString 里能对上 isEraser / isTouchEraser / postureDegree，
-     *     构造参数里还有 `gc.Iiliill touchType`（工具类型枚举，常量名也是混淆的）。
-     *     笔尾在感应范围内时，把这个对象的两个 eraser 布尔强制为 true —— App 的橡皮逻辑就会生效。
-     *     顺便打日志（前若干次 + 笔尾按下时）以便校准：能看出 touchType 到底是什么。
-     */
-    private static int sStateLogs = 0;
-    /** 是否强制改写 eraser 布尔：默认关（实测会破坏 App 绘制管线）
-     *  实测强制打开会破坏 App 的绘制管线（笔尾滑动既不画也不擦、抬手才按轨迹补一笔），
-     *  因为 isEraser 要与"橡皮端的坐标/几何"配套，光改标志位状态机就错乱了。
-     *  这里保留开关，等找到上游 producer（真正的橡皮判定）再用。 */
-    private static final boolean FORCE_ERASER = false;
-    private static int sToolLogs = 0;
-    private void hookStylusState(XC_LoadPackage.LoadPackageParam lp) {
-        // 注意：真实类名里有希腊字母 ι（U+03B9），jadx 输出到文件名时会变成 ASCII 的 "I"
-        Class<?> cls = null;
-        String hit = null;
-        for (String name : new String[]{"fc.I\u03b911lii", "fc.I11lii"}) {
-            cls = XposedHelpers.findClassIfExists(name, lp.classLoader);
-            if (cls != null) { hit = name; break; }
-        }
-        if (cls == null) { Log.i(TAG, "fc.I\u03b911lii 不存在（版本不同？）"); return; }
-        Log.i(TAG, "找到笔状态类 " + hit);
-        for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
-            try {
-                XposedBridge.hookMethod(ctor, new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        try {
-                            Object[] a = p.args;
-                            if (a == null || a.length < 10) return;
-                            boolean logIt = sTailDown || sStateLogs < 5;
-                            if (logIt) {
-                                sStateLogs++;
-                                Log.i(TAG, "I11lii ctor touchType=" + a[5]
-                                        + " bool7=" + a[6] + " posture=" + a[7]
-                                        + " int9=" + a[8] + " bool10=" + a[9]
-                                        + " tail=" + sTailDown);
-                            }
-                            if (FORCE_ERASER && sTailDown) {
-                                a[6] = Boolean.TRUE;
-                                a[9] = Boolean.TRUE;
-                            }
-                        } catch (Throwable ignored) { }
-                    }
-                });
-            } catch (Throwable t) {
-                Log.w(TAG, "hook I11lii ctor failed", t);
-            }
-        }
-        Log.i(TAG, "hook fc.I11lii ok");
-    }
-
-    /** ⑩ 笔尾=橡皮：我们注入 195（双击键）的那一瞬间，**只在 App 进程里**把
-     *  `stylus_double_click_status` 临时伪装成 1（笔刷/橡皮切换），1.2 秒窗口后自然失效。
-     *
-     *  为什么要这样：这条动作是 App 自己读设置后执行的（笔记里含该设置字符串），
-     *  用户的双击动作设的是别的值（如 4=笔刷参数）。直接改系统设置会破坏用户的双击；
-     *  在注入的瞬间伪装值，就能"借用" App 自己的切橡皮代码，而用户的双击不受影响。 */
-    private static final String KEY_DOUBLE = "stylus_double_click_status";
-    private static volatile long sTailTapUntil = 0;
-    /** App 收到笔尾广播时调用：开一个短暂的"双击=切橡皮"窗口 */
-    static void markTailTap() {
-        sTailTapUntil = SystemClock.uptimeMillis() + 1200;
-        Log.i(TAG, "⑩ tail-tap 窗口开启（双击动作临时按 1=笔刷/橡皮切换 处理）");
-    }
-
-    private void hookSettingsSpoof(XC_LoadPackage.LoadPackageParam lp) {
-        Class<?>[] classes = {android.provider.Settings.System.class,
-                              android.provider.Settings.Secure.class,
-                              android.provider.Settings.Global.class};
-        for (final Class<?> c : classes) {
-            for (final String m : new String[]{"getInt", "getString"}) {
-                try {
-                    XposedHelpers.findAndHookMethod(c, m,
-                            android.content.ContentResolver.class, String.class, int.class,
-                            new XC_MethodHook() {
-                                @Override protected void afterHookedMethod(MethodHookParam p) {
-                                    try {
-                                        if (SystemClock.uptimeMillis() >= sTailTapUntil) return;
-                                        if (KEY_DOUBLE.equals(p.args[1])) {
-                                            p.setResult(1);   // 1 = 笔刷/橡皮切换（com.miui.securitycore:integer/stylus_func_switch_between_brush_and_eraser）
-                                            Log.i(TAG, "⑩ spoof " + KEY_DOUBLE + " -> 1");
-                                        }
-                                    } catch (Throwable ignored) { }
-                                }
-                            });
-                } catch (Throwable ignored) { }
-                try {
-                    XposedHelpers.findAndHookMethod(c, m,
-                            android.content.ContentResolver.class, String.class,
-                            new XC_MethodHook() {
-                                @Override protected void afterHookedMethod(MethodHookParam p) {
-                                    try {
-                                        if (SystemClock.uptimeMillis() >= sTailTapUntil) return;
-                                        if (KEY_DOUBLE.equals(p.args[1])) {
-                                            p.setResult("1");
-                                            Log.i(TAG, "⑩ spoof(str) " + KEY_DOUBLE + " -> 1");
-                                        }
-                                    } catch (Throwable ignored) { }
-                                }
-                            });
-                } catch (Throwable ignored) { }
-            }
-        }
-        Log.i(TAG, "⑩ 设置读取钩子已装（笔尾窗口内伪装双击动作）");
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */
@@ -521,34 +302,24 @@ public class TbFixHook implements IXposedHookLoadPackage {
             File f = new File(c.getFilesDir(), "penstate");
             FileOutputStream out = new FileOutputStream(f, false);
             out.write((canvas ? "canvas=1" : "canvas=0").getBytes());
-            out.write(("\ntail=" + (sTailDown ? 1 : 0) + "\n").getBytes());
             out.close();
         } catch (Throwable t) {
             Log.w(TAG, "write penstate failed", t);
         }
     }
 
-    /** 根侧守护用广播告诉我们笔尾状态（动态注册的接收器能收到隐式广播） */
+    /** 根侧守护用广播让我们强制重算一次画布焦点（动态注册的接收器能收到隐式广播） */
     private static void tryRegisterReceiver() {
         if (sReceiverReady) return;
         try {
             Context ctx = currentApp();
             if (ctx == null) { Log.w(TAG, "no app context yet, will retry on resume"); return; }
             IntentFilter filter = new IntentFilter();
-            filter.addAction(ACTION_TAIL);
             filter.addAction(ACTION_FORCE_FOCUS);
-            sTailReceiver = new BroadcastReceiver() {
+            sFocusReceiver = new BroadcastReceiver() {
                 @Override public void onReceive(Context context, Intent intent) {
                     String a = intent == null ? "" : String.valueOf(intent.getAction());
-                    if (ACTION_TAIL.equals(a)) {
-                        boolean down = intent.getIntExtra("down", 0) != 0;
-                        if (down != sTailDown) {
-                            sTailDown = down;
-                            if (down) markTailTap();      // ⑩ 笔尾靠近：开"双击=切橡皮"窗口
-                            Log.i(TAG, "tail=" + down + " -> " + (down ? "TOOL_TYPE_ERASER" : "笔刷"));
-                            updateCanvas(sCanvas, "tail change");
-                        }
-                    } else if (ACTION_FORCE_FOCUS.equals(a)) {
+                    if (ACTION_FORCE_FOCUS.equals(a)) {
                         recomputeCanvas("forced");
                     }
                 }
@@ -560,15 +331,15 @@ public class TbFixHook implements IXposedHookLoadPackage {
                 try {
                     java.lang.reflect.Method m = Context.class.getMethod("registerReceiver",
                             BroadcastReceiver.class, IntentFilter.class, int.class);
-                    m.invoke(ctx, sTailReceiver, filter, 2 /* RECEIVER_EXPORTED */);
+                    m.invoke(ctx, sFocusReceiver, filter, 2 /* RECEIVER_EXPORTED */);
                     ok = true;
                 } catch (Throwable t) {
                     Log.w(TAG, "registerReceiver(flags) failed, fallback", t);
                 }
             }
-            if (!ok) ctx.registerReceiver(sTailReceiver, filter);
+            if (!ok) ctx.registerReceiver(sFocusReceiver, filter);
             sReceiverReady = true;
-            Log.i(TAG, "tail receiver registered");
+            Log.i(TAG, "focus receiver registered");
         } catch (Throwable t) {
             Log.e(TAG, "register receiver failed", t);
         }
