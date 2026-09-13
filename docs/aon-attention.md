@@ -95,10 +95,40 @@ dmesg | grep -c 'avc:.*hal_miface'             # → 0
   想手动看效果：把 `screen_off_timeout` 调短（如 20 秒），盯着屏幕别碰 —— 屏幕不该熄灭；
   盯着别处/离开，则按超时熄灭。看完记得把超时改回去。
 
-## 还没做的（第三步）
+## 第三步：让「设置 → 视觉感知/注视感知」那一页出现
 
-设置里那个"注视感知/视觉感知"页面仍然是隐藏的 —— 需要把
-`MiuiFrameworkResOverlay` 里三个 AON 相关 bool（gesture / screen_on / screen_off available）
-翻成 true。功能本身已经不依赖它（`adaptive_sleep` 开关本来就是开的），
-但要在 UI 上看到/切换，还得再补这一处（做法可以是再挂一个改过的 overlay，
-或者在设置进程里钩 `Resources.getBoolean` 按资源名放行）。
+HyperOS 里这一页的可见性由 **`com.miui.rom`** 里三个 bool 决定，而移植包自带的
+`/product/overlay/MiuiFrameworkResOverlay.apk`（target `com.miui.rom`、priority 100、isStatic）
+把它们写成了 false：
+
+```
+config_aon_gesture_available / config_aon_screen_on_available / config_aon_screen_off_available
+```
+
+**做法**：在**设置进程**里钩 `android.content.res.Resources.getBoolean(int)`，按资源名
+（先把三个名字解析成 id 缓存起来，热路径只比 int）把这三个 bool 放行成 true。
+作用域要加 `com.android.settings`（`scope.list` 与 `res/values/arrays.xml` 都要加 —— 见下面那条坑）。
+
+功能本身不依赖它（`secure adaptive_sleep=1` 本来就是开的，检查照常触发），这一步只是让用户在
+UI 上能看见、能切换。
+
+### ⚠️ 走过的弯路：千万不要用 tmpfs 覆盖系统 overlay 目录
+
+一开始做的是正经 RRO（`target com.miui.rom`、`priority 999`、只覆盖这三个 bool）。装成
+data overlay 被签名校验挡住：
+
+```
+INSTALL_FAILED_INTERNAL_ERROR: Overlay dev.tb378fc.aonoverlay and target com.miui.rom
+signed with different certificates, and the overlay lacks <overlay android:targetName>
+```
+
+（target 没声明 `<overlayable>`，异签名只能靠"装在系统分区"豁免。）于是改成
+`tmpfs 盖 /product/overlay` → 把原有 overlay 全部 `cp -a` 回去 → 再 `chcon` 自己的那个。
+**结果把 UI 弄坏了**：`cp -a` 不保留 SELinux 标签，83 个原有 overlay 全变成 `u:object_r:tmpfs:s0`，
+system_server 读不了它们（`avc: denied { getattr } path="/product/overlay/...apk" tcontext=u:object_r:tmpfs:s0`），
+而那个目录里正是 `MiuiDefaultLockscreenOverlay.apk` / `MiuiSystemUIResOverlay.apk` 这批
+锁屏与 SystemUI 的 overlay —— 表现就是**锁屏时钟消失、下拉通知栏出不来控制中心**。
+
+结论：**系统 overlay 目录不要用 tmpfs + cp 去镜像**（标签、fs-verity 都不是拷过来的）。
+真要用 RRO，就得整目录逐个 `chcon` 成原标签，而且要先验证 `ls -Z` 一致；
+更省事、风险更低的替代就是上面这个"在读取方进程里按资源名放行"的钩子。

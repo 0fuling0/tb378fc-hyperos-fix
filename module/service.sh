@@ -1036,14 +1036,7 @@ case "$1" in
     # 已经跑起来，会把 mIAlwaysOn 缓存成 null —— 之后恒返回"无人注视"（实测，必须清一次进程）。
     # 这里用 kill 而不是 am force-stop：kill 掉后框架下次请求会自然重新 bind（force-stop 会置
     # stopped 状态，语义更重）。每个开机只做一次（标记文件，post-fs-data 清）。
-    # ⑧c 启用 AON overlay（预装 + isStatic=false，要显式 enable；状态存在 /data，幂等）
-    if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonoverlay" ] \
-            && [ ! -e "$MODDIR/.aonoverlay-on" ]; then
-        if cmd overlay enable --user 0 dev.tb378fc.aonoverlay >/dev/null 2>&1; then
-            : > "$MODDIR/.aonoverlay-on"
-            log "⑧c AON overlay 已启用（注视感知设置页应可见）"
-        fi
-    fi
+    # ⑧c 设置页可见性由 TbFixHook 在设置进程里放行（见 hookAonSettingsBool），无需在这里做事。
 
     if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/aon.restarted" ] \
             && [ -x /odm/bin/hw/mifaced ] && pidof com.xiaomi.aon >/dev/null 2>&1; then

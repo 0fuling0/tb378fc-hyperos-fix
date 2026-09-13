@@ -107,11 +107,10 @@ if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
     fi
 fi
 
-# ------------------------------------------- ⑧c AON：把三个 com.miui.rom 的 bool 翻成 true
-# 目的：让「设置 → 视觉感知/注视感知」那一页重新出现（见 module/bin/aonoverlay.sh）。
-if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonoverlay" ]; then
-    MODDIR="$MODDIR" sh "$MODDIR/bin/aonoverlay.sh" 2>&1 | while read -r l; do log_msg "$l"; done
-fi
+# ⑧c「设置里让注视感知那一页出现」不再在这里做 —— 曾经用 tmpfs 盖 /product/overlay 挂 RRO，
+# 结果 cp 过去的 83 个 MIUI/SystemUI overlay 丢了 SELinux 标签（tmpfs:s0）被 system_server 拒读，
+# 锁屏时钟、控制中心整批消失。现在改成在设置进程里按资源名放行 getBoolean（见 TbFixHook）。
+# 教训：**不要用 tmpfs + cp 去镜像系统 overlay 目录**，标签/verity 都不是拷过来的。
 
 # ------------------------------------------- ⑧b AON HAL：/odm/lib64 里补 libcamera2ndk.so
 # mifaced 起不来就没有 IAlwaysOn → AON app 拿不到 HAL → "注视感知"永远给不出结果。

@@ -5,6 +5,7 @@ import android.app.Application;
 import android.app.Dialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.res.Resources;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
@@ -69,6 +70,73 @@ public class TbFixHook implements IXposedHookLoadPackage {
     /** AON 服务的包名（覆盖层里 config_defaultAttentionService 的值就是它） */
     private static final String AON_PKG = "com.xiaomi.aon";
 
+    /** ⑧c 设置里那一页「视觉感知 / 注视感知」的可见性开关。
+     *
+     *  移植包自带的 /product/overlay/MiuiFrameworkResOverlay.apk 把 com.miui.rom 里这三个
+     *  bool 写成了 false，设置 App 读到就 removePreference 掉那一页：
+     *      config_aon_gesture_available / config_aon_screen_on_available / config_aon_screen_off_available
+     *  这里在设置进程里按"资源名"放行（不改任何系统分区、不改资源本身）。
+     *
+     *  ⚠️ 曾经试过用 RRO 覆盖层改这三个资源：tmpfs 盖住 /product/overlay 再 cp 回来，结果那
+     *  83 个 MIUI/SystemUI overlay 全丢了 SELinux 标签（变成 tmpfs:s0）被 system_server 拒读，
+     *  锁屏时钟、控制中心整批消失。**别再走那条路。** */
+    private static final String SETTINGS_PKG = "com.android.settings";
+    private static final String[] AON_BOOLS = {
+            "config_aon_gesture_available",
+            "config_aon_screen_on_available",
+            "config_aon_screen_off_available",
+    };
+    private static final java.util.Set<Integer> sAonBoolIds = new java.util.HashSet<>();
+    private static volatile boolean sAonResolved = false;
+
+    /** 资源 id 缓存：getBoolean 是热路径，不能每次都拿名字去比。 */
+    private static boolean isAonBool(Resources res, int id) {
+        if (!sAonResolved) {
+            synchronized (sAonBoolIds) {
+                if (!sAonResolved) {
+                    for (String b : AON_BOOLS) {
+                        try {
+                            int rid = res.getIdentifier(b, "bool", "com.miui.rom");
+                            if (rid != 0) sAonBoolIds.add(rid);
+                        } catch (Throwable ignored) { }
+                    }
+                    sAonResolved = true;
+                    Log.i(TAG, "⑧c AON bool ids = " + sAonBoolIds);
+                }
+            }
+        }
+        if (!sAonBoolIds.isEmpty()) return sAonBoolIds.contains(id);
+        /* 解析不到 id（包里没有那份资源表）时的退路：按名字比，但只试有限次，避免热路径开销 */
+        try {
+            String n = res.getResourceName(id);
+            if (n == null) return false;
+            for (String b : AON_BOOLS) if (n.endsWith("bool/" + b)) return true;
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private void hookAonSettingsBool(String pkg) {
+        try {
+            XposedHelpers.findAndHookMethod(Resources.class, "getBoolean", int.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            try {
+                                if (Boolean.TRUE.equals(p.getResult())) return;
+                                int id = (Integer) p.args[0];
+                                Resources res = (Resources) p.thisObject;
+                                if (isAonBool(res, id)) {
+                                    p.setResult(Boolean.TRUE);
+                                    Log.i(TAG, "⑧c " + res.getResourceName(id) + " -> true");
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            Log.i(TAG, "⑧c hook Resources.getBoolean ok (" + pkg + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "⑧c hook settings getBoolean failed", t);
+        }
+    }
+
     /**
      * 直接接管 system_server 里"注视服务配好了没"的最终判断：
      *   PackageManagerServiceImpl.getSupportAonServicePackageName()  ← 上游开关不满足时返回 ""
@@ -130,6 +198,10 @@ public class TbFixHook implements IXposedHookLoadPackage {
         if (SYS_PKG.equals(pkg)) {          // system_server：注视感知的两道门
             hookCustFeature(pkg);
             hookAonPackageName(pkg);
+            return;
+        }
+        if (SETTINGS_PKG.equals(pkg)) {     // 设置：让「视觉感知/注视感知」那一页别被 removePreference
+            hookAonSettingsBool(pkg);
             return;
         }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;

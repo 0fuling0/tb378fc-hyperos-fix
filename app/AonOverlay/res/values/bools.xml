@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- 这三项在移植包自带的 MiuiFrameworkResOverlay 里被写成 false -->
-<resources>
-    <bool name="config_aon_gesture_available">true</bool>
-    <bool name="config_aon_screen_off_available">true</bool>
-    <bool name="config_aon_screen_on_available">true</bool>
-</resources>
