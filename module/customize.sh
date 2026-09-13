@@ -9,13 +9,11 @@ ui_print "- ⑤ 手写笔吸附胶囊"
 ui_print "- 作者: ACLaniakea"
 ui_print " "
 
-set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm "$MODPATH/service.sh" 0 0 0755
-set_perm "$MODPATH/action.sh" 0 0 0755
-set_perm "$MODPATH/uninstall.sh" 0 0 0755
-set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
-set_perm "$MODPATH/config" 0 0 0644
-set_perm "$MODPATH/bin/TbFix.apk" 0 0 0644
-set_perm "$MODPATH/payload/PowerKeeper.apk" 0 0 0644
-set_perm "$MODPATH/tools/patch_powerkeeper.py" 0 0 0644
-set_perm "$MODPATH/tools/fix_static.py" 0 0 0644
+chmod 0755 "$MODPATH"
+chmod 0644 "$MODPATH"/*.prop "$MODPATH"/config 2>/dev/null
+
+# ⚠️ KernelSU 的安装器**没有** Magisk 的 set_perm/set_perm_recursive（静默失效），
+# 所以必须用普通 chmod。曾经就因为这个：ksud 装完后 bin/penring 是 644 → penring 根本
+# 起不来 → 手势桥全死、"卸载重装后笔刷触感没了"。
+chmod 755 "$MODPATH"/*.sh "$MODPATH"/bin/penring "$MODPATH"/bin/*.sh 2>/dev/null
+chmod 644 "$MODPATH"/bin/TbFix.apk "$MODPATH"/payload/*.apk "$MODPATH"/webroot/* "$MODPATH"/sepolicy.rule 2>/dev/null

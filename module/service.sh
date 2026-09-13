@@ -619,6 +619,8 @@ brush_watch_loop() {
 
 penring_ensure() {
     gesture_enabled || return 0
+    # 自愈：ksud 安装（或某些管理器解包）会丢可执行位，曾导致"卸载重装后手势/触感全没"
+    [ -x "$PENRING_BIN" ] || chmod 755 "$PENRING_BIN" 2>/dev/null
     [ -x "$PENRING_BIN" ] || return 0
     penring_alive && return 0
     setsid "$PENRING_BIN" --moddir "$MODDIR" >>"$LOG.ring" 2>&1 </dev/null &

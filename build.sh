@@ -71,6 +71,9 @@ build_payload() {
 # ---------- ③ 打包 ----------
 pack() {
   echo "== [4/4] 打包模块 zip"
+  # 打包前把可执行位摆正（KernelSU 的 customize.sh 里 set_perm 无效，这里也兜一层）
+  chmod 755 "$MODULE"/*.sh "$MODULE"/bin/penring "$MODULE"/bin/*.sh 2>/dev/null
+  chmod 644 "$MODULE"/*.prop "$MODULE"/config "$MODULE"/sepolicy.rule 2>/dev/null
   mkdir -p "$OUT"
   local zip="$OUT/${MOD_ID}-${MOD_VER}.zip"
   rm -f "$zip"
