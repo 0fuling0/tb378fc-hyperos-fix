@@ -1,14 +1,23 @@
-# 构建中间产物
+# 构建产物
 out/
 app/*/build/
 app/*/*.apk.idsig
 extras/PenStylusHook/build/
 extras/PenStylusHook/PenStylusHook.apk
+
+# 中间产物（payload-src 下的原厂 APK 不入库，规则脚本入库）
 payload-src/PowerKeeper-patched.apk
 payload-src/classes-patched*.dex
 payload-src/payload.apk
-**/__pycache__/
+payload-src/PowerKeeper-stock.apk
+
+# 设备/调试残留
+*.log
+*.pid
+brush.*
+wake.log*
+__pycache__/
 *.pyc
 
-# 设备上那份的等价物由 build.sh 重建（APK 是产物；penring 保留入库便于对比）
+# 设备上那份由 build.sh 重建（penring 保留入库便于对比）
 module/bin/TbFix.apk

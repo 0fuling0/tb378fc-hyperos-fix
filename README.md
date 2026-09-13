@@ -1,181 +1,144 @@
-# TB378FC HyperOS 修复 —— 源码树
+# tb378fc-hyperos-fix
 
-联想小新 Pad Pro GT 13（**TB378FC**）刷 HyperOS 移植包（`OS3.0.307.0.WPYCNXM` / Android 16）之后的五项修复。
-本目录是**可构建的源码树**：模块脚本 + TbFix 应用源码 + PowerKeeper payload 的重建工具链。
+联想小新 Pad Pro GT 13（**TB378FC**）刷 **HyperOS 移植包**（`OS3.0.307.0.WPYCNXM`）后的适配修复：
+手写笔（联想 Tab Pen Pro 2）、手写笔电量胶囊、注视感知（AON）、以及移植包自身的几个坑。
 
-> 说明：`module/` 里的文件最初是从设备上**已安装的 v3.0 模块**原样拉下来的
-> （`adb exec-out su -c "tar -cf - -C /data/adb/modules tb378fc_hyperos_fix"`），
-> 只去掉了运行期状态（`wake.log` / `.monitor.lock/` / `.apk.sha`），并补回了安装期才用到的 `customize.sh`。
-> 当前版本 **v3.1** 在此基础上加了 ⑤ 吸附胶囊：`service.sh` / `config` / `action.sh` / `module.prop` /
-> `app/TbFix`（`Capsule.java` + `WakeReceiver` 的 ATTACH 分支 + `PenBle.readBattery`）。
+> 个人自用项目，只对上述机型 + 该移植包验证过。刷机/root 有风险，自行评估。
 
 ---
 
-## 五项修复
+## 一、修了什么（①–⑬）
 
-| # | 修复 | 做法 | 关掉的标记文件 |
+| # | 功能 | 主要实现方 | 开关 |
 |---|---|---|---|
-| ① | **手写笔休眠唤醒** | root 守护按 `wls_tx/attached` 的**取下边沿**，让 TbFix.apk 往笔的 BLE 特征 `fe41` 写 `{05,05}` 叫醒睡死的笔 | `module/disable` |
-| ② | **PowerKeeper 修复** | 用打好两处字节补丁的 `PowerKeeper.apk` 在 `post-fs-data` 阶段 bind mount 覆盖 `/system_ext/app/PowerKeeper/PowerKeeper.apk` | `module/disable-powerkeeper` |
-| ③ | **停 BPF 监视器** | 开机后看护并 `ctl.stop dynbpfloader`，避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块重启进 recovery | `module/disable-bpfmon` |
-| ④ | **停死电话栈** | `ro.radio.noril=yes`（`ro.baseband=apq`，无 modem）时 `pm disable-user` 掉 `com.qti.phone` / `com.qualcomm.qcrilmsgtunnel` / `com.qualcomm.qti.telephonyservice`，掐断每秒数百次的崩溃重启链 | `module/disable-telephony` |
-| ⑤ | **手写笔吸附胶囊** | 吸附边沿读反向无线充电线圈看到的笔电量（`wls_tx/level`），让 TbFix 发原生 `STYLUS_STATE_SOC` 广播给 `com.miui.securitycore`，由 HyperOS 自己弹电量胶囊；再用 GATT 真值补一条校正 | `module/disable-capsule` 或 `config` 里 `CAPSULE=0` |
-| ⑥ | **手势桥：变成小米焦点触控笔** | `bin/penring` 常驻：读联想笔手势节点（`eventN` 的 `MSC_SCAN 0x0c06xx`），造一支 **type-8**（`0x0022/0x5081`）虚拟笔并注入 `194 捏 / 195 双击 / 196 上滑 / 197 下滑 / 92 笔尾(截图键)`，同时给这支笔写一份 kl（本 ROM 的 Generic.kl 把 raw 194 映射成 337，不写 kl 就进不了 MIUI 的触控膜分支）；另外把"设置 → 手写笔"里的**双击开关/轻捏开关/轻捏力度**实时路由给笔（`{8,6,mask}` bit0/bit4、`{8,5,level}`）、停掉移植 ROM 自带的旧桥 `lwky_pen` | `config` 里 `GESTURE=0` / `TOUCHFILM=-1` / `SETTINGS_SYNC=0`，或标记文件 `disable-gesture` / `disable-rompen` |
+| ① | **手写笔休眠唤醒**：磁吸取下时经 BLE 发 `{5,5}` 叫醒睡死的笔 | 模块（轮询 `wls_tx/attached`）→ App（发 BLE） | `disable` |
+| ② | **PowerKeeper 修复**：修补移植包改坏的两处字节码，恢复 MIUI 省电管理 | 模块 `post-fs-data`（bind mount 修好的 APK） | `disable-powerkeeper` |
+| ③ | **停 BPF 监视器**：避免 `hyper_bpfloader` 判定"系统损坏"写 recovery 引导块 | 模块 | `disable-bpfmon` |
+| ④ | **停死电话栈**：本机无 modem，停掉每秒崩数百次的三件套 | 模块 | `disable-telephony` |
+| ⑤ | **吸附电量胶囊**：读反向无线充电线圈看到的笔电量，弹 HyperOS 原生胶囊（再用 GATT 真值校正） | 模块 + App | `CAPSULE=0` / `disable-capsule` |
+| ⑥ | **手势桥**：联想笔的捏/双击/上滑/下滑/笔尾桥成"小米触控膜笔"（type-8 虚拟笔 + 自定义 kl） | `bin/penring`（模块） | `GESTURE=0` / `disable-gesture` |
+| ⑦ | **笔刷触感**：笔记/小米创作切笔刷 → 给笔发对应 CON 波形；只在画布前台时开，离开就停 | 模块看护 + App | `BRUSH=0` / `disable-brush` |
+| ⑧ | **注视感知（AON）**：让 `AttentionManagerService` 真正拿到"有没有人在看"（真实前摄 + 人脸检测） | 模块（HAL/权限/库）+ 钩子（框架两道门） | `disable-aon` / `disable-aonlib` |
+| ⑨ | **笔休眠档**：吸在平板上且充满 → 停掉一切主动动作、断开缓存 BLE 连接 | 模块 + App | `PEN_REST=0` |
+| ⑫ | **设置→笔 即时下发**：设置里改双击/轻捏/力度，几十毫秒写进笔 | 钩子（设置进程）+ App | `SETTINGS_SYNC=0` |
+| ⑬ | **屏幕亮/灭告诉笔**：亮发 `{5,2}`、灭发 `{5,1}`（ZUX `buildScreenOnOffCmd`） | 模块（读 `debug.tracing.screen_state`）+ App | `SCREEN_CMD=0` |
+| — | **KernelSU WebUI**：上面这些开关 + 每种笔刷的波形选择 | 模块（`webroot/`） | — |
 
-| ⑦ | **笔刷触感跟着 App 走** | 读笔记/小米创作的 `creation_shpref.xml` 里 `current_brush`（根可读），切换笔刷就发一次 CON 波形（32 圆珠笔/33 铅笔/34 马克笔/35 橡皮/36 联想笔刷…），笔自己按这个手感持续振；笔尾（`BTN_TOOL_RUBBER`）靠近自动切 35、回笔尖再切回当前笔刷；退出应用（`topResumedActivity`）自动停 | `config` 里 `BRUSH=0` 或标记文件 `disable-brush` |；看护的启动/自愈/单实例机制与排障见 **`docs/stylus-gesture-bridge.md` §8**
-| ⑨ | **吸附已满 → 笔休眠** | 笔吸在平板上且**线圈报的 `charge_state` 由 1 变 0 并持续 `REST_IDLE`（默认 20）秒**（= 充完了）进入"休眠档"，电量 ≥ `REST_FULL`(99) 作兜底：停掉一切对笔的主动动作（唤醒广播 / 胶囊的 GATT 校正 / CON 波形），并广播 `dev.tb378fc.fix.REST` 让 TbFix 断掉"留给下一条手势"的缓存 BLE 连接；线圈电量轮询降到 `REST_POLL` 秒一次。取下、或线圈又重新开始充电（`chg=1`）立刻恢复。（起因：夜里吸附着掉电——旧 bug 每 3 秒发一条 BLE 唤醒命令，笔整夜进不了深睡） | `config` 里 `PEN_REST=0` 或标记文件 `disable-rest` |
+细节都在 `docs/` 里（尤其 AON 的完整排查过程和踩过的坑）。
 
-| ⑧ | **注视感知（AON）** | 四步：①tmpfs+bind 把 cust_features 盖到 `/mi_ext`（`/` 是 erofs 只读）并注入 `config_supported_aon_devices=true`；②LSPosed 钩住没注册的 `HyperOSCustFeatureResolve` 与 PMS 包名接口；③`/odm/lib64` 里补 `libcamera2ndk.so`（借 `/vendor/lib64/libcamera2ndk_vendor.so`，否则 mifaced 链接失败）；④三条 SELinux 规则（含 **camera worker 自我 exec**，缺它前摄永远不开、结果恒为"无人注视"）。链路：mifaced → 前摄 → 人脸检测 → `ATTENTION_SUCCESS_PRESENT` → `AttentionDetector: onSuccess: 1` | `disable-aon` / `disable-aonlib`；设置页那三个 bool 在设置进程里放行（作用域需含 `com.android.settings`），细节与弯路见 **`docs/aon-attention.md`** |
+## 二、三方分工（重要）
 
-原理细节都写在脚本文件头：`module/service.sh`（①③④⑤⑥）、`module/post-fs-data.sh`（②）；
-⑤ 的完整触发链与参数表见 **`docs/native-stylus-capsule.md`**，
-⑥ 的完整说明（手势表、键位映射、配置项、自检方法）见 **`docs/stylus-gesture-bridge.md`**，
-笔端 `{8,6,mask}` 功能位的位定义见 **`docs/zuxos-pen-protocol.md` §2.1**。
+```
+KernelSU 模块(module/)             App(dev.tb378fc.fix)                LSPosed 钩子(同一个 APK)
+  root：挂载/权限/定时/状态机    ┃   唯一有 BLE 栈的一方，负责"动手"   ┃   只能改框架/别的 App 内部状态
+  ────────────────────────────  ┃  ────────────────────────────────  ┃  ──────────────────────────────
+  post-fs-data：② PowerKeeper    ┃  {5,5} 唤醒 / {8,6,mask} / {8,5,lvl}┃  android(system_server)：⑧ AON 两道门
+  ⑧ cust_features / ⑧b 补库      ┃  {5,2}/{5,1} 屏幕状态               ┃  com.android.settings +
+  service.sh：①③④⑤⑥⑦⑧⑨⑬ 看护  ┃  振动波形（CON/IMP）                ┃  com.miui.securitycore：⑧c 设置页
+  penring：手势→type-8 虚拟笔     ┃  GATT 读真电量（0x180F/0x2A19）    ┃  com.miui.notes / com.miui.creation：
+  sepolicy.rule：AON HAL 三条    ┃  收 REST 断连 / 收 CFG 即时下发     ┃    画布焦点 → files/penstate
+```
 
----
+模块 → App 只用**显式广播**；App → 模块只用**状态文件**（`files/penstate`，模块 inotify 监听）。
 
-## 目录结构
+## 三、安装
+
+1. 刷模块：把 `out/tb378fc_hyperos_fix-*.zip` 交给 KernelSU 管理器（或 `ksud module install`），重启。
+2. 装 App：模块开机会自动安装 `bin/TbFix.apk`（`dev.tb378fc.fix`）。
+3. **LSPosed**：启用模块「**TB378FC 修复**」，作用域勾 **系统框架 / 设置 / com.miui.securitycore / 笔记 / 小米创作**，
+   然后**完整重启**（不是只重启 zygote）。少了这步：AON、设置页可见性、画布状态、即时下发都不生效，
+   但手势桥/胶囊/唤醒/波形这些不依赖它的部分仍然工作。
+4. WebUI：KernelSU 管理器 → 模块 → TB378FC → 「打开 WebUI」（若看不到，下拉刷新一次管理器）。
+
+## 四、配置
+
+- **WebUI**（推荐）：手势使能、写字触感总开关与每种笔刷波形、屏幕指令、胶囊/休眠档/设置同步。
+  改动写入 `module/config` 并重启一次守护（约 20 秒）生效。
+- 直接改 `module/config`（KernelSU 模块目录下同名文件）也可以；键的说明都写在文件里。
+- 命令行辅助：`sh service.sh --json`（读生效值）、`--set KEY VALUE`（写一项并重启）、
+  `--brushsend <波形id>`、`bin/penring --key <原始键>`（排障注入）。
+
+标记文件（放进模块目录即生效）：`disable`、`disable-gesture`、`disable-brush`、`disable-capsule`、
+`disable-rompen`、`disable-aon`、`disable-aonlib`、`disable-rest`。
+
+## 五、验收与排障
+
+```sh
+M=/data/adb/modules/tb378fc_hyperos_fix
+
+# 模块在不在跑（正常：supervise/monitor/brushwatch 各 1，penring + penring --watch）
+ps -A -o PID,ARGS | grep -E "service\.sh --|[p]enring"
+
+# 手势桥：虚拟笔 + 自定义 kl + 注入日志
+grep -c 'Xiaomi Pen' /proc/bus/input/devices          # 1
+ls /data/system/devices/keylayout/Vendor_0022_Product_5081.kl
+tail -f $M/wake.log.ring                              # 捏/双击/上滑/下滑/笔尾 各映射成什么键
+
+# 笔刷触感
+tail -f $M/brush.log                                  # send? wave=NN why=... / stop (canvas lost)
+
+# 注视感知（需要 LSPosed 那半边在）
+service check attention                               # Service attention: found
+dumpsys attention | head -12                          # AttentionServicePackageName=com.xiaomi.aon
+logcat -d | grep Y700AonShim | tail                   # open front camera id=1 / callback present=1
+logcat -d | grep AttentionDetector | tail             # onSuccess: 1
+dmesg | grep -c 'avc:.*hal_miface'                    # 0
+
+# 钩子在不在（应有 hooked com.miui.notes / ⑧c / ⑫ 之类）
+logcat -d | grep TbFixHook | tail
+```
+
+日志都在模块目录：`wake.log`（主日志）、`wake.log.ring`（手势桥）、`brush.log`（笔刷/波形）、
+`service.sh --json` 可看当前生效配置。
+
+## 六、已知取舍 / 没做的
+
+- **笔尾当橡皮**：小米笔记/小米创作里**没有"橡皮端"这条原生路径**（小米触控膜笔本身没有笔尾橡皮，
+  只有侧键/快捷键）。试过 ERASER tool type、伪造 `BUTTON_STYLUS_PRIMARY`、复用 MIUI 的"切笔/橡皮"
+  快捷键动作，都被否掉了（细节与实测数据见 `docs/stylus-gesture-bridge.md` §6）。目前只在**触感**上
+  让笔尾切到橡皮波形（35）。
+- **遥控 / 旋转笔刷**：不支持（联想笔没有陀螺仪，6DOF 通道回的是固定描述符）。
+- **AON**：依赖移植包里那份 `mifaced`（含联想 Y700 的 shim）+ 三条 SELinux 规则 + `/odm/lib64` 补
+  `libcamera2ndk.so`；`/odm` 与 `/` 是只读 erofs，所以都走 tmpfs + bind（开机自动，卸载即恢复）。
+- **App 里的 `PenBle.DEFAULT_MAC`**：是找不到笔时的兜底 MAC，请改成**你自己那支笔**的地址
+  （或留空让它走扫描）。
+- 本仓库含移植包里的第三方材料（PowerKeeper 字节码补丁 payload、图标等），仅供个人研究，权利归原厂。
+
+## 七、目录结构
 
 ```
 tb378fc-hyperos-fix/
-├── build.sh                     # 一键构建 + 打包（KernelSU 模块 zip）
-├── module/                      # 打进 zip 的内容（设备上那份 v3.0 + ⑤ 胶囊）
-│   ├── module.prop              # id / 版本 / 六项描述
-│   ├── customize.sh             # 安装期权限设置（从 v2.0 安装包恢复，按 v3.1 清单更新）
-│   ├── post-fs-data.sh          # ② PowerKeeper 覆盖 + 开机清锁
-│   ├── service.sh               # ①③④⑤⑥ 的状态机 / 看护进程（含 penring 与旧桥 lwky_pen）
-│   ├── action.sh                # KernelSU「操作」按钮里显示五项状态
-│   ├── uninstall.sh             # 卸载：停守护、卸 APK、**故意不**恢复死电话包
-│   ├── config                   # REFRESH_SECONDS / CAPSULE / TOUCHFILM / GESTURE_* 等可调项
-│   ├── tools/
-│   │   ├── patch_powerkeeper.py # 字节补丁：startCloudSyncData 的 return v0 -> return-void
-│   │   └── fix_static.py        # 结构补丁：isFeatureOn 移入 direct_methods + ACC_STATIC
-│   ├── bin/TbFix.apk        # ① 的载体（构建产物，见 app/TbFix）
-│   ├── bin/penring              # ⑥ 手势桥守护（构建产物，见 app/PenRing）
-│   └── payload/PowerKeeper.apk  # ② 的载体（构建产物，见 payload-src）
-├── app/TbFix/               # TbFix.apk 源码（BLE 唤醒 / 电量读取 / 胶囊转发）
-│   ├── AndroidManifest.xml      # dev.tb378fc.fix，versionCode 11 / 3.1
-│   ├── src/dev/tb378fc/stylus/  # PenBle.java, WakeReceiver.java, WakeActivity.java, Capsule.java
-│   ├── res/                     # 图标
-│   ├── tools/make_icons.py      # 图标生成
-│   ├── penwake.jks              # 签名密钥（store/key pass 都是 penwake）
-│   └── build.sh                 # aapt2 + javac + d8 + zipalign + apksigner（无 Gradle）
-├── app/PenRing/                 # ⑥ penring：联想笔手势 → type-8 虚拟笔（NDK 静态 aarch64）
-│   ├── penring.c                # 读 MSC_SCAN、造虚拟笔、写 kl、注入 194/195/196/197/92
-│   └── build.sh                 # aarch64-linux-android30-clang，无 Gradle
-├── tools/peninject.c            # 自检：伪造"联想笔手势节点"喂 usage（不需要真笔）
-├── payload-src/
-│   ├── PowerKeeper-stock.apk    # 移植包**原厂** APK（补丁输入，来自 system_ext/app/PowerKeeper）
-│   └── repack_payload.py        # 把打好补丁的 dex 塞回 APK（保持 stored + 原条目元数据）
-│   ├── stub-patches/            # Xposed API 编译桩（d8 时过滤掉）
-│   └── build.sh
-└── out/                         # 构建产物：<id>-v<version>.zip
+├── build.sh                  一键构建（App + penring + 打包模块 zip）
+├── app/
+│   ├── TbFix/                App + LSPosed 钩子（同时是笔的 BLE 代理）
+│   │   ├── src/dev/tb378fc/fix/{PenBle,WakeReceiver,Capsule,...}.java
+│   │   └── src/dev/tb378fc/fix/hook/TbFixHook.java
+│   └── PenRing/penring.c     手势桥守护（静态 aarch64）
+├── module/
+│   ├── post-fs-data.sh       ② PowerKeeper / ⑧ cust_features / ⑧b 补 libcamera2ndk
+│   ├── service.sh            看护主循环（①③④⑤⑥⑦⑧⑨⑬ + WebUI 用的 --json/--set）
+│   ├── sepolicy.rule         AON HAL（hal_miface_default）三条规则
+│   ├── webroot/index.html    KernelSU WebUI
+│   ├── bin/{penring,TbFix.apk}
+│   └── payload/PowerKeeper.apk
+├── tools/                    peninject / patch_powerkeeper / check-helpers 等
+└── docs/                     AON、胶囊、手势桥、ZUX 协议等完整文档
 ```
 
----
+## 八、构建
 
-## 构建
+```bash
+./build.sh            # App + penring + 打包（用仓库里现成的 payload）
+./build.sh --payload  # 额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
+```
 
-依赖：JDK 17、Android SDK（`build-tools/37.0.0` + `platforms/android-36`）、`python3`、`zip`。
+需要 JDK 17、Android SDK（build-tools 37 + platform android-36）、`python3`、`zip`；
 SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `ANDROID_PLATFORM=` 覆盖。
+构建期会跑 `sh -n` 与 `tools/check-helpers.py`（检查"调用了但没定义的函数"——脚本里这类问题会静默）。
 
-```bash
-./build.sh              # 只构建 TbFix.apk + 打包（payload 用仓库里现成的那份）
-./build.sh --payload    # 额外从 payload-src/PowerKeeper-stock.apk 重建 payload
-./build.sh --all        # 上面两个都做
-./build.sh --clean
-```
+## 九、文档
 
-构建时会做两件自检，任一失败就直接中止（脚本里的坑都是静默的，见
-`docs/stylus-gesture-bridge.md` §8）：
-
-1. `sh -n` 语法检查 `module/service.sh` / `module/post-fs-data.sh`；
-2. `tools/check-helpers.py` —— 剥离引号与 `$(( ))` 后比对"被调用但未定义"的函数名。
-   起因：曾经整段误删 `brushwatch_ensure()`，`sh` 只打一行 not found 继续跑，
-   看护进程从此静默不启动，现象上极难定位。
-
-产物：
-
-```
-app/TbFix/TbFix.apk              （同时拷进 module/bin/）
-out/tb378fc_hyperos_fix-v3.1.zip         KernelSU 模块包（zip 根 = module/ 的内容）
-```
-
-刷入：把 zip 交给 KernelSU 管理器，或 `su -c "magisk --install-module out/tb378fc_hyperos_fix-v3.0.zip"`，
-重启后 `action.sh` 的状态可以在 KernelSU 的「操作」里看到。
-
-### 可复现性（实测）
-
-- `TbFix.apk`：重新构建的产物与设备上那份 **9 个 zip 条目名/CRC/大小/压缩方式全部相同**，
-  `classes.dex` 逐字节相同；整包 sha256 不同只来自签名块/时间戳，功能等价。
-- `PowerKeeper.apk`：`--payload` 从原厂 APK 走完 `patch_powerkeeper.py` → `fix_static.py` → `repack_payload.py`
-  后，510 个条目里 **509 个条目 CRC 完全相同**，`classes.dex` 逐字节相同（补丁本身等长：1639 → 1639 字节，
-  dex 的 adler32/SHA-1 已重算）；只有 zip 容器的时间戳/额外字段有差异。
-
-### ② 的两个前提
-
-- payload 靠 **bind mount** 覆盖系统包；`PMS` 之所以接受这个改过的 APK，是因为该移植包
-  `ro.debuggable=1`（user 构建却打了 debuggable）。换 ROM 要重新确认。
-- 必须 `post-fs-data`（早于 PackageManager 扫描包）阶段覆盖；`service.sh` 阶段太晚。
-
----
-
-### ⑤ 胶囊：触发方法与参数（详版见 docs/native-stylus-capsule.md）
-
-触发链（v3.1 快路径，实测"笔放上去 → 胶囊出现"里只有 ~0.3s 是软件）：
-
-```
-wls_tx 边沿（POLL_MS=200 轮询，内建 read）
-  ├─ 边沿 A：level 1..100 -> 0（线圈刚启动，比 attached 早 ~2s）
-  │     └─ CAPSULE_FAST=1：先用上一次的线圈电量弹一条（~0.2s 出胶囊），2s 后拿新值刷新
-  └─ 边沿 B：attached 0 -> 1（硬件握手完成）
-  └─ 两条边都：守护直发 am broadcast … STYLUS_STATE_SOC（battery/state=4/connect=5）
-        → com.miui.securitycore/…MiuiStylusReceiver → 原生胶囊（实测 +0.3s 内出现）
-     并转发 ATTACH(battery=-1, coil=<已显示值>) 给 TbFix 做兜底校正
-```
-
-发往 `SecurityCoreAdd` 的参数（`STYLUS_STATE_SOC`）：
-
-| extra | 取值 | 说明 |
-|---|---|---|
-| `battery` | `0..100` | 胶囊显示的电量；非法值本模块直接不发（否则显示 "-1"） |
-| `state` | `4`=充电中（⚡）/ `2`=未充电 | 吸附时固定 `4` |
-| `connect` | **`5`=已连接（唯一会直接弹电量胶囊的值）**；`0/1/3/4/7/8/9` 见文档 | 本模块固定 `5` |
-
-前置条件：`settings put secure stylus_first_connect 1`（否则只走"首次连接引导"不弹胶囊）——
-`service.sh` 的 `prepare_stylus_settings()` 会自动补写；`setting_stylus_version` 需非 0（本机为 1）。
-
-响应速度相关的 config（都在 `module/config`）：
-
-| 键 | 默认 | 作用 |
-|---|---|---|
-| `POLL_MS` | `200` | 吸附检测轮询间隔，决定"吸上去多久才弹"（第一版 `sleep 1`+`sleep 2` ≈ 3s，现在 ~0.5s） |
-| `CAPSULE_DIRECT` | `1` | 守护直发原生广播，省掉"叫醒 App 进程"一跳 |
-| `CAPSULE_GATT` | `1` | 直发后再用系统 API / GATT 读真值，**不同**才补弹一条校正 |
-| `CAPSULE_FAST` | `1` | 边沿一到就用上次的线圈电量先弹（~0.2s），1~2s 后刷新为新值；`0` = 等本次真值（慢 1~2s） |
-
-手动验证（绕过守护直接弹）：
-
-```bash
-adb shell am broadcast -a com.android.settings.stylus.STYLUS_STATE_SOC \
-  -n com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver \
-  --ei battery 88 --ei state 4 --ei connect 5
-```
-
-**不要**发 `STYLUS_BATTERY_NOTIFY` 的 `battery=80`、也不要发 `connect=9`：这两个会调用
-`IMiCharge.setWirelessChargingEnabled(...)`，真的会开关反向无线充电。
-
-## 已知取舍
-
-- ④ 卸载时**故意不**恢复那三个电话包的启用状态（恢复就等于立刻回到每秒数百次的崩溃循环；
-  那是本机默认的坏状态，不是卸载模块的人想要的结果）。要恢复见 `module/uninstall.sh` 末尾的提示。
-- ③ 停掉的只是**开机后**由 init 拉起的监视器（`dynbpfloader`）；开机期 `hyper_bpfloader`
-  本体加载的约 50 个 BPF 不受影响。
-  LSPosed 数据库（`app_process` 的 linker namespace 里没有 `libandroidicu.so`）。
-
----
-
-## 相关文档
-
-- `docs/native-stylus-capsule.md` —— pad8p 原生「吸附胶囊」的触发链，以及在本机上**实测可用**的
-  触发命令（v3.0 模块没有内置胶囊；要做的话照这份文档接）。
+- `docs/stylus-gesture-bridge.md` — 手势桥：手势表、type-8/kl、映射、看护的启动/自愈、笔尾橡皮的结论
+- `docs/aon-attention.md` — 注视感知：四个卡点、SELinux 三条、验收命令、踩过的坑
+- `docs/native-stylus-capsule.md` — 原生电量胶囊的触发链与参数
+- `docs/zuxos-pen-protocol.md` — ZUX 笔协议帧表（`{5,5}`/`{5,3}`/`{5,2}`/`{5,1}`/`{8,6,..}`…）

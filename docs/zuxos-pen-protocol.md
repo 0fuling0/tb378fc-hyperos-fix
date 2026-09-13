@@ -119,7 +119,7 @@ onUeventReceved(uevent)                              ← 字段：TYPE(QI/NFC/TP
 - 实测内核日志（`dmesg`）每 ~0.8 s 一条，字段齐全：
   ```
   [LENOVO_PEN]qi_uevent_report tx:1 hall1:1 hall2:0 hall3:1
-  [LENOVO_PEN]pen_uevent:UEVENT_TO=PEN_FRAMEWORK, mac:MAC=DC:EB:4D:06:E0:95, level:LEVEL=100,
+  [LENOVO_PEN]pen_uevent:UEVENT_TO=PEN_FRAMEWORK, mac:MAC=XX:XX:XX:XX:XX:XX, level:LEVEL=100,
       attach:ATTACHED=1, charging_state:CHARGING_STATE=Charging, type:TYPE=QI, pen_type:PEN_TYPE=2,
       qi_pen_location_string: , qi_pen_foreign_string:FOREIGN=0
   ```
