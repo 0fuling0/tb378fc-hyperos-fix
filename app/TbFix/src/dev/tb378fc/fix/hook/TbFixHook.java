@@ -77,6 +77,8 @@ public class TbFixHook implements IXposedHookLoadPackage {
      *  83 个 MIUI/SystemUI overlay 全丢了 SELinux 标签（变成 tmpfs:s0）被 system_server 拒读，
      *  锁屏时钟、控制中心整批消失。**别再走那条路。** */
     private static final String SETTINGS_PKG = "com.android.settings";
+    /** 手写笔设置页所在的另一个进程（com.miui.securitycore = SecurityCoreAdd） */
+    private static final String SECURITY_PKG = "com.miui.securitycore";
     private static final String[] AON_BOOLS = {
             "config_aon_gesture_available",
             "config_aon_screen_on_available",
@@ -196,7 +198,9 @@ public class TbFixHook implements IXposedHookLoadPackage {
             hookAonPackageName(pkg);
             return;
         }
-        if (SETTINGS_PKG.equals(pkg)) {     // 设置：⑧c 注视感知那一页 + ⑫ 改笔参数即时下发
+        // 设置页可能由系统设置或 com.miui.securitycore 承载（手写笔那两个 fragment 的资源在后者里），
+        // 两个进程都挂，改笔参数才能即时下发。
+        if (SETTINGS_PKG.equals(pkg) || SECURITY_PKG.equals(pkg)) {
             hookAonSettingsBool(pkg);
             hookStylusSettingsWrite(lpparam);
             return;
