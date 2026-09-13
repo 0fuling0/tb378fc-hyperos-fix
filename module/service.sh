@@ -885,6 +885,14 @@ case "$1" in
     exit 0
     ;;
 
+--penkey)
+    # 往虚拟笔注入一次原始键（排障/复用）：sh service.sh --penkey 195
+    #   195 = MIUI 眼里的"双击"，194 = 轻捏，196/197 = 上滑/下滑，92 = 截图键
+    "$PENRING_BIN" --moddir "$MODDIR" --key "$2" 2>&1 | tail -3
+    log "penkey 注入 $2"
+    exit 0
+    ;;
+
 --rest)
     # 手工强制休眠档（排障/测试用）：sh service.sh --rest 1 | --rest 0
     case "$2" in 1|on) pen_rest_mark 1 ;; *) pen_rest_mark 0 ;; esac

@@ -500,6 +500,39 @@ static void usage(const char *argv0)
             argv0, argv0);
 }
 
+/*
+ * --key <raw> [--key <raw> ...]：往虚拟笔上注入一次按键（按下+松开）后退出。
+ *   用途一：实测 MIUI 把某个原始键翻成什么行为（例如 195 是否就是"双击→橡皮"那条动作）。
+ *   用途二：将来"笔尾靠近 → 替用户触发一次双击/切橡皮"直接复用这条路径。
+ *   例：penring --moddir /data/adb/modules/tb378fc_hyperos_fix --key 195
+ */
+static int key_inject_mode(int argc, char **argv)
+{
+    int raw[8], n = 0, i, fd;
+    for (i = 1; i < argc && n < 8; i++) {
+        if (!strcmp(argv[i], "--key") && i + 1 < argc)          raw[n++] = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--moddir") && i + 1 < argc)  g_moddir = argv[++i];
+        else if (!strcmp(argv[i], "--log") && i + 1 < argc)     g_log = argv[++i];
+    }
+    if (n == 0) { fprintf(stderr, "key: 需要 --key <raw>\n"); return 2; }
+    if (g_log == NULL) {
+        static char d[512];
+        snprintf(d, sizeof(d), "%s/penring.log", g_moddir);
+        g_log = d;
+    }
+    write_keylayout();          /* 保证 raw→键码 的自定义 kl 在位（否则进不了 MIUI 的笔分支） */
+    fd = ui_create();
+    if (fd < 0) return 1;
+    for (i = 0; i < n; i++) {
+        logf_("注入原始键 %d", raw[i]);
+        key_tap(fd, raw[i]);
+        usleep(150000);
+    }
+    usleep(250000);
+    ui_destroy();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char cfgpath[512];
@@ -510,6 +543,9 @@ int main(int argc, char **argv)
 
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--watch")) return watch_mode(argc, argv, i + 1);
+
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--key")) return key_inject_mode(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--moddir") && i + 1 < argc)       g_moddir = argv[++i];
