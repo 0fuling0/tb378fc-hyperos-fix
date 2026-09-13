@@ -112,3 +112,8 @@ REST_FULL=99
 REST_POLL=60          # 休眠期间线圈电量/充电状态轮询间隔（秒）
 # 出档：取下，或线圈重新开始充电（chg=1）—— 不能用"电量低于阈值"出档，会和"停充进档"打架
 
+
+# ⑪ 只在"笔尖真的落在屏幕上"时才开触感（读 BTN_TOUCH），而不是一进画布就开；
+#    抬手后留 BRUSH_TOUCH_GRACE_MS 毫秒余量，免得两笔之间触感一顿一顿。
+BRUSH_ON_TOUCH=1
+BRUSH_TOUCH_GRACE_MS=400

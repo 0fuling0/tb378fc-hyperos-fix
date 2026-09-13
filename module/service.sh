@@ -122,6 +122,9 @@ PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在
 BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
 BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
 BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
+BRUSH_TOUCH="$MODDIR/brush.touch"       # ⑪ 1 = 笔尖真落在屏幕上（BTN_TOUCH）
+BRUSH_TOUCHT="$MODDIR/brush.toucht"     # ⑪ 该状态最后一次变化的时刻（毫秒）
+BRUSH_UPSEQ="$MODDIR/brush.upseq"       # ⑪ 抬手序号：让"延迟停波形"在下一笔落下时失效
 # 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
 BRUSH_LOCK="$MODDIR/brush.lock"    # 单实例锁（mkdir 原子；防止多个 brushwatch 各跑一份老代码）
 PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate /data/data/dev.tb378fc.fix/files/penstate"
@@ -217,6 +220,10 @@ BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
 BRUSH_ERASER_STATES=""
 BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
 BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
+# ⑪ 只在"笔尖真的落在屏幕上"时才开触感（BTN_TOUCH），而不是一进画布就开；
+#    抬手后留 BRUSH_TOUCH_GRACE_MS 毫秒余量，免得两笔之间断开时触感一顿一顿。
+BRUSH_ON_TOUCH=1
+BRUSH_TOUCH_GRACE_MS=400
 # 工具栏工具值（select_state_save）实测：8 AI 笔 / 6 框选笔 / 7 橡皮
 BRUSH_AI_STATES="8"
 BRUSH_AI_WAVE=36
@@ -405,8 +412,21 @@ brush_base()  { cat "$BRUSH_BASE" 2>/dev/null; }
 brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
 
 # 画布是否可写（hook 写的 penstate；优先读"前台那个 App"的文件，避免读到另一边的旧状态）
+# ⑪ 触感闸门：笔尖是否落在屏幕上（含抬手余量）。没有状态文件时不拦（保持旧行为）。
+brush_touch_ok() {
+    case "$BRUSH_ON_TOUCH" in 1|true|yes|on) ;; *) return 0 ;; esac
+    [ -e "$BRUSH_TOUCH" ] || return 0
+    [ "$(cat "$BRUSH_TOUCH" 2>/dev/null)" = "1" ] && return 0
+    local t now
+    t=$(cat "$BRUSH_TOUCHT" 2>/dev/null)
+    now=$(date +%s%3N)
+    [ -n "$t" ] || return 0
+    [ $((now - t)) -le "$BRUSH_TOUCH_GRACE_MS" ]
+}
+
 brush_canvas() {
     local f v fg order
+    brush_touch_ok || return 1
     fg=$(cat "$MODDIR/brush.fg" 2>/dev/null)
     order="$PENSTATE_LIST"
     case "$fg" in
@@ -490,6 +510,7 @@ brush_exit_check() {
         brush_send 0 "app left ($fg)"
         BRUSH_MISS=0
         : > "$BRUSH_BASE"
+    : > "$BRUSH_TOUCH"; : > "$BRUSH_TOUCHT"; : > "$BRUSH_UPSEQ"   # ⑪ 触感闸门状态清零
     fi
 }
 
@@ -561,6 +582,23 @@ brush_watch_loop() {
                                     brush_send 0 "canvas lost"
                                 fi ;;
                         esac ;;
+                    "TOUCH down")
+                        echo 1 > "$BRUSH_TOUCH"
+                        date +%s%3N > "$BRUSH_TOUCHT"
+                        # 让上一笔遗留的"延迟停"失效
+                        echo "$(( $(cat "$BRUSH_UPSEQ" 2>/dev/null || echo 0) + 1 ))" > "$BRUSH_UPSEQ"
+                        if [ -n "$(brush_base)" ]; then
+                            brush_send "$(brush_base)" "pen down"
+                        fi ;;
+                    "TOUCH up")
+                        echo 0 > "$BRUSH_TOUCH"
+                        date +%s%3N > "$BRUSH_TOUCHT"
+                        # 抬手后延迟停（余量内又落笔就作废），免得两笔之间触感一顿一顿
+                        _seq=$(( $(cat "$BRUSH_UPSEQ" 2>/dev/null || echo 0) + 1 ))
+                        echo "$_seq" > "$BRUSH_UPSEQ"
+                        _gs=$(awk "BEGIN{printf \"%.2f\", $BRUSH_TOUCH_GRACE_MS/1000}" 2>/dev/null)
+                        [ -n "$_gs" ] || _gs=0.4
+                        ( sleep "$_gs"; [ "$(cat "$BRUSH_UPSEQ" 2>/dev/null)" = "$_seq" ] && brush_send 0 "pen up" ) & ;;
                     "TAIL down")
                         echo 1 > "$BRUSH_TAIL"
                         if [ -n "$(brush_base)" ]; then

@@ -374,6 +374,7 @@ static void on_signal(int sig)
  * 给根侧 shell 用的**逐行、不缓冲**事件流：
  *     FILE <name>      prefs 被写（inotify：CLOSE_WRITE / MOVED_TO / CREATE）
  *     TAIL down|up     笔尾（橡皮端）进/出感应范围（BTN_TOOL_RUBBER）
+ *     TOUCH down|up    笔尖真的落在屏幕上（BTN_TOUCH）—— 上层用它只在划线时才开触感
  *
  * 为什么不用 getevent：它是 stdio 全缓冲，输出接管道时会攒到 4KB 才吐，
  * 切换手感就慢半拍；inotify 是内核直接通知，毫秒级。
@@ -394,7 +395,7 @@ static int watch_mode(int argc, char **argv, int start)
     int wds[8];
     int npref = 0;
     int retry_tick = 0;
-    int ifd, i, tail_state = -1, touch_fd = -1;
+    int ifd, i, tail_state = -1, touch_state = -1, touch_fd = -1;
     const char *match = "creation_shpref.xml";
     const char *match2 = "penstate";
 
@@ -477,11 +478,21 @@ static int watch_mode(int argc, char **argv, int start)
             struct input_event ev;
             while (read(touch_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
                 int now;
-                if (ev.type != EV_KEY || ev.code != BTN_TOOL_RUBBER) continue;
+                if (ev.type != EV_KEY) continue;
                 now = ev.value ? 1 : 0;
-                if (now != tail_state) {
-                    tail_state = now;
-                    print_line("TAIL %s", now ? "down" : "up");
+                if (ev.code == BTN_TOOL_RUBBER) {
+                    if (now != tail_state) {
+                        tail_state = now;
+                        print_line("TAIL %s", now ? "down" : "up");
+                    }
+                } else if (ev.code == BTN_TOUCH) {
+                    /* ⑪ 笔尖真的落在屏幕上：上层用它决定"只在划线时才开触感"。
+                     * 这个节点只有笔（手指在另一支 NVTCapacitiveTouchScreen 上），所以 BTN_TOUCH
+                     * 就等于"笔在写字"。 */
+                    if (now != touch_state) {
+                        touch_state = now;
+                        print_line("TOUCH %s", now ? "down" : "up");
+                    }
                 }
             }
         }

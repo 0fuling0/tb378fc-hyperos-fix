@@ -207,6 +207,24 @@ public final class PenBle {
         Log.i(TAG, "rest: dropped idle gatt link=" + (g != null));
     }
 
+    /** 最近一次已知的 {8,6,mask}（模块通过 WAKE 下发）。设置改了要即时下发时，在它基础上只调两位。 */
+    private static volatile int sCfgMask = TOUCHFILM_ALL;
+    static void noteCfgMask(int mask) { if (mask >= 0) sCfgMask = mask; }
+
+    /**
+     * 设置里改了笔参数（双击开关 / 轻捏开关 / 轻捏力度）→ **立刻**下发，不等根侧 2 秒轮询。
+     *
+     * 只动 bit0（双击）与 bit4（轻捏）两位：上滑/下滑/笔尾那几位是模块按 config 算的，
+     * App 这边不知道，所以不能整体覆盖。
+     */
+    public static Result applyStylusCfg(Context ctx, int dbl, int pinch, int level) {
+        int mask = (sCfgMask & ~0x11) | (dbl != 0 ? 0x01 : 0x00) | (pinch != 0 ? 0x10 : 0x00);
+        sCfgMask = mask;
+        Result r = sendCmds(ctx, null, false, mask, level);
+        Log.i(TAG, "cfg instant -> touchfilm=" + mask + " squeeze=" + level + " " + r);
+        return r;
+    }
+
     static void clearHapticCache() {
         sHGatt = null;
         sHCon = null;

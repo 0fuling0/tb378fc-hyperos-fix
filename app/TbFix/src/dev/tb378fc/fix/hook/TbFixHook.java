@@ -196,17 +196,113 @@ public class TbFixHook implements IXposedHookLoadPackage {
             hookAonPackageName(pkg);
             return;
         }
-        if (SETTINGS_PKG.equals(pkg)) {     // 设置：让「视觉感知/注视感知」那一页别被 removePreference
+        if (SETTINGS_PKG.equals(pkg)) {     // 设置：⑧c 注视感知那一页 + ⑫ 改笔参数即时下发
             hookAonSettingsBool(pkg);
+            hookStylusSettingsWrite(lpparam);
             return;
         }
         if (!"com.miui.notes".equals(pkg) && !"com.miui.creation".equals(pkg)) return;
 
+        hookTouchTarget(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
         // 真正的注册放到第一次 onResume（见 updateCanvas/tryRegisterReceiver）。
         tryRegisterReceiver();
         Log.i(TAG, "hooked " + pkg + " (api=" + Build.VERSION.SDK_INT + ")");
+    }
+
+    /**
+     * ⑪ 探测：一笔"落"在哪个 View 上。
+     *
+     * 目的：同一支笔在画布里点工具栏按钮/滑颜色条时 BTN_TOUCH 也是按下 —— 光看"笔在不在屏幕上"
+     * 分不出"在写字"还是"在点控件"。真正的判据是**这一下触摸的目标 View 是不是画布**。
+     * 这里先把 ACTION_DOWN 的 View 类名打出来（每个类名首见一条 + 前 30 条明细），
+     * 认出画布类名后就能用它做闸门（只对落在画布上的笔迹开触感）。
+     */
+    private static final java.util.Set<String> sSeenView = new java.util.HashSet<>();
+    private static int sTouchLogs = 0;
+    private void hookTouchTarget(XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            XposedBridge.hookAllMethods(android.view.View.class, "dispatchTouchEvent",
+                    new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            try {
+                                MotionEvent e = (MotionEvent) p.args[0];
+                                if (e == null || e.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+                                android.view.View v = (android.view.View) p.thisObject;
+                                String cn = v.getClass().getName();
+                                if (sSeenView.add(cn) || sTouchLogs < 30) {
+                                    sTouchLogs++;
+                                    Log.i(TAG, "⑪ touch DOWN view=" + cn
+                                            + " tool=" + e.getToolType(0)
+                                            + " size=" + v.getWidth() + "x" + v.getHeight());
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            Log.i(TAG, "⑪ 触摸目标探测钩子已装");
+        } catch (Throwable t) {
+            Log.w(TAG, "⑪ hook touch target failed", t);
+        }
+    }
+
+    /**
+     * ⑫ 设置里改笔参数 → **立刻**让 App 下发 {8,6,mask} / {8,5,level}（原来要等根侧 2 秒轮询）。
+     *
+     * 在设置进程里按方法名钩 Settings.System 的写入（putInt/putString/...ForUser，
+     * 不关心重载签名），key 是 stylus_* 就 150ms 去抖后读三个键 → 显式组件广播给 App
+     * （不需要权限）。App 收到后只改 bit0/bit4，保住模块算好的上滑/下滑/笔尾位。
+     */
+    private static final String A_CFG = "dev.tb378fc.fix.CFG";
+    private static final String APP_PKG = "dev.tb378fc.fix";
+    private static final String APP_RCV = "dev.tb378fc.fix.WakeReceiver";
+    private static volatile long sCfgPushAt = 0;
+
+    private void pushStylusCfg(android.content.ContentResolver cr) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sCfgPushAt < 150) return;           // 去抖：一次操作写多个键只发一次
+        sCfgPushAt = now;
+        try {
+            android.content.Context ctx = currentApp();   // 复用自己的取 Context 助手（旧 API 桩里没有 AndroidAppHelper）
+            if (ctx == null || cr == null) return;
+            int dbl = android.provider.Settings.System.getInt(cr, "stylus_double_click_status", 1);
+            int pinch = android.provider.Settings.System.getInt(cr, "stylus_pinch_status", 5);
+            int adj = android.provider.Settings.System.getInt(cr, "stylus_pinch_pressure_adjust", 2);
+            int level = adj + 1;
+            if (level > 5) level = 5;
+            if (level < 1) level = 1;
+            android.content.Intent i = new android.content.Intent(A_CFG);
+            i.setComponent(new android.content.ComponentName(APP_PKG, APP_RCV));
+            i.putExtra("dbl", dbl != 0 ? 1 : 0);
+            i.putExtra("pinch", pinch != 0 ? 1 : 0);
+            i.putExtra("level", level);
+            ctx.sendBroadcast(i);
+            Log.i(TAG, "⑫ 设置变了 → 即时下发 dbl=" + (dbl != 0 ? 1 : 0)
+                    + " pinch=" + (pinch != 0 ? 1 : 0) + " level=" + level);
+        } catch (Throwable t) {
+            Log.w(TAG, "⑫ push cfg failed", t);
+        }
+    }
+
+    private void hookStylusSettingsWrite(XC_LoadPackage.LoadPackageParam lp) {
+        String[] names = {"putInt", "putString", "putIntForUser", "putStringForUser"};
+        for (String n : names) {
+            try {
+                XposedBridge.hookAllMethods(android.provider.Settings.System.class, n,
+                        new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                                try {
+                                    if (p.args == null || p.args.length < 2) return;
+                                    Object k = p.args[1];
+                                    if (k instanceof String && ((String) k).startsWith("stylus_")) {
+                                        pushStylusCfg((android.content.ContentResolver) p.args[0]);
+                                    }
+                                } catch (Throwable ignored) { }
+                            }
+                        });
+            } catch (Throwable ignored) { }
+        }
+        Log.i(TAG, "⑫ 设置写入钩子已装（改笔参数即时下发）");
     }
 
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */

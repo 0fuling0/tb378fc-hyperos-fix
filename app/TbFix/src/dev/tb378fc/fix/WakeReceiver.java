@@ -31,6 +31,9 @@ public final class WakeReceiver extends BroadcastReceiver {
     /** ⑨ 休眠档：吸附在平板上且已充满 —— 关掉缓存的 BLE 连接，让笔进低功耗 */
     public static final String ACTION_REST = "dev.tb378fc.fix.REST";
 
+    /** ⑫ 设置进程（LSPosed 钩子）改了笔参数时发来的"立刻下发"请求 */
+    public static final String ACTION_CFG = "dev.tb378fc.fix.CFG";
+
     @Override
     public void onReceive(Context context, Intent intent) {
         final PendingResult pending = goAsync();
@@ -53,6 +56,25 @@ public final class WakeReceiver extends BroadcastReceiver {
                     }
                 }
             }, "penrest-rx").start();
+            return;
+        }
+
+        if (ACTION_CFG.equals(action)) {
+            // ⑫ 设置里改了双击/轻捏/力度 → 立刻下发（几十毫秒），不用等根侧 2 秒轮询
+            final int dbl = intent.getIntExtra("dbl", 1);
+            final int pinch = intent.getIntExtra("pinch", 1);
+            final int level = intent.getIntExtra("level", 3);
+            new Thread(new Runnable() {
+                @Override public void run() {
+                    try {
+                        PenBle.applyStylusCfg(app, dbl, pinch, level);
+                    } catch (Throwable t) {
+                        Log.e(PenBle.TAG, "instant cfg failed", t);
+                    } finally {
+                        try { pending.finish(); } catch (Throwable ignored) { }
+                    }
+                }
+            }, "pencfg-rx").start();
             return;
         }
 
@@ -114,6 +136,7 @@ public final class WakeReceiver extends BroadcastReceiver {
                     // wake     ：0 = 只改设置，不唤醒（根侧守护同步"小米设置"时用）
                     final int touchfilm = intent.getIntExtra("touchfilm", PenBle.TOUCHFILM_ALL);
                     final int squeeze = intent.getIntExtra("squeeze", -1);
+                    PenBle.noteCfgMask(touchfilm);      // ⑫ 记下来，给"设置改了立刻下发"当底
                     final boolean wake = intent.getIntExtra("wake", 1) != 0;
                     PenBle.Result r = PenBle.sendCmds(app, mac, wake, touchfilm, squeeze);
                     Log.i(PenBle.TAG, "WAKE " + r);
