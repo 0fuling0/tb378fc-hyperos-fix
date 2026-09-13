@@ -230,8 +230,8 @@ BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
 #    并让 App 断掉缓存 BLE 连接，让笔真正睡下去；取下或电量掉到 REST_RESUME 以下立刻恢复。
 PEN_REST=1
 REST_FULL=99          # 线圈报的电量 ≥ 此值且吸附 → 进入休眠
-REST_RESUME=95        # 电量 < 此值（或取下）→ 退出休眠
 REST_POLL=60          # 休眠期间线圈电量轮询间隔（秒）
+REST_IDLE=20          # charge_state 由 1 变 0 后，持续这么多秒就认定"充完了"
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -888,15 +888,21 @@ case "$1" in
 
 --restcheck)
     # 用给定的 att/lvl 走一遍休眠判定（不改状态）：sh service.sh --restcheck 1 100
+    # 用法：--restcheck <att> <lvl> [chg] [距上次 chg=1 的秒数]
     pen_rest_enabled || { echo "PEN_REST=0：休眠档关闭"; exit 0; }
-    if [ "$2" = 1 ] && [ "$3" -ge "$REST_FULL" ]; then
-        echo "→ 进入休眠（吸附且 $3 ≥ $REST_FULL）"
-    elif [ "$2" = 0 ]; then
+    _att="$2"; _lvl="$3"; _chg="${4:-0}"; _idle="${5:-0}"
+    if [ "$_att" = 0 ]; then
         echo "→ 不休眠（已取下）"
-    elif [ "$3" -lt "$REST_RESUME" ]; then
-        echo "→ 不休眠/退出（$3 < $REST_RESUME）"
+    elif [ "$_lvl" -ge "$REST_FULL" ]; then
+        echo "→ 进入休眠（兜底判据：电量 $_lvl ≥ $REST_FULL）"
+    elif [ "$_chg" = 1 ]; then
+        echo "→ 不休眠（正在充电 chg=1，电量 $_lvl）"
+    elif [ "$_idle" -ge "$REST_IDLE" ]; then
+        echo "→ 进入休眠（主判据：充电已停 ${_idle}s ≥ $REST_IDLE，电量 $_lvl）"
+    elif [ "$_att" = 0 ]; then
+        echo "→ 不休眠（已取下）"
     else
-        echo "→ 保持现状（吸附，电量 $3 在 $REST_RESUME~$((REST_FULL-1)) 之间）"
+        echo "→ 保持现状（吸附，chg=0 但只停了 ${_idle}s < $REST_IDLE，电量 $_lvl）"
     fi
     exit 0
     ;;
@@ -1032,7 +1038,10 @@ case "$1" in
     refresh_deadline=0
     lvl_win=0          # "全速读线圈电量"的剩余秒数（吸附边沿后开窗）
     pen_rest=0         # ⑨ 休眠档当前状态（文件里也写一份，给别的进程看）
+    chg_seen=0         # ⑨ 本次吸附期间有没有见过 chg=1（见过才算"充过电"）
+    chg_last=0         # ⑨ 最后一次见到 chg=1 的时刻（now_sec）
     pen_rest_enabled && [ "$REST_POLL" -ge 5 ] 2>/dev/null || REST_POLL=5
+    [ "$REST_IDLE" -ge 5 ] 2>/dev/null || REST_IDLE=5
     pen_rest_mark 0
     if capsule_enabled; then
         prepare_stylus_settings
@@ -1071,33 +1080,66 @@ case "$1" in
         #   lvl_win>0（刚吸附/线圈启动后 8 秒）：每 ~1 秒一次，尽快拿到真值弹胶囊
         #   吸附稳定：每 ~2 秒一次
         #   未吸附：每 ~10 秒兜底一次（认线圈启动边沿）
-        lvl_read=0
+        lvl_read=0; chg=0
         if [ "$pen_rest" = 1 ]; then
-            # 休眠档：线圈电量降到 REST_POLL 秒一次（只是用来发现"该醒了"）
-            [ $((sub % $((REST_POLL * 5)))) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+            # 休眠档：降到 REST_POLL 秒一次（只是用来发现"该醒了"）
+            [ $((sub % $((REST_POLL * 5)))) -eq 0 ] && lvl_read=1
         elif [ "$lvl_win" -gt 0 ]; then
-            [ $((sub % 5)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+            [ $((sub % 5)) -eq 0 ] && lvl_read=1
         elif [ "$att" = 1 ]; then
-            [ $((sub % 10)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+            [ $((sub % 10)) -eq 0 ] && lvl_read=1
         else
-            [ $((sub % 50)) -eq 0 ] && { lvl=$(read_level); lvl_read=1; }
+            [ $((sub % 50)) -eq 0 ] && lvl_read=1
         fi
-        [ "$lvl_read" = 0 ] && lvl=$last_lvl
+        if [ "$lvl_read" = 1 ]; then
+            lvl=$(read_level)
+            chg=$(read_int "$WLS_CHG" 0)     # 0/1：线圈报的"是否正在给笔充电"
+        else
+            lvl=$last_lvl
+        fi
         if [ "$lvl_read" = 1 ] && [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
 
-        # ⑨ 休眠档状态机：吸附且充满 → 让笔休眠；取下或电量掉下来 → 恢复
+        # ⑨ 休眠档状态机：吸附且"充完了" → 让笔休眠；取下、或线圈重新开始充电 → 恢复
+        #
+        # 判据用 **charge_state**（线圈驱动报的"是否正在给笔充电"）而不是拍一个电量阈值：
+        #   1) 本轮读到 chg=1 → 说明确实在充，记下时间（刚吸上那几秒 chg 也是 0 —— 握手还没起来，
+        #      所以不能只看 chg=0，否则一吸上就误判成"充满"）；
+        #   2) 之后读到 chg=0 且距上次 chg=1 已 ≥ REST_IDLE 秒 → 充完了（笔端 Qi 接收芯片终止取电
+        #      就是这么体现的），进休眠档；
+        #   3) 兜底：电量 ≥ REST_FULL（有的笔端在 100% 之前就停充、或 chg 读不到时用）。
         if pen_rest_enabled; then
+            if [ "$att" = 0 ]; then
+                chg_seen=0; chg_last=0
+            elif [ "$lvl_read" = 1 ] && [ "$chg" = 1 ]; then
+                chg_seen=1; chg_last=$now_sec
+            fi
             if [ "$pen_rest" != 1 ]; then
+                rested=0
                 if [ "$lvl_read" = 1 ] && [ "$att" = 1 ] && [ "$lvl" -ge "$REST_FULL" ]; then
+                    rested=1; rest_why="电量=$lvl ≥ $REST_FULL"
+                elif [ "$att" = 1 ] && [ "$chg_seen" = 1 ] && [ "$lvl_read" = 1 ] && [ "$chg" = 0 ] \
+                        && [ $((now_sec - chg_last)) -ge "$REST_IDLE" ]; then
+                    rested=1; rest_why="充完静默 $((now_sec - chg_last))s（chg 1→0，电量=$lvl）"
+                fi
+                if [ "$rested" = 1 ]; then
                     pen_rest=1; pen_rest_mark 1; lvl_win=0
-                    log "pen rest ON: 吸附且电量=$lvl ≥ $REST_FULL → 停唤醒/停胶囊/断 BLE"
+                    log "pen rest ON: 吸附且 $rest_why → 停唤醒/停胶囊/断 BLE"
                     /system/bin/sh "$0" --brushstop >/dev/null 2>&1   # 清掉可能 latch 住的 CON 波形
                     send_extra "$A_REST" "rest-on" --ei on 1
                 fi
             else
-                if [ "$att" = 0 ] || { [ "$lvl_read" = 1 ] && [ "$lvl" -ge 0 ] && [ "$lvl" -lt "$REST_RESUME" ]; }; then
+                # 出档：取下，或线圈**重新开始充电**（说明笔又要用电了 → 恢复唤醒/胶囊）。
+                # 这里不能用"电量低于某个阈值"来出档：进档主判据是"停充"，两者会来回打架
+                # （90% 停充 → 进档 → 立刻因 <95 出档 → 再进档，实测会 20 秒一跳）。
+                if [ "$att" = 0 ]; then
                     pen_rest=0; pen_rest_mark 0
-                    log "pen rest OFF: att=$att 电量=$lvl (本轮读到=$lvl_read) → 恢复唤醒/胶囊"
+                    log "pen rest OFF: 已取下 → 恢复唤醒/胶囊"
+                    send_extra "$A_REST" "rest-off" --ei on 0
+                elif [ "$lvl_read" = 1 ] && [ "$chg" = 1 ] && [ "$lvl" -lt "$REST_FULL" ]; then
+                    # 注意要带 lvl < REST_FULL：本机实测**笔满 100% 时 chg 仍然是 1**
+                    # （线圈持续 ~300mA 送电），只按 chg=1 出档会和"电量兜底进档"60 秒一跳。
+                    pen_rest=0; pen_rest_mark 0
+                    log "pen rest OFF: 线圈重新给笔补电 (电量=$lvl < $REST_FULL) → 恢复唤醒/胶囊"
                     send_extra "$A_REST" "rest-off" --ei on 0
                 fi
             fi
