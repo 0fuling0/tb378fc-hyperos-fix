@@ -411,19 +411,25 @@ brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
 
 # 画布是否可写（hook 写的 penstate；优先读"前台那个 App"的文件，避免读到另一边的旧状态）
 brush_canvas() {
-    # 只信"前台那个 App 自己写的 penstate"：
-    #   以前前台不是笔记/创作时会回退去读*所有* penstate 文件，结果被别的 App（或被 force-stop
-    #   后没来得及写 canvas=0 的陈旧文件）里的 canvas=1 骗住 → 从画布切出去触感还在（实测）。
-    # 拿不到前台（dumpsys 偶发失败）时才宽松放行，避免抖动。
-    local f v fg
+    # 判据分三层（都是实测踩出来的）：
+    #   1) 前台不是笔记/创作 → 肯定不在画布（这条修掉"切出去触感还在"）
+    #   2) 前台是它们，但 penstate 文件不存在 / 里面没有 canvas= / 文件太久没更新（>20 秒，
+    #      说明钩子没在跑或 App 刚重装）→ **当未知，放行**。上一版这里要求"必须明确 canvas=1"，
+    #      结果重装 App（数据被清）或 LSPosed 没加载时波形永远不开（"笔刷触感又没了"）。
+    #   3) 只有拿到**新鲜的** canvas=0 才真正停（App 明确说"不在画布"）。
+    local f v fg now mt
     fg=$(pen_fg)
     [ -n "$fg" ] || return 0
     case "$fg" in
         com.miui.notes)    f=/data/data/com.miui.notes/files/penstate ;;
         com.miui.creation) f=/data/data/com.miui.creation/files/penstate ;;
-        *) return 1 ;;                       # 前台不是笔记/创作 → 肯定不在画布
+        *) return 1 ;;
     esac
+    [ -f "$f" ] || return 0
     v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
+    [ -n "$v" ] || return 0
+    now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null)
+    [ -n "$mt" ] && [ $((now - mt)) -gt 20 ] && return 0
     [ "$v" = "1" ]
 }
 
@@ -532,6 +538,11 @@ brush_watch_loop() {
     local line pkg miss=0
     # 每轮先对齐一次现状（App 可能已经在前台且选好了笔刷）
     brush_scan_apps
+    # 如果启动时就已经在画布里（模块刚重装 / App 数据被清 / 看护被杀过），补发一次当前笔刷波形 ——
+    # 否则要等下一次事件才会开，表现就是"重装后触感没了"。
+    if [ -n "$(brush_base)" ] && brush_canvas; then
+        brush_send "$(brush_base)" "watch start canvas"
+    fi
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
         # 2>/dev/null：penring 的 logf_ 已经自己写 --log 指定的文件，而 stderr 也会被本进程
         # （其 stderr 已经指向同一个 brush.log）接住 → 不屏蔽的话每条日志都出现两遍。
