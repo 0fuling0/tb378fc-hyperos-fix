@@ -224,16 +224,37 @@ public class TbFixHook implements IXposedHookLoadPackage {
      *    只在值变化时打日志（getButtonState 是热路径）。
      */
     private static int sLastButton = Integer.MIN_VALUE;
+
+    /**
+     * 笔尾（橡皮端）改写成"小米笔侧键"约定：{@code toolType=STYLUS(2) + BUTTON_STYLUS_PRIMARY(32)}。
+     *
+     * 为什么不用框架原生的 ERASER(4)：实测这台机器上框架**已经**会报 4，但两个 App 都不吃这套 ——
+     *   笔记：报 4 时照样出墨（它认按钮约定，小米笔本来就是"侧键=橡皮"）
+     *   创作：报 4 时进了橡皮分支但绘制管线卡住（既不画也不擦）
+     * 所以改成按钮约定，并把 4 藏起来（避免再触发那条坏路径）。
+     * 想回到"原样透传 ERASER"就把这个常量改成 false 重新构建。
+     */
+    private static final boolean TAIL_AS_STYLUS_BUTTON = true;
+    /** 最近一次 getToolType 的**原始**返回值（改写前），给 getButtonState/getActionButton 用 */
+    private static volatile int sOrigTool = MotionEvent.TOOL_TYPE_UNKNOWN;
     private void hookButtonState(XC_LoadPackage.LoadPackageParam lp) {
         try {
             XposedHelpers.findAndHookMethod(MotionEvent.class, "getButtonState", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     try {
                         int bs = (Integer) p.getResult();
+                        if (TAIL_AS_STYLUS_BUTTON && sOrigTool == MotionEvent.TOOL_TYPE_ERASER) {
+                            int want = bs | MotionEvent.BUTTON_STYLUS_PRIMARY;
+                            if (want != bs) {
+                                p.setResult(want);
+                                bs = want;
+                            }
+                        }
                         if (bs != sLastButton) {
                             sLastButton = bs;
                             Log.i(TAG, "buttonState -> " + bs + " (STYLUS_PRIMARY="
-                                    + MotionEvent.BUTTON_STYLUS_PRIMARY + ") tail=" + sTailDown);
+                                    + MotionEvent.BUTTON_STYLUS_PRIMARY + ") origTool="
+                                    + sOrigTool + " tail=" + sTailDown);
                         }
                     } catch (Throwable ignored) { }
                 }
@@ -241,6 +262,25 @@ public class TbFixHook implements IXposedHookLoadPackage {
             Log.i(TAG, "hook getButtonState ok");
         } catch (Throwable t) {
             Log.w(TAG, "hook getButtonState failed", t);
+        }
+        // 有些 App 读的是"动作按钮"（ACTION_DOWN/POINTER_DOWN 上的 actionButton）
+        try {
+            XposedHelpers.findAndHookMethod(MotionEvent.class, "getActionButton", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    try {
+                        if (!TAIL_AS_STYLUS_BUTTON) return;
+                        if (sOrigTool != MotionEvent.TOOL_TYPE_ERASER) return;
+                        MotionEvent ev = (MotionEvent) p.thisObject;
+                        int a = ev.getActionMasked();
+                        if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
+                            p.setResult(MotionEvent.BUTTON_STYLUS_PRIMARY);
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            });
+            Log.i(TAG, "hook getActionButton ok");
+        } catch (Throwable t) {
+            Log.w(TAG, "hook getActionButton failed", t);
         }
     }
 
@@ -252,10 +292,19 @@ public class TbFixHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             int orig = (Integer) param.getResult();
+                            sOrigTool = orig;
                             // 只在"框架报的不是 STYLUS"时记一条（排查用；2=STYLUS 4=ERASER）
-                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 5) {
+                            if (orig != MotionEvent.TOOL_TYPE_STYLUS && sToolLogs < 8) {
                                 sToolLogs++;
-                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown);
+                                Log.i(TAG, "getToolType orig=" + orig + " tail=" + sTailDown
+                                        + " -> " + (TAIL_AS_STYLUS_BUTTON ? "STYLUS+按钮" : "ERASER"));
+                            }
+                            if (TAIL_AS_STYLUS_BUTTON) {
+                                // 笔尾：藏掉 ERASER，改成 STYLUS（配合下面的主按钮位）
+                                if (orig == MotionEvent.TOOL_TYPE_ERASER) {
+                                    param.setResult(MotionEvent.TOOL_TYPE_STYLUS);
+                                }
+                                return;
                             }
                             if (!sTailDown) return;
                             if (orig == MotionEvent.TOOL_TYPE_STYLUS || orig == MotionEvent.TOOL_TYPE_ERASER) {
