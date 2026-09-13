@@ -227,7 +227,9 @@ public class TbFixHook implements IXposedHookLoadPackage {
     private static int sTouchLogs = 0;
     private void hookTouchTarget(XC_LoadPackage.LoadPackageParam lp) {
         try {
-            XposedBridge.hookAllMethods(android.view.View.class, "dispatchTouchEvent",
+            // 钩叶子 View 的 onTouchEvent：ViewGroup 会覆盖 dispatchTouchEvent，
+            // 真正"吃掉"这一下触摸的是实现 onTouchEvent 的那个 View（画布 / 按钮 / 色条）。
+            XposedBridge.hookAllMethods(android.view.View.class, "onTouchEvent",
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
                             try {
@@ -235,11 +237,12 @@ public class TbFixHook implements IXposedHookLoadPackage {
                                 if (e == null || e.getActionMasked() != MotionEvent.ACTION_DOWN) return;
                                 android.view.View v = (android.view.View) p.thisObject;
                                 String cn = v.getClass().getName();
-                                if (sSeenView.add(cn) || sTouchLogs < 30) {
+                                if (sSeenView.add(cn) || sTouchLogs < 40) {
                                     sTouchLogs++;
                                     Log.i(TAG, "⑪ touch DOWN view=" + cn
                                             + " tool=" + e.getToolType(0)
-                                            + " size=" + v.getWidth() + "x" + v.getHeight());
+                                            + " size=" + v.getWidth() + "x" + v.getHeight()
+                                            + " id=" + v.getId());
                                 }
                             } catch (Throwable ignored) { }
                         }

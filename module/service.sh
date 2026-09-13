@@ -557,7 +557,7 @@ brush_watch_loop() {
             --prefs /data/data/com.miui.creation/files \
             --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
         | while :; do
-            if IFS= read -r -t 2 line; then
+            if IFS= read -r -t 2 line 2>/dev/null; then
                 miss=0
                 case "$line" in
                     FILE*)
