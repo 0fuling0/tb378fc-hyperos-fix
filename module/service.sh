@@ -435,7 +435,14 @@ brush_canvas() {
     esac
     for f in $order; do
         v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
-        [ -n "$v" ] && { [ "$v" = "1" ]; return $?; }
+        [ -n "$v" ] || continue
+        # ⑪ 同一个文件里还有 stroke=（App 按"触摸落在画布上而不是那条 182 高的工具栏"写的）：
+        #    有这一项时必须也为 1 才允许开触感；没有这一项（别的 App / 旧版本）就不拦。
+        st=$(sed -n 's/^stroke=//p' "$f" 2>/dev/null | head -1)
+        if [ "$v" = "1" ]; then
+            [ -z "$st" ] || [ "$st" = "1" ] && return 0
+            return 1
+        fi
     done
     return 0
 }
