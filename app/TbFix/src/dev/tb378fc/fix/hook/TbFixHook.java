@@ -9,6 +9,7 @@ import android.content.res.Resources;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.widget.PopupWindow;
@@ -208,6 +209,7 @@ public class TbFixHook implements IXposedHookLoadPackage {
 
         hookToolType(lpparam);
         hookButtonState(lpparam);
+        hookSettingsSpoof(lpparam);
         hookStylusState(lpparam);
         hookLifecycle(lpparam);
         // 注意：这里还没有 Context（ActivityThread 的 Application 可能还没建好），
@@ -371,6 +373,61 @@ public class TbFixHook implements IXposedHookLoadPackage {
         Log.i(TAG, "hook fc.I11lii ok");
     }
 
+    /** ⑩ 笔尾=橡皮：我们注入 195（双击键）的那一瞬间，**只在 App 进程里**把
+     *  `stylus_double_click_status` 临时伪装成 1（笔刷/橡皮切换），1.2 秒窗口后自然失效。
+     *
+     *  为什么要这样：这条动作是 App 自己读设置后执行的（笔记里含该设置字符串），
+     *  用户的双击动作设的是别的值（如 4=笔刷参数）。直接改系统设置会破坏用户的双击；
+     *  在注入的瞬间伪装值，就能"借用" App 自己的切橡皮代码，而用户的双击不受影响。 */
+    private static final String KEY_DOUBLE = "stylus_double_click_status";
+    private static volatile long sTailTapUntil = 0;
+    /** App 收到笔尾广播时调用：开一个短暂的"双击=切橡皮"窗口 */
+    static void markTailTap() {
+        sTailTapUntil = SystemClock.uptimeMillis() + 1200;
+        Log.i(TAG, "⑩ tail-tap 窗口开启（双击动作临时按 1=笔刷/橡皮切换 处理）");
+    }
+
+    private void hookSettingsSpoof(XC_LoadPackage.LoadPackageParam lp) {
+        Class<?>[] classes = {android.provider.Settings.System.class,
+                              android.provider.Settings.Secure.class,
+                              android.provider.Settings.Global.class};
+        for (final Class<?> c : classes) {
+            for (final String m : new String[]{"getInt", "getString"}) {
+                try {
+                    XposedHelpers.findAndHookMethod(c, m,
+                            android.content.ContentResolver.class, String.class, int.class,
+                            new XC_MethodHook() {
+                                @Override protected void afterHookedMethod(MethodHookParam p) {
+                                    try {
+                                        if (SystemClock.uptimeMillis() >= sTailTapUntil) return;
+                                        if (KEY_DOUBLE.equals(p.args[1])) {
+                                            p.setResult(1);   // 1 = 笔刷/橡皮切换（com.miui.securitycore:integer/stylus_func_switch_between_brush_and_eraser）
+                                            Log.i(TAG, "⑩ spoof " + KEY_DOUBLE + " -> 1");
+                                        }
+                                    } catch (Throwable ignored) { }
+                                }
+                            });
+                } catch (Throwable ignored) { }
+                try {
+                    XposedHelpers.findAndHookMethod(c, m,
+                            android.content.ContentResolver.class, String.class,
+                            new XC_MethodHook() {
+                                @Override protected void afterHookedMethod(MethodHookParam p) {
+                                    try {
+                                        if (SystemClock.uptimeMillis() >= sTailTapUntil) return;
+                                        if (KEY_DOUBLE.equals(p.args[1])) {
+                                            p.setResult("1");
+                                            Log.i(TAG, "⑩ spoof(str) " + KEY_DOUBLE + " -> 1");
+                                        }
+                                    } catch (Throwable ignored) { }
+                                }
+                            });
+                } catch (Throwable ignored) { }
+            }
+        }
+        Log.i(TAG, "⑩ 设置读取钩子已装（笔尾窗口内伪装双击动作）");
+    }
+
     /** 2) 画布焦点：前台 Activity + 没有弹窗/面板 → 可写 */
     private void hookLifecycle(XC_LoadPackage.LoadPackageParam lp) {
         try {
@@ -487,6 +544,7 @@ public class TbFixHook implements IXposedHookLoadPackage {
                         boolean down = intent.getIntExtra("down", 0) != 0;
                         if (down != sTailDown) {
                             sTailDown = down;
+                            if (down) markTailTap();      // ⑩ 笔尾靠近：开"双击=切橡皮"窗口
                             Log.i(TAG, "tail=" + down + " -> " + (down ? "TOOL_TYPE_ERASER" : "笔刷"));
                             updateCanvas(sCanvas, "tail change");
                         }

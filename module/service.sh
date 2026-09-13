@@ -436,8 +436,11 @@ tail_tap_eraser() {
         brush_log "tail-tap 跳过：画布未聚焦"
         return 0
     fi
+    # 先让 App 处理完"笔尾"广播（它收到后会开一个 1.2 秒的窗口：把双击动作临时当 1 处理），
+    # 再注入双击键 —— 这样借用 App 自己的"切橡皮"代码，而用户真实双击的设置值不受影响。
+    sleep 0.2
     "$PENRING_BIN" --moddir "$MODDIR" --key "$GESTURE_DOUBLE" >/dev/null 2>&1
-    brush_log "tail-tap: 注入 $GESTURE_DOUBLE（笔刷/橡皮切换）"
+    brush_log "tail-tap: 注入 $GESTURE_DOUBLE（App 侧临时按 1=笔刷/橡皮切换 处理）"
 }
 
 brush_tell_hooks() { am broadcast --user 0 -a dev.tb378fc.fix.TAIL --ei down "$1" >/dev/null 2>&1 & }
