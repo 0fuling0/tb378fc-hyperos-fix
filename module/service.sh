@@ -503,6 +503,9 @@ brush_exit_check() {
         brush_send 0 "app left ($fg)"
         BRUSH_MISS=0
         : > "$BRUSH_BASE"
+    # 关键：把 brush.last.<pkg> 一起清掉。brush_scan_one 有"签名没变就 return"的短路，
+    # 重启后这些文件还在 → 首次扫描直接跳过 → base 永远空 → 没有波形（重装后没触感的真根因）。
+    rm -f "$MODDIR"/brush.last.* 2>/dev/null
     fi
 }
 
@@ -540,13 +543,19 @@ brush_watch_loop() {
     brush_scan_apps
     # 如果启动时就已经在画布里（模块刚重装 / App 数据被清 / 看护被杀过），补发一次当前笔刷波形 ——
     # 否则要等下一次事件才会开，表现就是"重装后触感没了"。
-    if [ -n "$(brush_base)" ] && brush_canvas; then
-        brush_send "$(brush_base)" "watch start canvas"
+    if brush_canvas; then
+        # 启动时还没 base（App 刚重装 / 数据被清 → 之前没有工具事件）→ 主动读一次前台 App 的笔刷
+        [ -n "$(brush_base)" ] || brush_scan_one "$(pen_fg)"
+        if [ -n "$(brush_base)" ]; then
+            brush_send "$(brush_base)" "watch start canvas"
+        else
+            brush_log "watch start：画布在前台但读不到笔刷（等一次工具事件）"
+        fi
     fi
     while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
         # 2>/dev/null：penring 的 logf_ 已经自己写 --log 指定的文件，而 stderr 也会被本进程
         # （其 stderr 已经指向同一个 brush.log）接住 → 不屏蔽的话每条日志都出现两遍。
-        "$PENRING_BIN" --watch 2>/dev/null \
+        "$PENRING_BIN" --watch 2>>"$BRUSH_LOG.err" \
             --prefs /data/data/com.miui.notes/shared_prefs \
             --prefs /data/data/com.miui.creation/shared_prefs \
             --prefs /data/data/dev.tb378fc.fix/files \
@@ -594,9 +603,10 @@ brush_watch_loop() {
                 # read 超时或管道断了。若 penring --watch 已经没了，必须立刻跳出内层让外层重建：
                 # 否则 read 会立刻返回失败 → 空转，而且每轮都跑 brush_exit_check（里面有 dumpsys）
                 # → 几秒内几千次 fork（实测把 pid 都耗到绕回）。
-                # 每 3 次超时才做一次进程表扫描（守卫本身也要花 fork，别每 2 秒都扫）
+                # 每 8 次超时才做一次进程表扫描：守卫本身要 fork，而且扫得太勤会在 penring
+                # 刚被重建的空档里误判"已退出"，导致看护反复重建（实测 1 秒 3 次抖动）。
                 miss=$((miss+1))
-                if [ $((miss % 3)) -eq 0 ] && [ -z "$(penring_watch_pids)" ]; then
+                if [ $((miss % 8)) -eq 0 ] && [ -z "$(penring_watch_pids)" ]; then
                     brush_log "watch: penring --watch 已退出，重建看护"
                     break
                 fi
@@ -929,17 +939,11 @@ case "$1" in
         echo "$_k=$_v" >> "$CFG"
     fi
     log "config: $_k=$_v（守护稍后重启生效）"
-    # detach：只精确杀本模块的守护（supervise/monitor/brushwatch/penring），再拉一个新的
-    setsid /system/bin/sh -c '
-        sleep 1
-        for p in $(ps -A -o PID,ARGS | awk "\$2 ~ /service\.sh$/ && \$3 ~ /^--(supervise|monitor|brushwatch)$/ {print \$1}"); do kill -9 "$p" 2>/dev/null; done
-        for p in $(ps -A -o PID,ARGS | awk "\$2 ~ /penring$/ {print \$1}"); do kill -9 "$p" 2>/dev/null; done
-        sleep 1
-        rm -rf "'"$MODDIR"'/brush.lock" 2>/dev/null
-        setsid /system/bin/sh "'"$MODDIR"'/service.sh" >/dev/null 2>&1 </dev/null &
-    ' >/dev/null 2>&1 </dev/null &
+    # detach 出去重启（只杀本模块守护；脚本单独成文件，避免把自己也匹配进去）
+    MODDIR="$MODDIR" setsid /system/bin/sh "$MODDIR/restart.sh" >/dev/null 2>&1 </dev/null &
     echo "ok"
     exit 0
+
     ;;
 
 --rest)
