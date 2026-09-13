@@ -1,6 +1,14 @@
-# 构建产物（build.sh 会重新生成）
+# 构建中间产物
+out/
 app/*/build/
 app/*/*.apk.idsig
-out/
+extras/PenStylusHook/build/
+extras/PenStylusHook/PenStylusHook.apk
+payload-src/PowerKeeper-patched.apk
+payload-src/classes-patched*.dex
+payload-src/payload.apk
+**/__pycache__/
 *.pyc
-__pycache__/
+
+# 设备上那份的等价物由 build.sh 重建（APK 是产物；penring 保留入库便于对比）
+module/bin/TbFix.apk
