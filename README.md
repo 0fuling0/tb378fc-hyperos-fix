@@ -199,7 +199,7 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 
 ```bash
 # 版本号改完、提交推上去之后：
-git tag v3.6 && git push origin v3.6
+git tag v3.7 && git push origin v3.7
 ```
 
 也可以手动跑：Actions 页面 →「构建并发布模块」→ Run workflow（tag 留空就用 `module.prop` 里的 `version`）。
