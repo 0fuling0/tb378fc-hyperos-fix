@@ -101,12 +101,43 @@
 #     service.sh --stopbpfmon   等 boot_completed 后停掉 BPF 监视器
 #     service.sh --fixtelephony 等 boot_completed 后停掉死电话栈（一次即可，不需看护）
 #
-# 单独关闭某一项：在模块目录下建对应的标记文件即可，四项互不影响。
+# 功能开关
+# --------
+# 每一项功能都有对应的 config 键（见 module/config，WebUI 里改），改完由 WebUI 触发一次
+# 守护重启即可生效。旧的 disable-* 标记文件仍然支持，且**优先级更高**（标记在 = 强制关）。
+#
+#   分组 A —— 纯模块功能（只靠 root + 内核/属性/包管理，不需要 App），默认全开：
+#     FIX_POWERKEEPER  ② PowerKeeper 字节码修补（post-fs-data.sh 消费）
+#     FIX_BPFMON       ③ BPF 监视器拆弹
+#     FIX_TELEPHONY    ④ 死电话栈
+#     GESTURE          ⑥ 手势桥（penring + 停掉 ROM 自带笔桥）
+#
+#   分组 B —— 需要 App（dev.tb378fc.fix，它同时是 LSPosed 钩子），默认全关：
+#     PEN_WAKE         ① 手写笔休眠唤醒
+#     CAPSULE          ⑤ 吸附电量胶囊
+#     BRUSH            ⑦ 笔刷触感
+#     AON              ⑧ 注视感知（含 ⑧b HAL 补库、⑧c 设置页可见性）
+#     PEN_REST         ⑨ 笔休眠档
+#     SETTINGS_SYNC    ⑫ 设置 → 笔 下发
+#     SCREEN_CMD       ⑬ 屏幕亮/灭告诉笔
+#
+#   **分组 B 里只要有一项为 1，开机就安装 bin/TbFix.apk；七项全为 0 就把它卸载掉。**
+#   判据是 need_app()。这就是"取消默认自动安装 APK"的实现：默认七项全是 0。
+#   手动对齐一次：sh service.sh --apksync      查状态：sh service.sh --appstat
+#
+# 旧的标记文件（仍有效，优先级高于 config）：
 #     disable              ① 手写笔守护
-#     disable-powerkeeper  ② PowerKeeper 补丁（见 post-fs-data.sh）
+#     disable-powerkeeper  ② PowerKeeper 补丁
 #     disable-bpfmon       ③ BPF 监视器拆弹
 #     disable-telephony    ④ 死电话栈
-#     disable-capsule      ⑤ 吸附胶囊（只关胶囊，唤醒照常）
+#     disable-capsule      ⑤ 吸附胶囊
+#     disable-gesture      ⑥ 手势桥
+#     disable-brush        ⑦ 笔刷触感
+#     disable-aon          ⑧ 注视感知（post-fs-data.sh 消费）
+#     disable-aonlib       ⑧b AON HAL 补库
+#     disable-rest         ⑨ 笔休眠档
+#     disable-screen       ⑬ 屏幕指令
+#     disable-rompen       ⑥ 不停 ROM 自带笔桥
 
 MODDIR=${0%/*}
 LOG="$MODDIR/wake.log"
@@ -118,6 +149,9 @@ DISABLE_CAPSULE="$MODDIR/disable-capsule"
 DISABLE_GESTURE="$MODDIR/disable-gesture"
 DISABLE_ROMPEN="$MODDIR/disable-rompen"
 DISABLE_BRUSH="$MODDIR/disable-brush"
+DISABLE_POWERKEEPER="$MODDIR/disable-powerkeeper"
+DISABLE_AON="$MODDIR/disable-aon"
+DISABLE_SCREEN="$MODDIR/disable-screen"
 PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在这个节点上）
 BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
 BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
@@ -193,7 +227,11 @@ CAPSULE_FAST=0
 # ⑥ 笔端触控膜功能位 {8,6,mask}：63=0x3F 全开（双击/三击/上滑/下滑/捏合/笔尾）；
 #    -1 = 只唤醒不改位。位定义见 docs/zuxos-pen-protocol.md §2.1
 TOUCHFILM=63
-# ⑥ 手势桥开关：1 = 起 penring（默认），0 = 不起；也可以建 disable-gesture 标记文件
+# ⑥ 手势桥开关（分组 A，默认开）：1 = 起 penring 并停掉 ROM 自带笔桥，0 = 不起；
+#    也可以建 disable-gesture 标记文件。
+#    注意：笔要**上报**手势，得先有人用 BLE 把笔端触控膜功能位 {8,6,mask} 写进去 ——
+#    那一步只有 App 能做。所以 ⑥ 虽然不需要 App 常驻，但至少要被分组 B 开过一次
+#    （笔会记住这个位，直到它重启/睡死）。
 GESTURE=1
 # ⑥ 手势 → Android 键码映射（改完重启模块生效；-1 = 关掉这一条）
 #   194 轻捏=快捷环 · 195 双击 · 196 上滑 · 197 下滑
@@ -228,15 +266,60 @@ BRUSH_LASSO_WAVE=36
 # 认不出的编号统一用这个波形
 BRUSH_DEFAULT_WAVE=36
 BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
-# ⑬ 屏幕亮/灭时告诉笔（ZUX {5,2}=亮 / {5,1}=灭；SCREEN_SWAP=1 互换）
-SCREEN_CMD=1
+# ⑬ 屏幕亮/灭时告诉笔（分组 B，默认关；ZUX {5,2}=亮 / {5,1}=灭；SCREEN_SWAP=1 互换）
+SCREEN_CMD=0
 SCREEN_SWAP=0
-# ⑨ 休眠档：吸附在平板上且已充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
-#    并让 App 断掉缓存 BLE 连接，让笔真正睡下去；取下或电量掉到 REST_RESUME 以下立刻恢复。
-PEN_REST=1
+# ⑨ 休眠档（分组 B，默认关）：吸附在平板上且已充满 → 停掉一切对笔的主动动作
+#    （唤醒/胶囊/GATT 校正/波形），并让 App 断掉缓存 BLE 连接，让笔真正睡下去；
+#    取下或电量掉到 REST_RESUME 以下立刻恢复。
+PEN_REST=0
 REST_FULL=99          # 线圈报的电量 ≥ 此值且吸附 → 进入休眠
 REST_POLL=60          # 休眠期间线圈电量轮询间隔（秒）
 REST_IDLE=20          # charge_state 由 1 变 0 后，持续这么多秒就认定"充完了"
+
+# ---- 分组 A：纯模块功能（不需要 App），默认全开 ----
+# ② PowerKeeper 字节码修补（post-fs-data.sh 消费同一个键）
+FIX_POWERKEEPER=1
+# ③ 停 BPF 监视器（hyper_bpfloader）
+FIX_BPFMON=1
+# ④ 停死电话栈（com.qti.phone 等三个包）
+FIX_TELEPHONY=1
+
+# ---- 分组 B：需要 App（dev.tb378fc.fix），默认全关 ----
+# ① 手写笔休眠唤醒：磁吸取下时发 {5,5} 把睡死的笔叫起来（经 App 的 BLE）
+PEN_WAKE=0
+# ⑧ 注视感知（AON）：含 ⑧b HAL 补库与 ⑧c 设置页可见性，需要 LSPosed 钩子
+AON=0
+
+# ============================================================ 开关判定
+# "配置项算不算开"：1/true/yes/on 都算开（兼容 config 里的各种写法）
+cfg_on() { case "$1" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+
+# 每个功能的开关 = config 键 AND 没有对应 disable-* 标记文件（标记优先级更高，兼容老用法）
+fix_powerkeeper_enabled() { [ -e "$DISABLE_POWERKEEPER" ] && return 1; cfg_on "$FIX_POWERKEEPER"; }
+fix_bpfmon_enabled()      { [ -e "$DISABLE_BPFMON" ]      && return 1; cfg_on "$FIX_BPFMON"; }
+fix_telephony_enabled()   { [ -e "$DISABLE_TELEPHONY" ]   && return 1; cfg_on "$FIX_TELEPHONY"; }
+pen_wake_enabled()        { [ -e "$DISABLE" ]             && return 1; cfg_on "$PEN_WAKE"; }
+brush_enabled()           { [ -e "$DISABLE_BRUSH" ]       && return 1; cfg_on "$BRUSH"; }
+aon_enabled()             { [ -e "$DISABLE_AON" ]         && return 1; cfg_on "$AON"; }
+screen_enabled()          { [ -e "$DISABLE_SCREEN" ]      && return 1; cfg_on "$SCREEN_CMD"; }
+settings_sync_enabled()   { cfg_on "$SETTINGS_SYNC"; }
+
+# 分组 B（需要 App）里只要有一项开着，就需要那个 APK —— 装；七项全关 —— 卸。
+# 这就是"取消默认自动安装 APK"的唯一判据：默认七项全是 0，所以默认不装。
+# 注意 capsule_enabled / pen_rest_enabled / gesture_enabled 定义在下面，这里是函数体，
+# 真正调用发生在守护启动之后（那时所有函数都已定义），所以顺序没问题。
+need_app() {
+    pen_wake_enabled      && return 0
+    capsule_enabled       && return 0
+    brush_enabled         && return 0
+    aon_enabled           && return 0
+    pen_rest_enabled      && return 0
+    settings_sync_enabled && return 0
+    screen_enabled        && return 0
+    return 1
+}
+
 [ -f "$CFG" ] && . "$CFG" 2>/dev/null
 
 refresh_seconds() {
@@ -244,10 +327,10 @@ refresh_seconds() {
     case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
 }
 
-# ⑤ 是否要弹胶囊：config CAPSULE=1（默认）且没有 disable-capsule 标记
+# ⑤ 是否要弹胶囊：config CAPSULE（分组 B，默认 0）且没有 disable-capsule 标记
 capsule_enabled() {
     [ -e "$DISABLE_CAPSULE" ] && return 1
-    case "$CAPSULE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+    cfg_on "$CAPSULE"
 }
 
 # ⑥ 手势桥 penring：把联想笔的捏/双击/上滑/下滑/笔尾桥成小米焦点触控笔的键。
@@ -653,7 +736,7 @@ pen_rest_on()      { [ "$(cat "$PEN_REST_FILE" 2>/dev/null)" = "1" ]; }
 pen_rest_mark()    { echo "$1" > "$PEN_REST_FILE" 2>/dev/null; }
 pen_rest_enabled() {
     [ -e "$MODDIR/disable-rest" ] && return 1
-    case "$PEN_REST" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
+    cfg_on "$PEN_REST"
 }
 # 休眠档开着时不允许别的动作误判：显式提供"现在该不该静默"
 pen_quiet() { pen_rest_enabled && pen_rest_on; }
@@ -719,6 +802,32 @@ install_apk() {
     pm grant --user 0 $PKG android.permission.BLUETOOTH_SCAN >/dev/null 2>&1
 }
 
+# APK 装没装（pm path 对不存在的包输出空）
+app_installed() { [ -n "$(pm path $PKG 2>/dev/null)" ]; }
+
+# 分组 B（需要 App 的功能）全关 → 把 APK 卸掉，不留残包。
+# WebUI 里关掉最后一个依赖项、或 --apksync 判定"不再需要"时会走到这里。
+# 注意：卸载后 LSPosed 作用域列表里会留一条失效条目，需要你在 LSPosed 里手动清掉。
+uninstall_apk() {
+    app_installed || return 0
+    if pm uninstall --user 0 $PKG >/dev/null 2>&1; then
+        rm -f "$MODDIR/.apk.sha" 2>/dev/null
+        log "TbFix.apk 已卸载（分组 B 七项全关，没有任何功能需要它）"
+    else
+        log "ERROR apk uninstall failed"
+    fi
+}
+
+# 按 need_app() 把 APK 状态对齐一次：需要就装、不需要就卸。
+# 开机（--monitor）与 WebUI 切开关（--apksync）都走这一条路径，行为一致。
+sync_apk() {
+    if need_app; then
+        install_apk
+    else
+        uninstall_apk
+    fi
+}
+
 send() {
     if am broadcast --user 0 -n "$RCV" -a "$1" >/dev/null 2>&1; then
         log "$2 sent"
@@ -736,6 +845,20 @@ send_extra() {
         log "$what sent ($*) dispatch=$((t1-t0))ms"
     else
         log "ERROR $what failed ($*)"
+    fi
+}
+
+# ① 唤醒 与 ⑥ 手势位同步共用 App 的同一条广播（A_WAKE）。两者要分开控制：
+#   开了 ①            → wake=1，真的发 {5,5} 把笔叫起来
+#   只开 ⑥ 没开 ①     → wake=0，只把笔端触控膜功能位/轻捏力度写进去，不吵醒它
+#   两个都关          → 什么都不发
+# （App 侧对 wake extra 的处理与 --syncsettings 那条路径一致，见 WakeReceiver。）
+send_wake() {
+    local what="$1"
+    if pen_wake_enabled; then
+        send_extra "$A_WAKE" "$what" --ei wake 1 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
+    elif gesture_enabled; then
+        send_extra "$A_WAKE" "$what/no-wake" --ei wake 0 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
     fi
 }
 
@@ -898,8 +1021,7 @@ case "$1" in
     #   A) 轮询笔记/小米创作的 creation_shpref.xml 里 current_brush（笔刷切换）
     #   B) 读笔触控节点，BTN_TOOL_RUBBER 按下=笔尾（橡皮端）靠近，抬起=回笔尖
     #   状态写在 $BRUSH_STATE："<波形id> <包名>"；退出应用后由 A 负责停波形。
-    [ -e "$DISABLE_BRUSH" ] && exit 0
-    case "$BRUSH" in 0|false|no|off) exit 0 ;; esac
+    brush_enabled || exit 0
     log "brushwatch up (apps=$BRUSH_APPS level=$BRUSH_LEVEL map=$BRUSH_MAP eraser=$BRUSH_ERASER)"
     : > "$BRUSH_STATE"
     : > "$BRUSH_BASE"
@@ -911,39 +1033,105 @@ case "$1" in
     exit 0
     ;;
 
+--sepolicy)
+    # ⑭ 开发者选项修复：把 sepolicy.rule 重新应用一遍（免重启）：sh service.sh --sepolicy
+    # 用途：开机脚本被跳过、或刷了新策略之后 denial 又回来时，手动救一次。
+    # 原理：ksud sepolicy apply 把规则注入**运行时策略**并触发一次策略重载，会刷新内核 AVC 与
+    #       init 用户态 libselinux 里的陈旧拒绝缓存 —— 立即生效、无需重启；
+    #       代价是只在内存里，重启后由 post-fs-data.sh 与 setup 自动重放。
+    # 注意：它按传入文件重新推导、不跨调用累积，所以传的是**完整**的 sepolicy.rule。
+    KSUD=""
+    for c in /data/adb/ksud /data/adb/ksu/bin/ksud; do
+        if [ -x "$c" ]; then KSUD="$c"; break; fi
+    done
+    if [ -z "$KSUD" ]; then
+        echo "找不到 ksud（试过 /data/adb/ksud 与 /data/adb/ksu/bin/ksud）" >&2
+        exit 1
+    fi
+    echo "enforce=$(getenforce)  ksud=$KSUD"
+    "$KSUD" sepolicy apply "$MODDIR/sepolicy.rule"
+    rc=$?
+    echo "sepolicy apply rc=$rc"
+    # 顺带报一下这两个属性的当前值，便于确认写入路径是通的
+    echo "logd.logpersistd=[$(getprop logd.logpersistd)]  persist.logd.logpersistd.buffer=[$(getprop persist.logd.logpersistd.buffer)]"
+    exit $rc
+    ;;
+
+--appstat)
+    # WebUI 查 APK 状态（比 --json 轻）：sh service.sh --appstat
+    #   installed=1/0  那个 APK 在不在
+    #   needed=1/0     分组 B 里有没有功能需要它（= need_app()）
+    if app_installed; then echo "installed=1"; else echo "installed=0"; fi
+    if need_app; then echo "needed=1"; else echo "needed=0"; fi
+    exit 0
+    ;;
+
+--apksync)
+    # 按 need_app() 把 APK 状态对齐一次。WebUI 切换分组 B 的开关后立刻调用，
+    # 不用等守护重启那 ~20 秒；开机路径走 --monitor 里的 sync_apk()，两者同一个判据。
+    sync_apk
+    if app_installed; then echo "installed=1"; else echo "installed=0"; fi
+    exit 0
+    ;;
+
 --json)
-    # WebUI 读"生效值"（含默认与 config 覆盖）：sh service.sh --json
-    printf '{"BRUSH":%s,"BRUSH_ERASER":%s,"BRUSH_DEFAULT_WAVE":%s,"BRUSH_AI_WAVE":%s,' \
-        "${BRUSH:-1}" "${BRUSH_ERASER:-35}" "${BRUSH_DEFAULT_WAVE:-36}" "${BRUSH_AI_WAVE:-36}"
-    printf '"BRUSH_LASSO_WAVE":%s,' "${BRUSH_LASSO_WAVE:-36}"
-    printf '"GESTURE":%s,"GESTURE_RING":%s,"GESTURE_DOUBLE":%s,"GESTURE_SLIDE_UP":%s,' \
-        "${GESTURE:-1}" "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
+    # WebUI 读"生效值"（含默认、config 覆盖与 disable-* 标记）：sh service.sh --json
+    # 布尔项一律走 *_enabled()，这样标记文件造成的"强制关"在界面上也看得见。
+    _b() { if "$1"; then echo 1; else echo 0; fi; }
+    printf '{"FIX_POWERKEEPER":%s,"FIX_BPFMON":%s,"FIX_TELEPHONY":%s,' \
+        "$(_b fix_powerkeeper_enabled)" "$(_b fix_bpfmon_enabled)" "$(_b fix_telephony_enabled)"
+    printf '"GESTURE":%s,"PEN_WAKE":%s,"CAPSULE":%s,"BRUSH":%s,"AON":%s,' \
+        "$(_b gesture_enabled)" "$(_b pen_wake_enabled)" "$(_b capsule_enabled)" \
+        "$(_b brush_enabled)" "$(_b aon_enabled)"
+    printf '"PEN_REST":%s,"SETTINGS_SYNC":%s,"SCREEN_CMD":%s,"NEED_APP":%s,' \
+        "$(_b pen_rest_enabled)" "$(_b settings_sync_enabled)" "$(_b screen_enabled)" "$(_b need_app)"
+    printf '"BRUSH_ERASER":%s,"BRUSH_DEFAULT_WAVE":%s,"BRUSH_AI_WAVE":%s,"BRUSH_LASSO_WAVE":%s,' \
+        "${BRUSH_ERASER:-35}" "${BRUSH_DEFAULT_WAVE:-36}" "${BRUSH_AI_WAVE:-36}" "${BRUSH_LASSO_WAVE:-36}"
+    printf '"GESTURE_RING":%s,"GESTURE_DOUBLE":%s,"GESTURE_SLIDE_UP":%s,' \
+        "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
     printf '"GESTURE_SLIDE_DOWN":%s,"GESTURE_TAIL":%s,' "${GESTURE_SLIDE_DOWN:-197}" "${GESTURE_TAIL:-92}"
-    printf '"SCREEN_CMD":%s,"SCREEN_SWAP":%s,' "${SCREEN_CMD:-1}" "${SCREEN_SWAP:-0}"
-    printf '"CAPSULE":%s,"PEN_REST":%s,"SETTINGS_SYNC":%s,' "${CAPSULE:-1}" "${PEN_REST:-1}" "${SETTINGS_SYNC:-1}"
+    printf '"SCREEN_SWAP":%s,"CAPSULE_DIRECT":%s,"CAPSULE_GATT":%s,"CAPSULE_FAST":%s,' \
+        "${SCREEN_SWAP:-0}" "$(_b capsule_direct)" "$(_b capsule_gatt)" "$(_b capsule_fast)"
+    printf '"REFRESH_SECONDS":%s,"POLL_MS":%s,' "$(refresh_seconds)" "${POLL_MS:-200}"
+    # 存在哪些 disable-* 标记文件（有标记的功能会被强制关，界面上要能提示）
+    _mk=""
+    for _m in disable disable-powerkeeper disable-bpfmon disable-telephony disable-capsule \
+              disable-gesture disable-brush disable-aon disable-aonlib disable-rest \
+              disable-screen disable-rompen; do
+        [ -e "$MODDIR/$_m" ] && _mk="$_mk$_m "
+    done
+    printf '"MARKERS":"%s",' "${_mk% }"
     printf '"BRUSH_MAP":"%s"}\n' "${BRUSH_MAP:-}"
     exit 0
     ;;
 
 --set)
-    # WebUI 写配置：sh service.sh --set KEY VALUE
-    # 立即改 config 那一行并返回（页面不能被卡住）；重启交给一个 detach 出去的小脚本去做。
+    # WebUI 写配置：sh service.sh --set KEY VALUE [KEY VALUE ...]
+    # **支持一次写多项** —— WebUI 里每个分类的"总开关"要一次改好几项，
+    # 逐项调用会触发多次守护重启（每次 ~20 秒），必须合并成一次。
+    # 立即改 config 并返回（页面不能被卡住）；重启交给一个 detach 出去的小脚本去做。
     # 注意：绝不能像以前那样"杀掉所有含模块路径的进程" —— 会把正在跑这条命令的 shell 也杀掉，
     # ksu.exec 永远不返回，WebUI 就卡在那次调用上（实测）。
-    _k="$2"; _v="$3"
-    case "$_k" in
-        ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
-    esac
-    if grep -q "^$_k=" "$CFG" 2>/dev/null; then
-        _tmp="$CFG.tmp.$$"
-        sed "s|^$_k=.*|$_k=$_v|" "$CFG" > "$_tmp" && mv -f "$_tmp" "$CFG"
-    else
-        echo "$_k=$_v" >> "$CFG"
-    fi
-    log "config: $_k=$_v（守护稍后重启生效）"
+    shift
+    _n=0
+    while [ $# -ge 2 ]; do
+        _k="$1"; _v="$2"; shift 2
+        case "$_k" in
+            ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
+        esac
+        if grep -q "^$_k=" "$CFG" 2>/dev/null; then
+            _tmp="$CFG.tmp.$$"
+            sed "s|^$_k=.*|$_k=$_v|" "$CFG" > "$_tmp" && mv -f "$_tmp" "$CFG"
+        else
+            echo "$_k=$_v" >> "$CFG"
+        fi
+        log "config: $_k=$_v（守护稍后重启生效）"
+        _n=$((_n+1))
+    done
+    [ "$_n" -gt 0 ] || { echo "usage: --set KEY VALUE [KEY VALUE ...]" >&2; exit 2; }
     # detach 出去重启（只杀本模块守护；脚本单独成文件，避免把自己也匹配进去）
     MODDIR="$MODDIR" setsid /system/bin/sh "$MODDIR/restart.sh" >/dev/null 2>&1 </dev/null &
-    echo "ok"
+    echo "ok $_n"
     exit 0
 
     ;;
@@ -997,8 +1185,12 @@ case "$1" in
     #    MiuiStylusShortcutManager 当成"截图键/速记键"乱触发 —— 和我们 penring 抢着注入。
     #    这里把它停掉（init 的 oneshot 服务，ctl.stop 之后不会自己回来；真回来就再停）。
     [ -e "$DISABLE_ROMPEN" ] && exit 0
+    gesture_enabled || exit 0
     was=0
     while [ ! -e "$DISABLE_ROMPEN" ]; do
+        # ⑥ 在 WebUI 里被关掉（config 改了 → 守护重启）时自己退出去，
+        # 把 ROM 原本的笔桥还回去（ctl.stop 只作用于本次开机，下次开机它就自己回来了）。
+        gesture_enabled || { log "⑥ 手势桥已关闭，停止看护 ROM 笔桥"; exit 0; }
         if pidof penbridge_hyperos >/dev/null 2>&1; then
             setprop ctl.stop lwky_pen 2>/dev/null
             sleep 1
@@ -1023,6 +1215,7 @@ case "$1" in
     # 但实测本机它会被别的东西重新拉起来（观察到一次：开机很久之后又出现一个
     # hyper_bpfloader --monitor-mode），所以只停一次不够，要一直看护。
     [ -e "$DISABLE_BPFMON" ] && exit 0
+    fix_bpfmon_enabled || exit 0
     i=0
     while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
         sleep 2
@@ -1032,6 +1225,8 @@ case "$1" in
     log "bpf monitor watchdog up (will keep dynbpfloader down)"
     was=0
     while [ ! -e "$DISABLE_BPFMON" ]; do
+        # ③ 在 WebUI 里被关掉时看护自己退出（它是个常驻循环，不会随守护重启一起消失）
+        fix_bpfmon_enabled || { log "③ BPF 监视器拆弹已关闭，看护退出"; exit 0; }
         if pidof hyper_bpfloader >/dev/null 2>&1; then
             setprop ctl.stop dynbpfloader 2>/dev/null
             sleep 2
@@ -1053,6 +1248,7 @@ case "$1" in
     # 见文件头 ④。这是一次性动作，不需要常驻看护：停用状态本身写在 packages.xml 里
     # 跨重启保持，这里只是每次开机复查一遍，防止 ROM 更新/包重装把状态冲掉。
     [ -e "$DISABLE_TELEPHONY" ] && exit 0
+    fix_telephony_enabled || exit 0
 
     i=0
     while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
@@ -1093,7 +1289,9 @@ case "$1" in
     done
     sleep 10
 
-    install_apk
+    # 分组 B（需要 App 的功能）里任意一项开着 → 装 bin/TbFix.apk；七项全关 → 把它卸掉。
+    # 默认七项全是 0，所以**默认不会安装任何 APK**；只有你在 WebUI 里手动开一项才会装。
+    sync_apk
 
     # ⑧ AON：mifaced（HAL）由 init 在 sys.boot_completed=1 时才起，而 com.xiaomi.aon 若在这之前
     # 已经跑起来，会把 mIAlwaysOn 缓存成 null —— 之后恒返回"无人注视"（实测，必须清一次进程）。
@@ -1101,7 +1299,7 @@ case "$1" in
     # stopped 状态，语义更重）。每个开机只做一次（标记文件，post-fs-data 清）。
     # ⑧c 设置页可见性由 TbFixHook 在设置进程里放行（见 hookAonSettingsBool），无需在这里做事。
 
-    if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/aon.restarted" ] \
+    if aon_enabled && [ ! -e "$MODDIR/aon.restarted" ] \
             && [ -x /odm/bin/hw/mifaced ] && pidof com.xiaomi.aon >/dev/null 2>&1; then
         kill -9 "$(pidof com.xiaomi.aon)" 2>/dev/null
         : > "$MODDIR/aon.restarted"
@@ -1135,9 +1333,10 @@ case "$1" in
     fi
 
     if [ "$last_att" = 0 ]; then
-        # 开机时笔不在线圈上：唤醒它，并同步一次 {8,6,mask} 手势位（见 detach 处说明）
+        # 开机时笔不在线圈上：唤醒它（①），并同步一次 {8,6,mask} 手势位（⑥ 也需要这一步）。
+        # ① 关掉而 ⑥ 开着时 send_wake 会带 wake=0 —— 只写功能位，不叫醒笔。
         pen_sync_read
-        send_extra "$A_WAKE" "startup-wake" --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
+        send_wake "startup-wake"
     fi
 
     while [ ! -e "$DISABLE" ]; do
@@ -1154,7 +1353,7 @@ case "$1" in
             [ "$lvl_win" -gt 0 ] && lvl_win=$((lvl_win-1))
 
             # ⑬ 屏幕亮/灭 → 告诉笔（debug.tracing.screen_state：1=灭 2=亮）
-            if case "$SCREEN_CMD" in 0|false|no|off) false ;; *) true ;; esac; then
+            if screen_enabled; then
                 sc=$(getprop debug.tracing.screen_state 2>/dev/null)
                 case "$sc" in 1|2) ;;
                     *) sc="" ;;
@@ -1256,7 +1455,7 @@ case "$1" in
             # 笔重启或睡死会把这位清零 → 手势全部消失；联想原厂每次连接都重发，这里替他发。
             # 只要唤醒不改位就传 --ei touchfilm -1。
             pen_sync_read
-            send_extra "$A_WAKE" "detach-wake" --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
+            send_wake "detach-wake"
             tick=0
             refresh_at=0
             refresh_deadline=0
@@ -1310,7 +1509,8 @@ case "$1" in
         fi
 
         if [ "$att" = 0 ] && [ "$REFRESH" -gt 0 ] && [ "$tick" -ge "$REFRESH" ]; then
-            send "$A_WAKE" "refresh-wake"
+            # ① 的"安全网"补唤醒：只有 ① 开着才有意义（这条不带 touchfilm，不负责同步手势位）
+            pen_wake_enabled && send "$A_WAKE" "refresh-wake"
             tick=0
         fi
 
@@ -1360,17 +1560,30 @@ case "$1" in
     rm -rf "$BRUSH_LOCK" 2>/dev/null
     rm -f "$MODDIR/brush.pid" "$PENRING_PID" 2>/dev/null
 
-    # ③ BPF 监视器拆弹、④ 死电话栈、① 唤醒守护三者各自独立，互不依赖。
-    if [ ! -e "$DISABLE_BPFMON" ]; then
+    # ⑭ 开发者选项：开机补一次 sepolicy（post-fs-data 已经打过一次）。
+    # 为什么还要补：post-fs-data 之后到 framework 起完这段时间，Settings 可能已经触发过一次被拒的
+    # 属性写入，init 用户态 AVC 会把该拒绝缓存住 —— 再应用一次会触发策略重载，把缓存刷掉。
+    # 同步执行（不是 setsid &）：要在下面拉起看护之前确定生效。
+    # 本项没有 disable 标记：它是崩溃修复，不是可选功能。
+    /system/bin/sh "$0" --sepolicy >> "$LOG" 2>&1
+
+    # ③ BPF 监视器拆弹、④ 死电话栈、⑥ 停 ROM 笔桥三者各自独立，互不依赖。
+    # 判据走 *_enabled()：config 键（WebUI 可改）与 disable-* 标记文件都算。
+    if fix_bpfmon_enabled; then
         setsid /system/bin/sh "$0" --stopbpfmon >/dev/null 2>&1 </dev/null &
+    else
+        log "③ BPF 监视器拆弹已关闭（FIX_BPFMON=0）"
     fi
 
-    if [ ! -e "$DISABLE_TELEPHONY" ]; then
+    if fix_telephony_enabled; then
         setsid /system/bin/sh "$0" --fixtelephony >/dev/null 2>&1 </dev/null &
+    else
+        log "④ 死电话栈修复已关闭（FIX_TELEPHONY=0）"
     fi
 
-    # ⑥ 把移植 ROM 自带的旧笔桥（lwky_pen / penbridge_hyperos）停掉，避免和 penring 抢注入
-    if [ ! -e "$DISABLE_ROMPEN" ]; then
+    # ⑥ 把移植 ROM 自带的旧笔桥（lwky_pen / penbridge_hyperos）停掉，避免和 penring 抢注入。
+    # 手势桥关掉时就不停它了 —— 等于把 ROM 原本的行为还回去。
+    if gesture_enabled && [ ! -e "$DISABLE_ROMPEN" ]; then
         setsid /system/bin/sh "$0" --stoprompen >/dev/null 2>&1 </dev/null &
     fi
 

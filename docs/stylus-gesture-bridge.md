@@ -106,7 +106,8 @@ settings put system stylus_pinch_pressure_adjust 4   → {8,5,5}     (力度 5)
 settings put system stylus_pinch_pressure_adjust 1   → {8,5,2}
 ```
 
-开关/力度都走 `bin/penring` 的存在性做前置判断；关掉这个行为：`config` 里 `SETTINGS_SYNC=0`。
+开关/力度都走 `bin/penring` 的存在性做前置判断；关掉这个行为：`config` 里 `SETTINGS_SYNC=0`
+（**v3.7 起默认就是 0** —— ⑫ 属于"需要 App"那一组）。
 手动跑一次：`sh /data/adb/modules/tb378fc_hyperos_fix/service.sh --syncsettings`，
 结果看 `wake.log` 的 `settings->pen mask=.. squeeze=..` 一行。
 
@@ -324,7 +325,8 @@ App 侧（`PenBle.restMode`）收到广播后**立刻断掉"留给下一条手�
 但笔都躺在平板上充电了，留着它只会让笔的控制器进不了最深那档低功耗。之后有手势/波形时
 `quickHaptic` 会自然重连，用户无感。
 
-开关：`config` 里 `PEN_REST=0`，或标记文件 `disable-rest`。
+开关：`config` 里 `PEN_REST=0`，或标记文件 `disable-rest`（**v3.7 起默认就是 0** —— ⑨ 属于
+"需要 App"那一组）。
 
 ### 配置与排障
 

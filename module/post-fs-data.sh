@@ -37,6 +37,17 @@ TARGET=/system_ext/app/PowerKeeper/PowerKeeper.apk
 
 log_msg() { echo "$(date '+%F %T') [post-fs-data] $*" >> "$LOG"; }
 
+# 功能开关：与 service.sh 同一套 config 键（WebUI 里改）。这里只关心两个：
+#   FIX_POWERKEEPER  ② PowerKeeper 补丁
+#   AON              ⑧ / ⑧b 注视感知（含 HAL 补库）
+# 旧的 disable-powerkeeper / disable-aon / disable-aonlib 标记文件仍然有效（见下面各段）。
+CFG="$MODDIR/config"
+[ -f "$CFG" ] && . "$CFG" 2>/dev/null
+FIX_POWERKEEPER=${FIX_POWERKEEPER:-1}
+AON=${AON:-0}
+pk_enabled()  { case "$FIX_POWERKEEPER" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+aon_enabled() { case "$AON" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+
 # ---- 开机清锁。必须放在本脚本任何一处 exit 0 之前，否则可能被前面的分支跳过。----
 # service.sh 的 setup 靠 .monitor.lock/pid 判断"supervisor 是不是已经在跑"，判据是 kill -0。
 # 但 supervisor 不可能跨重启存活，这个 pid 文件开机时必然是上一轮的残留，而 pid 会被复用：
@@ -58,6 +69,8 @@ fi
 # 现在改成条件分支，脚本只有一个结尾 exit 0。
 if [ -e "$MODDIR/disable-powerkeeper" ]; then
     log_msg "PowerKeeper patch disabled by marker"
+elif ! pk_enabled; then
+    log_msg "② PowerKeeper 补丁已关闭（config FIX_POWERKEEPER=0）"
 elif [ ! -f "$PAYLOAD" ]; then
     log_msg "PowerKeeper payload missing"
 elif [ ! -f "$TARGET" ]; then
@@ -82,11 +95,11 @@ fi
 # → config_supported_aon_devices 取默认 false → PMS 不返回 com.xiaomi.aon
 # → AttentionManagerService 起不来 → "注视感知"被 removePreference（设置里没这一项）。
 # 这里在 post-fs-data（SystemServer 起来之前）把那份目录 bind mount 过去。
-# 关掉：建 marker 文件 disable-aon。
+# 关掉：config AON=0（默认），或建 marker 文件 disable-aon。
 AON_SRC=/product/etc/cust_features
 AON_WORK="$MODDIR/mi_ext/product/etc/cust_features"   # 可写的工作副本（/ 是 erofs 只读）
 AON_DST=/mi_ext/product/etc/cust_features
-if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
+if [ ! -e "$MODDIR/disable-aon" ] && aon_enabled && [ -d "$AON_SRC" ]; then
     mkdir -p "$AON_WORK" 2>/dev/null
     cp -a "$AON_SRC"/. "$AON_WORK"/ 2>/dev/null
     # 解析器可能只读 cust_features.xml（实测里面没有 config_supported_aon_devices，
@@ -105,6 +118,8 @@ if [ ! -e "$MODDIR/disable-aon" ] && [ -d "$AON_SRC" ]; then
     else
         log_msg "⑧ ERROR mi_ext cust_features 挂载失败"
     fi
+elif [ ! -e "$MODDIR/disable-aon" ] && ! aon_enabled; then
+    log_msg "⑧ AON 已关闭（config AON=0），跳过 mi_ext cust_features"
 fi
 
 # ⑧c「设置里让注视感知那一页出现」不再在这里做 —— 曾经用 tmpfs 盖 /product/overlay 挂 RRO，
@@ -114,9 +129,32 @@ fi
 
 # ------------------------------------------- ⑧b AON HAL：/odm/lib64 里补 libcamera2ndk.so
 # mifaced 起不来就没有 IAlwaysOn → AON app 拿不到 HAL → "注视感知"永远给不出结果。
-# 细节见 module/bin/aonlib.sh（幂等；可用 disable-aonlib 关掉）。同理不能 exit 0。
-if [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonlib" ]; then
+# 细节见 module/bin/aonlib.sh（幂等；可用 config AON=0 或 disable-aonlib 关掉）。同理不能 exit 0。
+if aon_enabled && [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonlib" ]; then
     MODDIR="$MODDIR" sh "$MODDIR/bin/aonlib.sh" 2>&1 | while read -r l; do log_msg "$l"; done
+fi
+
+# ------------------------------------------- ⑭ 开发者选项：显式再应用一次 sepolicy
+# 移植包的策略没给 system_app 授权写 logpersistd_logging_prop，「设置 → 开发者选项」在 Enforcing
+# 下必现闪退（细节见 sepolicy.rule 尾部注释与 docs/devopts-selinux-fix.md）。
+#
+# 规则已经写在 sepolicy.rule 里（KernelSU 开机会自动加载），但实测在 ReSukiSU 4.x late-load LKM 上
+# **纯声明式加载并不可靠** —— 出现过"删掉模块重启后原始 denial 又回来了"的情况。
+# 所以这里用 ksud 的运行时通道显式再应用一遍：它会触发一次策略重载，顺带刷新内核 AVC 与
+# init 用户态 libselinux 里的陈旧拒绝缓存。service.sh 的 setup 里还会补一次。
+#
+# 注意 1：本项**没有 disable 标记** —— 它是崩溃修复，不是可选功能。
+# 注意 2：ksud sepolicy apply 是"按传入文件重新推导并应用"，**不会跨调用累积**，
+#         所以这里必须传**完整**的 sepolicy.rule（含 ⑧b 的三条），不能只传 ⑭ 那两条。
+KSUD=""
+for c in /data/adb/ksud /data/adb/ksu/bin/ksud; do
+    if [ -x "$c" ]; then KSUD="$c"; break; fi
+done
+if [ -n "$KSUD" ]; then
+    "$KSUD" sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1
+    log_msg "⑭ sepolicy apply rc=$? ($KSUD)"
+else
+    log_msg "⑭ 找不到 ksud，跳过显式应用（规则仍由 KernelSU 声明式加载）"
 fi
 
 exit 0

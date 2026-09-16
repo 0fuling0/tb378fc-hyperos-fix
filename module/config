@@ -1,120 +1,156 @@
-# 唤醒 / 胶囊 策略配置
+# TB378FC HyperOS 修复 —— 运行配置
 #
-# REFRESH_SECONDS=0   只按吸附状态触发（默认）：
-#                       取下 -> 发唤醒命令
-#                       吸附 -> 弹原生电量胶囊（见 CAPSULE）
-#                     其余时间不打扰，笔按自己的节奏休眠
+# 全部开关都能在 KernelSU 管理器的 WebUI 里改（推荐）；也可以直接编辑本文件。
+# WebUI 改完会自动重启一次守护（约 20 秒）生效；直接改本文件则要重启模块或设备。
 #
-# REFRESH_SECONDS=120 额外安全网：未吸附期间每 120 秒补发一次唤醒。
-#                     适合"笔搁在桌上睡死了、你又不想吸附一下"的场景，
-#                     代价是笔在未吸附且平板闲置时会保持唤醒（耗笔的电）。
+# 三条规则：
+#   1) 只靠模块就能做的功能（系统修复、手势桥）默认开；
+#      需要那个 App 的功能默认关。
+#   2) **需要 App 的那一组里只要有一项为 1，开机就安装 bin/TbFix.apk；
+#      整组全为 0 就把它卸载掉。** 默认全为 0 → 默认不装任何 APK。
+#      手动对齐：sh service.sh --apksync      查状态：sh service.sh --appstat
+#   3) 每一项还都能用模块目录下的 disable-* 标记文件强制关掉，优先级高于本文件
+#      （WebUI 顶部会把存在的标记列出来）。
+#
+# 布尔键的写法：1/true/yes/on = 开，其它（0/false/no/off）= 关。
+
+
+# ============================================================ 一、系统修复
+# 移植包自身的问题，只靠模块（root + 内核/属性/包管理）就能修，不需要 App。默认全开。
+
+# ② 修补移植包改坏的 PowerKeeper 字节码（两处），恢复 MIUI 省电管理。
+#    post-fs-data.sh 消费本键；关掉后 com.miui.powerkeeper 开机即崩。
+FIX_POWERKEEPER=1
+
+# ③ 停掉 hyper_bpfloader（BPF 监视器）：避免它判定"系统损坏"去写 recovery 引导块。
+FIX_BPFMON=1
+
+# ④ 停掉三个死电话包（本机无 modem，它们每秒崩数百次）。
+FIX_TELEPHONY=1
+
+# ⑭ 开发者选项（SELinux）是崩溃修复，**没有开关**，永远生效：
+#    补 system_app → logpersistd_logging_prop 两条最小权限，
+#    否则 Enforcing 下打开「设置 → 开发者选项」必现闪退。
+#    免重启手动重应用：sh service.sh --sepolicy
+
+
+# ============================================================ 二、手写笔连接
+# 都需要 App（dev.tb378fc.fix）的 BLE 栈。默认全关。
+
+# ① 手写笔休眠唤醒：磁吸取下时发 {5,5} 把睡死的笔叫起来。
+PEN_WAKE=0
+
+# ⑤ 吸附时弹 HyperOS 原生电量胶囊。
+CAPSULE=0
+#    ⑤-1 抢跑：边沿一到就先用**上一次的**线圈电量弹（~0.2s 出胶囊），1~2 秒后刷新。
+#         0 = 不抢跑，等线圈报出本次的新值再弹（慢 1~2 秒，但第一眼就是真值）。
+CAPSULE_FAST=0
+#    ⑤-2 守护直发：跳过 App 一跳，自己直接发原生 STYLUS_STATE_SOC（省 0.3~1s）。
+#         0 = 只发 ATTACH 给 App，由 App 组装并弹（老路径）。
+CAPSULE_DIRECT=1
+#    ⑤-3 直发之后再让 App 用 GATT 读一次真电量（0x180F/0x2A19），不同才补弹一条校正。
+#         想要"一次就完、不要第二次弹窗"可以设 0。
+CAPSULE_GATT=1
+#    ⑤-4 未吸附期间的补唤醒周期（秒）。0 = 只按吸附状态触发（默认，最省笔的电）。
+#         120 = 未吸附时每 120 秒补发一次唤醒（适合"笔搁在桌上睡死了"的场景）。
 REFRESH_SECONDS=0
-
-# CAPSULE=1   吸附时弹 HyperOS 原生电量胶囊（默认开）。
-#             也可以建一个 disable-capsule 标记文件单独关掉（唤醒照常）。
-#             参数语义见 docs/native-stylus-capsule.md。
-CAPSULE=1
-
-# POLL_MS     吸附检测的轮询间隔（毫秒）。检测是轮询 /sys/class/power_supply/wls_tx/attached，
-#             这个值直接决定"吸上去多久才弹"：
-#               200 = 默认（最坏 0.2s 发现，实测总延迟 ~0.5s）
-#               500 / 1000 = 更省电、更迟钝
-#               100 / 50  = 更灵敏（轮询用 shell 内建 read，代价很小）
+#    ⑤-5 吸附检测的轮询间隔（毫秒）。直接决定"吸上去多久才弹"：
+#         200 = 默认（最坏 0.2s 发现，实测总延迟 ~0.5s）
+#         500/1000 = 更省电更迟钝；100/50 = 更灵敏
 POLL_MS=200
 
-# CAPSULE_DIRECT=1  守护**自己**直接发原生 STYLUS_STATE_SOC 广播（默认）。
-#                   少一跳：不用先叫醒 PenBridge 应用进程，实测能省 0.3~1s。
-#                   0 = 只发 ATTACH 给 PenBridge，由应用组装并弹（老路径）
-CAPSULE_DIRECT=1
+# ⑨ 笔休眠档：吸在平板上且充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
+#    并让 App 断掉"留给下一条手势"的缓存 BLE 连接，让笔真正睡下去。每天夜里都吸着时最有用。
+PEN_REST=0
+#    ⑨-1 主判据：charge_state（线圈报的"是否正在给笔充电"）由 1 变 0 并持续这么多秒
+#         才认定"充完了"（刚吸上去那几秒 chg 也是 0 —— 握手没起来，所以必须"先见到过 chg=1"）。
+REST_IDLE=20
+#    ⑨-2 兜底判据：电量 ≥ 此值且吸附 → 进档（有的笔端在 100% 前就停充，或 chg 读不到时用）。
+REST_FULL=99
+#    ⑨-3 休眠期间的线圈电量/充电状态轮询间隔（秒）。
+REST_POLL=60
+#    出档：取下，或线圈重新开始充电（chg=1）。
+#    注意不能用"电量低于阈值"出档 —— 会和"停充进档"打架。
 
-# CAPSULE_GATT=1    直发之后再让 PenBridge 用 GATT 读一次真电量（0x180F/0x2A19），
-#                   与已显示的数字**不同**才补弹一条校正。读到相同值不会重复弹。
-#                   想要"一次就完、不要第二次弹窗"可以设 0（那就只信任线圈电量）。
-CAPSULE_GATT=1
+# ⑬ 屏幕亮/灭时告诉笔（ZUX buildScreenOnOffCmd：{5,2}=亮、{5,1}=灭）。
+SCREEN_CMD=0
+#    ⑬-1 亮灭互换：实测发反了就打开（比如亮时笔反而睡）。
+SCREEN_SWAP=0
 
-# CAPSULE_FAST=1     边沿一到就用上一次的线圈电量先弹（~0.2s 出胶囊），1~2 秒后拿新值刷新。
-#                   0 = 不抢跑，等线圈报出本次的新值再弹（慢 1~2 秒，但第一眼就是真值）。
-CAPSULE_FAST=0
 
-# TOUCHFILM   笔端"触控膜功能位" `{8,6,mask}`：笔上报哪些手势的总开关。
-#             位（ZUX buildTouchfilmEnable，见 docs/zuxos-pen-protocol.md §2.1）：
-#               0x01 双击 / 0x02 三击 / 0x04 上滑 / 0x08 下滑 / 0x10 捏合 / 0x20 笔尾
-#             63 = 0x3F 全开（默认）：开机 + 每次取下笔都补发一次。
-#             笔一旦重启/睡死/被别的程序写成 0，双击/上滑/下滑/捏合就再也不上报
-#             （笔尖写字不受影响）；联想原厂是每次连接都重发一次全量 mask。
-#             -1 = 只唤醒，不动手势位。
-TOUCHFILM=63
+# ============================================================ 三、手势与书写
+# ⑥ 只靠模块；⑦ 和 ⑫ 需要 App（其中画布状态、即时下发还要 LSPosed 钩子）。
 
-# GESTURE     手势桥（bin/penring）开关：1 = 常驻（默认），0 = 不起。
-#             也可以建一个 disable-gesture 标记文件。详见 docs/stylus-gesture-bridge.md。
+# ⑥ 手势桥：起 penring（bin/penring），把联想笔的捏/双击/上滑/下滑/笔尾桥成
+#    "小米触控膜笔"（type-8 虚拟笔 + 自定义 kl），并停掉 ROM 自带的旧笔桥。
+#    **注意**：笔要"上报"手势，得先有人用 BLE 把笔端触控膜功能位 {8,6,mask} 写进去 ——
+#    那一步只有 App 能做。所以 ⑥ 虽然不需要 App 常驻，但至少要被"二、手写笔连接"里
+#    的某一项开过一次（笔会记住这个位，直到它重启/睡死）。
 GESTURE=1
 
-# 下面这几项是"联想笔的手势 → 注入哪个 Android 键码"，改完重启模块生效，-1 = 关掉这条。
-#   194 轻捏（HyperOS 快捷环；系统级，任何 App 都弹）
-#   195 双击（MIUI 双击功能；只有小米创作 / 自己开过触控膜的 App 有反应）
-#   196 上滑 / 197 下滑（MIUI 上滑下滑；白名单 App 会被 MIUI 转成 92/93 翻页）
-#    92 截图键 / 93 速记键（"按住这个键 + 点屏幕"= 截图标注 / 灵感速记，系统级）
-# 想要"任何 App 里上滑下滑都翻页"，把 GESTURE_SLIDE_UP/DOWN 改成 92/93
-# （那就等于直接发 PAGE_UP/PAGE_DOWN，代价是 380ms 内会被 MIUI 当成截图/速记键待命）。
+# ⑦ 笔刷触感：读笔记/小米创作的当前笔刷，给笔发一次 CON 波形（笔自己就持续按这个手感振）。
+#    只有 LSPosed hook 报 canvas=1（编辑器 Activity 且无弹窗）时才发波形。
+BRUSH=0
+#    ⑦-1 跟随哪些 App 的笔刷。
+BRUSH_APPS="com.miui.notes com.miui.creation"
+#    ⑦-2 波形强度 / 摩擦感（笔端参数，一般不用改）。
+BRUSH_LEVEL=3
+BRUSH_FRICTION=1
+#    ⑦-3 current_brush 编号 → CON 波形（实测：1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔）。
+BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
+#    ⑦-4 工具栏工具值（select_state_save）实测：8 = AI 笔 / 6 = 框选笔 / 7 = 橡皮。
+#         这三类都不改 current_brush（还停在上一支真笔刷上），所以判定时优先看 select_state_save。
+BRUSH_AI_STATES="8"
+BRUSH_AI_WAVE=36
+BRUSH_LASSO_STATES="6"
+BRUSH_LASSO_WAVE=36
+#    ⑦-5 工具状态取这些值时也算橡皮（UI 里选橡皮时 current_brush 不变）。
+BRUSH_ERASER_STATES="7"
+#    ⑦-6 笔尾（橡皮端）靠近时用的波形。
+BRUSH_ERASER=35
+#    ⑦-7 认不出的编号统一用这个波形。
+BRUSH_DEFAULT_WAVE=36
+#    ⑦-8 退出应用/离开画布后自动停波形。
+BRUSH_EXIT_CHECK=1
+#    ⑦-9 读笔刷状态用哪些 prefs 键。
+BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
+
+# ⑫ 设置 → 笔 下发：把「设置 → 手写笔」里的双击开关/轻捏开关/轻捏力度路由给笔。
+#     双击开关  -> {8,6,mask} bit0
+#     轻捏开关  -> {8,6,mask} bit4
+#     轻捏力度  -> {8,5,level}（设置里 0..4 → 笔端 1..5）
+#    MIUI 自己那份设置只对它自家笔有效（丢给自己的 BLE 服务），联想笔听不懂，
+#    所以由守护每 2 秒核对一次、变了就发等价帧；LSPosed 钩子在时是几十毫秒的即时下发。
+SETTINGS_SYNC=0
+
+#    ⑥ 手势 → Android 键码映射（改完重启模块生效，-1 = 关掉这一条）：
+#      194 轻捏（HyperOS 快捷环；系统级，任何 App 都弹）
+#      195 双击（MIUI 双击功能；只有小米创作 / 自己开过触控膜的 App 有反应）
+#      196 上滑 / 197 下滑（MIUI 上滑下滑；白名单 App 会被 MIUI 转成 92/93 翻页）
+#       92 截图键 / 93 速记键（"按住这个键 + 点屏幕"= 截图标注 / 灵感速记，系统级）
+#    想要"任何 App 里上滑下滑都翻页"，把 GESTURE_SLIDE_UP/DOWN 改成 92/93
+#    （那就等于直接发 PAGE_UP/PAGE_DOWN，代价是 380ms 内会被 MIUI 当成截图/速记键待命）。
 GESTURE_RING=194
 GESTURE_DOUBLE=195
 GESTURE_SLIDE_UP=196
 GESTURE_SLIDE_DOWN=197
-# 笔尾那个按键：92 = 截图键（默认），93 = 速记键，-1 = 不管
+#    笔尾那个按键：92 = 截图键（默认），93 = 速记键，-1 = 不管。
 GESTURE_TAIL=92
 
-# SETTINGS_SYNC=1  把"设置 → 手写笔"里改的东西实时路由给笔（默认）：
-#                   双击开关  -> {8,6,mask} bit0
-#                   轻捏开关  -> {8,6,mask} bit4
-#                   轻捏力度  -> {8,5,level}（设置里 0..4 → 笔端 1..5）
-#                  MIUI 自己那份设置只对它自家笔有效（丢给自己的 BLE 服务），
-#                  联想笔听不懂，所以由守护每 2 秒核对一次、变了就发等价帧。
-#                  0 = 只按上面的固定映射下发，不跟随设置。
-SETTINGS_SYNC=1
-
-# ---------------------------------------------------------------- ⑦ 笔刷触感（跟随 App 的笔刷）
-# 读笔记/小米创作的 current_brush（root 可读的 prefs），切一次发一次 CON 波形；
-# 笔尾（BTN_TOOL_RUBBER）靠近发 BRUSH_ERASER、离开恢复当前笔刷；
-# 只有 LSPosed hook 报 canvas=1（编辑器 Activity 且无弹窗）时才发波形。
-BRUSH=1
-BRUSH_APPS="com.miui.notes com.miui.creation"
-BRUSH_LEVEL=3
-BRUSH_FRICTION=1
-# current_brush 编号 -> CON 波形（实测：1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔）
-# 波形：32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 无音效版
-BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
-# 工具栏工具值（select_state_save）实测：8 = AI 笔 / 6 = 框选笔 / 7 = 橡皮
-# 这三类都不改 current_brush（还停在上一支真笔刷上），所以判定时优先看 select_state_save
-BRUSH_AI_STATES="8"
-BRUSH_AI_WAVE=36
-# 框选笔：同样不改 current_brush，用 select_state_save=6 标识
-BRUSH_LASSO_STATES="6"
-BRUSH_LASSO_WAVE=36
-# 认不出的编号统一用这个波形
-BRUSH_DEFAULT_WAVE=36
-# 笔尾（橡皮端）靠近时用的波形
-BRUSH_ERASER=35
-# 工具状态 select_state_save 取这些值时也算橡皮（UI 里选橡皮时 current_brush 不变）
-BRUSH_ERASER_STATES="7"
-BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
-# 退出应用/离开画布后自动停波形
-BRUSH_EXIT_CHECK=1
-
-# ⑨ 休眠档：吸附在平板上且已充满 → 停掉一切对笔的主动动作（唤醒/胶囊/GATT 校正/波形），
-#    并让 App 断掉"留给下一条手势"的缓存 BLE 连接，让笔真正睡下去（不再被每几秒吵醒）。
-#    取下、或电量掉到 REST_RESUME 以下 → 立刻恢复。每天夜里都吸在平板上时最有用。
-PEN_REST=1
-# 主判据：charge_state（线圈驱动报的"是否正在给笔充电"）由 1 变 0 并持续 REST_IDLE 秒 → 充完了
-#   （刚吸上去那几秒 chg 也是 0 —— 握手没起来，所以必须"先见到过 chg=1"才算数）
-REST_IDLE=20
-# 兜底判据：电量 ≥ REST_FULL（有的笔端在 100% 前就停充，或 chg 读不到时用）
-REST_FULL=99
-REST_POLL=60          # 休眠期间线圈电量/充电状态轮询间隔（秒）
-# 出档：取下，或线圈重新开始充电（chg=1）—— 不能用"电量低于阈值"出档，会和"停充进档"打架
+#    ⑥ 笔端"触控膜功能位" `{8,6,mask}`：笔上报哪些手势的总开关。
+#       位（ZUX buildTouchfilmEnable）：0x01 双击 / 0x02 三击 / 0x04 上滑 / 0x08 下滑 /
+#       0x10 捏合 / 0x20 笔尾。63 = 0x3F 全开。
+#       本键目前**只是留档**：实际下发的是 pen_mask（由上面的 GESTURE_* 与「设置 → 手写笔」
+#       里的双击/轻捏开关实时算出来的），见 service.sh 的 pen_sync_read()。
+TOUCHFILM=63
 
 
+# ============================================================ 四、注视感知（AON）
+# 需要 App + LSPosed 钩子（框架两道门 + 设置进程里放行），另外还需要移植包里那份
+# 含联想 Y700 shim 的 mifaced。默认关。
 
-# ⑬ 屏幕亮/灭时告诉笔（ZUX buildScreenOnOffCmd：{5,2}=亮、{5,1}=灭）
-SCREEN_CMD=1
-# 实测发反了就改成 1（亮灭互换）
-SCREEN_SWAP=0
+# ⑧ 注视感知：让 AttentionManagerService 真正拿到"有没有人在看"（真实前摄 + 人脸检测）。
+#    post-fs-data.sh 消费本键：包含 ⑧（/mi_ext cust_features 让 AON 设备识别生效）
+#    与 ⑧b（/odm/lib64 补 libcamera2ndk.so，否则 mifaced 起不来）。
+#    ⑧c「设置里让注视感知那一页出现」由 LSPosed 钩子在设置进程里放行，无需额外配置。
+AON=0
