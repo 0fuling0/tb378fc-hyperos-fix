@@ -40,7 +40,7 @@ REQUIRED = [
     "post-fs-data.sh",
     "service.sh",
     "uninstall.sh",
-    "payload/PowerKeeper.apk",
+    "payload/app/PowerKeeper.apk",
     "webroot/index.html",
 ]
 
@@ -62,7 +62,8 @@ RUNTIME_RE = [
 ]
 
 # Full 分支专属：Lite 里不该出现（不管是文件还是脚本里的引用）
-FULL_ONLY_FILES = re.compile(r"(^|/)(bin/|app/)|(^|/)(action|restart)\.sh$")
+# 注意锚定到 **zip 根**：`payload/app/...` 是 Lite 自己的目录结构，不是 Full 的 `app/`。
+FULL_ONLY_FILES = re.compile(r"^(bin/|app/)|(^|/)(action|restart)\.sh$")
 FULL_ONLY_TOKENS = [
     "bin/penring", "penring", "TbFix", "aonlib.sh", "action.sh", "restart.sh",
     "brushwatch", "stoprompen", "PenRing",
@@ -200,15 +201,35 @@ def main(argv) -> int:
             ok(f"versionCode={vc.group(1).strip()}")
 
     # --- 7. payload 与仓库里的那份逐字节一致 ---
-    disk = MODULE / "payload" / "PowerKeeper.apk"
-    if "payload/PowerKeeper.apk" in name_set and disk.is_file():
+    disk = MODULE / "payload" / "app" / "PowerKeeper.apk"
+    if "payload/app/PowerKeeper.apk" in name_set and disk.is_file():
         a = hashlib.sha256(disk.read_bytes()).hexdigest()
-        b = hashlib.sha256(z.read("payload/PowerKeeper.apk")).hexdigest()
+        b = hashlib.sha256(z.read("payload/app/PowerKeeper.apk")).hexdigest()
         if a != b:
             bad += 1
             fail(f"包里的 payload 与 module/payload/ 下的不一致（{a[:12]} != {b[:12]}）")
         else:
             ok(f"payload 与仓库一致（sha256 {a[:16]}）")
+
+    # --- 8. payload 必须带 APK Signing Block ---
+    # 这是最贵的一个坑：用 `zipfile` 重建 APK 会丢掉 v2/v3 签名块，产物看着完全正常，
+    # 但 Android 11+ 的 PMS 直接拒绝扫描（"No APK Signature Scheme v2 signature in package"）
+    # —— 包不进已安装列表，而模块日志照样写"补丁已挂载"。看起来一切正常，功能是死的。
+    if "payload/app/PowerKeeper.apk" in name_set:
+        import struct
+        apk = z.read("payload/app/PowerKeeper.apk")
+        i = apk.rfind(b"PK\x05\x06")
+        if i < 0:
+            bad += 1
+            fail("payload 不是合法 zip（找不到 EOCD）")
+        else:
+            cd_off = struct.unpack_from("<I", apk, i + 16)[0]
+            if cd_off < 16 or apk[cd_off - 16:cd_off] != b"APK Sig Block 42":
+                bad += 1
+                fail("payload 丢了 APK Signing Block —— PMS 会拒绝扫描，② 是死的")
+            else:
+                size = struct.unpack_from("<Q", apk, cd_off - 24)[0] + 8
+                ok(f"payload 带 APK Signing Block（{size} bytes）")
 
     print()
     if bad:

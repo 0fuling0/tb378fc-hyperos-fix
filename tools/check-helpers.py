@@ -26,6 +26,7 @@ service logcat getevent sendevent log df du free mount umount mountpoint sync
 insmod rmmod lsmod modprobe dmesg sysctl getenforce setenforce restorecon chcon
 applypatch reboot svc tar gzip unzip which mktemp flock truncate fallocate strings
 sha256sum md5sum base64 uuidgen uptime watchprops nandread ionice nice renice
+nsenter unshare chroot losetup nproc ip ifconfig netstat
 """.split())
 
 # 安装器（KernelSU / Magisk）在 customize.sh 运行时**注入**的函数。

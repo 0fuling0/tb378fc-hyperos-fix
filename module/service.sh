@@ -2,7 +2,8 @@
 # TB378FC HyperOS 修复 Lite —— 服务脚本
 #
 # 与 Full 分支最大的区别：**这里没有任何常驻进程**。
-# 三个修复都是"开机后做一次就完"：③ 停 BPF 监视器、④ 停死电话栈、⑭ 补一次 sepolicy。
+# 四个修复都是"开机后做一次就完"：② 换一次 PowerKeeper 挂载并拉起它、
+# ③ 停 BPF 监视器、④ 停死电话栈、⑭ 补一次 sepolicy。
 # 做完脚本自己退出 —— 没有 supervisor、没有 monitor、没有 penring、没有看护循环。
 #
 # 调用方式
@@ -46,8 +47,10 @@ LOG="$MODDIR/lite.log"
 DISABLE_BPFMON="$MODDIR/disable-bpfmon"
 DISABLE_TELEPHONY="$MODDIR/disable-telephony"
 TELEPHONY_PKGS="com.qti.phone com.qualcomm.qcrilmsgtunnel com.qualcomm.qti.telephonyservice"
-PAYLOAD="$MODDIR/payload/PowerKeeper.apk"
-PK_TARGET=/system_ext/app/PowerKeeper/PowerKeeper.apk
+PK_STAGE="$MODDIR/payload/app"
+PK_PAYLOAD="$PK_STAGE/PowerKeeper.apk"
+PK_DIR=/system_ext/app/PowerKeeper
+PK_TARGET="$PK_DIR/PowerKeeper.apk"
 
 VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -1)
 
@@ -78,7 +81,126 @@ bpfmon_running() {
     ps -A -o ARGS 2>/dev/null | grep -q '[h]yper_bpfloader --monitor-mode'
 }
 
-pk_mounted() { grep -q " $PK_TARGET " /proc/mounts 2>/dev/null; }
+pk_mounted() { grep -q " $PK_DIR " /proc/1/mountinfo 2>/dev/null; }
+
+# ---------------------------------------------------------------- ② 必须在 init 的 mount ns 里操作
+# KernelSU 执行 service.sh 时给的是一个**独立 mount namespace**（≠ init 的 4026532850）。
+# 在那里 mount 只影响脚本自己：日志会写「已挂载」、脚本视角 sha256 也对，
+# 但 init / zygote / App 的 ns 里根本没有这条挂载 —— powerkeeper 照旧读 ROM 原件并崩。
+# （实测：手工在 init ns 里跑同一个 `service.sh --boot`，powerkeeper 立刻正常起来 pid=17548；
+#  而 KernelSU 自己跑出来的那次，日志同样写「已挂载」，进程却仍然 VerifyError。
+#  对照组：post-fs-data.sh 那次挂载**确实**落在 init ns —— 所以两个阶段的 ns 不同。）
+#
+# 所以 ② 的 mount/umount 一律显式切到 init 的 ns：
+#   - 判据用 /proc/1/mountinfo（init 的 ns 快照，不受当前 ns 影响）
+#   - 操作走 nsenter -t 1 -m --（挂载带 shared:44 传播属性，在 init ns 里建立后
+#     会传播到 zygote 与后续 App 的 ns）
+PK_SELF_NS=$(readlink /proc/self/ns/mnt 2>/dev/null)
+PK_INIT_NS=$(readlink /proc/1/ns/mnt 2>/dev/null)
+PK_NEED_NS=0
+if [ -n "$PK_SELF_NS" ] && [ "$PK_SELF_NS" != "$PK_INIT_NS" ] && command -v nsenter >/dev/null 2>&1; then
+    PK_NEED_NS=1
+fi
+
+pk_ns() {
+    if [ "$PK_NEED_NS" = 1 ]; then nsenter -t 1 -m -- "$@"; else "$@"; fi
+}
+
+# powerkeeper 进程自己能不能看到补丁 —— 判据是它自己的 mount namespace 里有没有这条挂载。
+# 不能只看 /proc/mounts（那是脚本/init 视角）：KernelSU 会把模块挂载从 App 进程的 ns 里
+# 卸掉，于是"init 视角有、App 视角没有"这种状态完全可能出现（见上面 do_pk_mount 的注释）。
+pk_visible() {
+    local p
+    p=$(pidof com.miui.powerkeeper 2>/dev/null | awk '{print $1}')
+    [ -n "$p" ] || return 1
+    grep -q " $PK_DIR " "/proc/$p/mountinfo" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- ② PowerKeeper 挂载
+# 为什么要在 service.sh 里**再挂一次**（而且必须先 umount）
+# ------------------------------------------------------
+# KernelSU 会把「模块建立的挂载」从 **App 进程** 的 mount namespace 里卸载掉 ——
+# 这是它隐藏 root/模块的设计。实测（本机 ReSukiSU 4.2.0-rc1-52 late-load LKM）：
+#
+#   post-fs-data 阶段挂的那次
+#     → init 视角：挂载在，sha256 = 我们的补丁
+#     → com.miui.powerkeeper（uid 1000）视角：**没有这条挂载**，读到 ROM 原件
+#       → 开机必崩：java.lang.VerifyError: Verifier rejected class
+#          com.miui.powerkeeper.cloudcontrol.LocalUpdateUtils ...
+#          [0x1] unexpected non-category 1 return type
+#   post-fs-data **之后**重新建立的挂载
+#     → init / zygote / 新起的 App 进程都能看到补丁 ✓
+#
+# 所以这里先 umount 掉 post-fs-data 那次，再原地挂一遍 —— 新挂载实例不在 KernelSU 的
+# 记录里，App 就能看到。实测 remount 之后：
+#   init(1) / su : mnt ns 4026532850 → 279592be…  ✓
+#   zygote64     : 4026534865        → 279592be…  ✓
+#   powerkeeper  : 4026535201        → 279592be…  ✓
+#
+# 为什么挂**父目录**而不是那个 APK 文件：父目录一挂，ROM 预编译的 `oat/` 也一起被盖掉，
+# ART 不会再用那份基于坏字节码编出来的 odex。
+#
+# 代价：umount 与 mount 之间有个极短窗口，那期间路径上是 ROM 原件。
+# 这个窗口里没有 App 会去加载它（powerkeeper 由 SystemServer 拉起，比本脚本晚）。
+do_pk_mount() {
+    [ -f "$PK_PAYLOAD" ] || { log "ERROR ② payload 缺失: $PK_PAYLOAD"; return 1; }
+    [ -d "$PK_DIR" ]     || { log "ERROR ② 目标目录不存在: $PK_DIR"; return 1; }
+
+    chown -R 0:0 "$PK_STAGE" 2>/dev/null
+    chmod 0755 "$PK_STAGE" 2>/dev/null
+    chmod 0644 "$PK_PAYLOAD" 2>/dev/null
+    # bind mount 用的是**源文件**的 SELinux 标签，必须是 system_file，
+    # 否则 PMS / ART 读到会报 avc denied。
+    chcon -R u:object_r:system_file:s0 "$PK_STAGE" 2>/dev/null
+
+    if pk_mounted; then
+        pk_ns umount "$PK_DIR" 2>/dev/null || pk_ns umount -l "$PK_DIR" 2>/dev/null
+    fi
+
+    if pk_ns mount -t none -o bind "$PK_STAGE" "$PK_DIR" 2>/dev/null; then
+        [ "$PK_NEED_NS" = 1 ] && log "② 脚本 ns($PK_SELF_NS) ≠ init ns($PK_INIT_NS)，已用 nsenter 切到 init ns 挂载"
+        log "② PowerKeeper 目录已挂载（App 可见）($(sha256sum "$PK_PAYLOAD" 2>/dev/null | cut -c1-16)) ns: self=$PK_SELF_NS init=$PK_INIT_NS need=$PK_NEED_NS"
+        return 0
+    fi
+    # 退路：目录挂不上就退回文件级（至少 PMS / system_server 视角是对的）
+    if pk_ns mount -t none -o bind "$PK_PAYLOAD" "$PK_TARGET" 2>/dev/null; then
+        log "WARN ② 目录挂载失败，退回文件级挂载（App 进程可能看不到，补丁不生效）"
+        return 0
+    fi
+    log "ERROR ② bind mount 失败（self ns=$PK_SELF_NS init ns=$PK_INIT_NS nsenter=$PK_NEED_NS）"
+    return 1
+}
+
+# 让 powerkeeper 用新的 mount namespace 重新加载补丁版 APK。
+# 时序实测：本脚本 05:41:33 跑到，而 powerkeeper 05:41:19 就已经被 SystemServer 拉起并崩掉，
+# 之后 AMS 的崩溃退避会让它越来越久不再重试（1s → 11s → 30min → 1h → 2h）。
+# 所以必须**显式拉一次**，不能等它自己起来。
+PK_DONE=0
+do_pk_restart() {
+    [ "$PK_DONE" = 1 ] && return 0
+    if pk_visible; then
+        log "② powerkeeper 已看到补丁 (pid=$(pidof com.miui.powerkeeper))"
+        PK_DONE=1
+        return 0
+    fi
+    # 有进程但看不到 → 它加载的是 ROM 原件，杀掉让它换个 namespace 重来
+    local pids
+    pids=$(pidof com.miui.powerkeeper 2>/dev/null)
+    if [ -n "$pids" ]; then
+        log "② powerkeeper 跑在旧 APK 上，重启它（pid=$pids）"
+        kill -9 $pids 2>/dev/null
+        sleep 1
+    fi
+    # 显式拉一次：崩过几次之后 AMS 的退避可能已经不再自动重启它
+    am start-service -n com.miui.powerkeeper/.PowerKeeperBackgroundService >/dev/null 2>&1
+    sleep 3
+    if pk_visible; then
+        log "② powerkeeper 已用补丁版启动 (pid=$(pidof com.miui.powerkeeper))"
+        PK_DONE=1
+    else
+        log "WARN ② powerkeeper 仍未看到补丁（pid=$(pidof com.miui.powerkeeper)）"
+    fi
+}
 
 telephony_summary() {
     local p exist disabled n
@@ -223,8 +345,37 @@ wait_boot_completed() {
 
 boot_actions() {
     [ -e "$MODDIR/disable" ] && { log "模块已被 disable 标记停用，跳过"; return 0; }
+
+    # ② 第一次尝试（late_start 阶段，boot_completed 之前）：
+    # 能成就最好（那样 powerkeeper 一次都不用崩），成不了下面还会重来。
+    if fix_powerkeeper_enabled; then
+        do_pk_mount
+        do_pk_restart
+    fi
+
     wait_boot_completed
-    log "--- Lite 开机动作开始（v$VERSION）---"
+    log "--- Lite 开机动作开始（$VERSION）---"
+
+    # ② 关键的一次：**必须在 boot_completed 之后重挂**。
+    # 实测（本机 ReSukiSU 4.2.0-rc1-52）：同样是 init ns 里的 umount + mount 同一路径，
+    #   late_start 阶段做 → App 进程仍然读到 ROM 原件，powerkeeper 照旧 VerifyError；
+    #   系统完全起来之后做 → 新起的 App 进程立刻读到补丁版。
+    # 日志里两次的 ns 与 mnt_id 都相同（mnt_id 226 —— Linux 的 ida 会复用最小空闲 id），
+    # 所以这不是"挂错了地方"，而是**挂载生效的时机**问题。早期那次挂载本身不算白做：
+    # 万一别的 KernelSU 版本/机型上它就能生效，那就一次都不用崩。
+    if fix_powerkeeper_enabled && ! pk_visible; then
+        log "② boot_completed 之后重挂一次（late_start 那次对 App 不可见）"
+        local i=0
+        while [ "$i" -lt 3 ]; do
+            i=$((i+1))
+            do_pk_mount
+            PK_DONE=0
+            do_pk_restart
+            pk_visible && break
+            [ "$i" -lt 3 ] && { log "② 第 $i 次重挂后仍不可见，等 10s 再试"; sleep 10; }
+        done
+    fi
+
     do_bpfmon
     do_telephony
     do_sepolicy
@@ -275,16 +426,17 @@ json_out() {
     printf '"BPFMON_SVC":"%s","BPFMON_RUNNING":%s,' \
         "$(getprop init.svc.dynbpfloader)" "$(_b bpfmon_running)"
     printf '"POWERKEEPER_MOUNTED":%s,' "$(_b pk_mounted)"
-    printf '"POWERKEEPER_PAYLOAD":%s,' "$([ -f "$PAYLOAD" ] && printf 1 || printf 0)"
+    printf '"POWERKEEPER_SEEN":%s,' "$(_b pk_visible)"
+    printf '"POWERKEEPER_PAYLOAD":%s,' "$([ -f "$PK_PAYLOAD" ] && printf 1 || printf 0)"
     printf '"TELEPHONY_DONE":%s,"TELEPHONY_STATE":"%s",' "$td" "$ts"
     printf '"MARKERS":"%s"}\n' "$mk"
 }
 
 status_out() {
-    echo "TB378FC HyperOS 修复 Lite  v$VERSION"
+    echo "TB378FC HyperOS 修复 Lite  $VERSION"
     echo "模块目录: $MODDIR"
     echo
-    echo "② PowerKeeper 补丁     : $(_b fix_powerkeeper_enabled)   已挂载: $(_b pk_mounted)"
+    echo "② PowerKeeper 补丁     : $(_b fix_powerkeeper_enabled)   已挂载: $(_b pk_mounted)   App 可见: $(_b pk_visible)   pid=$(pidof com.miui.powerkeeper)"
     echo "③ 停 BPF 监视器        : $(_b fix_bpfmon_enabled)   dynbpfloader=$(getprop init.svc.dynbpfloader)  监视器进程: $(_b bpfmon_running)"
     echo "④ 停死电话栈           : $(_b fix_telephony_enabled)   $(telephony_summary)"
     echo "⑭ 开发者选项 sepolicy  : 常开（无开关）"

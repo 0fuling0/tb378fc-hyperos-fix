@@ -15,7 +15,8 @@ chmod 0644 "$MODPATH"/*.prop "$MODPATH"/config 2>/dev/null
 # ⚠️ KernelSU 的安装器**没有** Magisk 的 set_perm/set_perm_recursive（会静默失效），
 # 所以必须用普通 chmod。曾经就因为这个：ksud 装完后可执行位丢了 → 脚本根本跑不起来。
 chmod 755 "$MODPATH"/*.sh 2>/dev/null
-chmod 644 "$MODPATH"/payload/*.apk "$MODPATH"/webroot/* "$MODPATH"/sepolicy.rule 2>/dev/null
+chmod 755 "$MODPATH"/payload/app 2>/dev/null
+chmod 644 "$MODPATH"/payload/app/*.apk "$MODPATH"/webroot/* "$MODPATH"/sepolicy.rule 2>/dev/null
 
 # ---- 升级时保住用户已经调好的开关 ----
 # ksud module install 会把包里的 config 原样写进 /data/adb/modules_update/<id>/，

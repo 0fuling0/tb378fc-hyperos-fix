@@ -14,7 +14,7 @@
 
 | 编号 | 修什么 | 怎么做 | 什么时候做 |
 |---|---|---|---|
-| **②** | **PowerKeeper 字节码** | `post-fs-data.sh` 把修补过的 APK `mount -o bind` 到 `/system_ext/app/PowerKeeper/PowerKeeper.apk` | 每次开机，**zygote 之前**（PMS 扫描包之前） |
+| **②** | **PowerKeeper 字节码** | `post-fs-data.sh` 与 `service.sh` 把修补过的 APK `mount -o bind` 到 `/system_ext/app/PowerKeeper`（挂父目录） | `post-fs-data` 一次（供 PMS 扫描）+ **`boot_completed` 之后一次**（这一次才对 App 生效） |
 | **③** | **停 BPF 监视器** | 等 `boot_completed` 后 `setprop ctl.stop dynbpfloader` | 每次开机一次 |
 | **④** | **停死电话栈** | `pm disable-user --user 0` 那三个电话包 | 每次开机复查（停用状态写在 `packages.xml`，跨重启保持） |
 | **⑭** | **开发者选项闪退** | `ksud sepolicy apply` 补两条最小权限 | `post-fs-data` 与开机后各一次 |
@@ -29,8 +29,60 @@
   `ins_size` 从 0 变成 1），而全部 4 个调用点都是 `invoke-static` → `IncompatibleClassChangeError`。
 
 不修的话 `com.miui.powerkeeper` 开机即崩，MIUI 的省电管理整个不可用。
-修好的 APK 放在 `module/payload/PowerKeeper.apk`，重建流程见
+修好的 APK 放在 `module/payload/app/PowerKeeper.apk`，重建流程见
 [docs/powerkeeper-patch.md](docs/powerkeeper-patch.md)。
+
+#### 让补丁真正生效要绕开三个坑
+
+这一项是本模块里最麻烦的一处。前后踩了三个坑，**都不是"脚本写错"，而是机制问题**，
+而且前两个坑都会让模块**从任何 root 视角检查都显示"已生效"**，属于最难查的那一类：
+
+**坑 1 — APK 签名块不能丢。** 用 Python `zipfile` 重建 zip 会把 **APK Signing Block**
+（v2/v3 签名块，位于最后一个 local entry 与 central directory 之间）整个丢掉。
+Android 11+ 对 `targetSdk>=30` 强制要求 v2 签名，PMS 直接拒绝扫描：
+
+```
+W PackageManager: Failed to scan /system_ext/app/PowerKeeper:
+    No APK Signature Scheme v2 signature in package
+```
+
+结果是 `com.miui.powerkeeper` **根本没装上**，② 等于没做。
+现在 payload 由 `payload-src/apk_inplace.py` 做**等长原地补丁**：只覆盖 `classes.dex` 的
+数据段 + 回填两处 CRC-32（local header +14、central directory +16），容器其余部分逐字节
+不动，签名块原样保留（本机 4096 字节）。产物 **6228160 字节，与原厂完全等长**。
+
+> 顺带一个结论：**不能改用 `pm install` 装成"系统应用更新"**。补丁改了 `classes.dex`，
+> v3 签名块里的内容摘要必然失效，而重签需要平台密钥。实测：
+> `INSTALL_PARSE_FAILED_NO_CERTIFICATES: ... using APK Signature Scheme v3:
+> SHA-256 digest of contents did not verify`。
+> 开机扫描之所以接受它，是因为包尺寸与原厂等长 + 证书未变，命中 PMS 的缓存校验路径 ——
+> 这也正是"必须等长"的另一个理由。
+
+**坑 2 — KernelSU 会把模块挂载从 App 进程里卸掉。** 这是它隐藏 root/模块的设计。
+实测 post-fs-data 阶段挂的那次：`init` 视角看得到、`sha256sum` 也是补丁版，
+但 `com.miui.powerkeeper`（`android.uid.system` / uid 1000）**自己的 mount namespace 里
+没有这条挂载**，读到的是 ROM 原件 → 照旧 `VerifyError`。
+判据不能看 `/proc/mounts`（那是 init 视角），要看 `/proc/<pid>/mountinfo`。
+
+**坑 3 — 同一路径、同一个 init namespace，只有"晚挂"才有效。** 实测把 `umount` + `mount`
+挪到 **`boot_completed` 之后**，新起的 App 进程立刻就能看到补丁；放在 `late_start`
+（`boot_completed` 之前）则看不到 —— 两次的 ns（`mnt:[4026532850]`）和 mnt_id（226，
+Linux 的 `ida` 会复用最小空闲 id）都相同，所以这是**时机**问题，不是"挂错了地方"。
+
+于是 `service.sh` 的做法是：
+
+1. `late_start` 先挂一次（best effort，万一别的 KernelSU 版本上就能生效，那一次都不用崩）；
+2. `boot_completed` 之后再 `umount` + `mount` 一次（`pk_visible` 不成立时最多重试 3 次）；
+3. 显式把 `com.miui.powerkeeper` 拉起来 —— 开机早期它已经崩过几次，AMS 的崩溃退避会让它
+   越来越久不再自动重试（1s → 11s → 30min → 1h → 2h），所以必须主动
+   `am start-service -n com.miui.powerkeeper/.PowerKeeperBackgroundService`。
+
+**已知副作用（无害）**：`boot_completed` 之前 powerkeeper 会崩几次，开机日志里能看到几条
+`am_crash` / `VerifyError`；约 1.5 分钟后由模块自动恢复并常驻。这是"补丁生效窗口"的代价，
+不影响最终状态。
+
+挂的是**父目录** `/system_ext/app/PowerKeeper` 而不是那个 APK 文件：父目录一挂，
+ROM 预编译的 `oat/` 也一起被盖掉，ART 不会再用那份基于坏字节码编出来的 odex。
 
 > 为什么用 bind mount 而不是模块的 `system/` 目录：本机的 KernelSU 是 **ReSukiSU 4.x late-load LKM**
 > 形态，**不做文件级 overlay** —— 模块里的 `system_ext/...` 不会被叠到真实路径上。
@@ -172,15 +224,31 @@ sh .../service.sh --set FIX_BPFMON 0                                # 改配置�
 
 ## 六、验收与排障
 
+仓库里带了一个**设备端验收脚本**，逐项断言四个修复的最终状态：
+
+```bash
+adb push tools/acceptance.sh /data/local/tmp/
+adb shell su -c 'sh /data/local/tmp/acceptance.sh'   # 结尾打印「全部通过」或「有 N 项失败」
+```
+
+它刻意做了两件事，都是踩过坑之后加的：② 的判据是 **powerkeeper 自己的
+mount namespace**（`/proc/<pid>/mountinfo`）而不是 `/proc/mounts`；
+崩溃断言只统计**模块修好之后**的窗口（开机早期那几条是已知无害的）。
+
+手工排查用的命令：
+
 ```bash
 M=/data/adb/modules/tb378fc_hyperos_fix_lite
 
 # 一眼看全部状态（等于管理器「执行」按钮的内容）
 adb shell su -c "sh $M/service.sh --status"
 
-# ② 挂上了没有 / powerkeeper 活没活
-adb shell su -c "grep PowerKeeper /proc/mounts"
-adb shell su -c "ps -A -o NAME | grep powerkeeper"
+# ② 挂上了没有 / powerkeeper 活没活 / 它自己能不能看到补丁
+adb shell su -c "grep PowerKeeper /proc/1/mountinfo"      # init 视角
+adb shell su -c "pidof com.miui.powerkeeper"
+#   ↑ 这才是关键判据：App 自己的 namespace 里有没有这条挂载。
+#     （只看 /proc/mounts 会误判 —— KernelSU 会把模块挂载从 App 进程里卸掉）
+adb shell su -c 'p=$(pidof com.miui.powerkeeper); grep PowerKeeper /proc/$p/mountinfo'
 
 # ③ 监视器停没停（期望 stopped；ps 那行期望为空）
 adb shell su -c "getprop init.svc.dynbpfloader"
@@ -205,7 +273,15 @@ adb shell su -c "ps -A -o ARGS | grep -E 'supervise|brushwatch|penring|stoprompe
   再确认 `post-fs-data.sh` / `service.sh` 有可执行位（`ls -l $M/*.sh`）。
   KernelSU 的安装器**没有** Magisk 的 `set_perm`，权限位就是包里带的那个 ——
   所以 `build.sh` 打包前会显式 `chmod 755 *.sh`，并且 `tools/verify_pack.py` 会拦下来。
-- **② 日志说 `bind mount 失败`** → 看 `/proc/mounts` 里目标路径是否已存在、payload 是否完整。
+- **② 日志说 `bind mount 失败`** → 看目标目录是否存在、payload 是否完整。
+- **② 日志说「已挂载」但 powerkeeper 还是 `VerifyError`** → 挂载没落到 App 的 namespace 里。
+  用上面那条 `grep /proc/$p/mountinfo` 确认。已知两种成因：
+  ① 挂载发生在 `boot_completed` 之前（`late_start` 那次就是这样，属预期，等后面的重挂）；
+  ② 挂载落到了别的 mount namespace（脚本 ns ≠ init ns，日志里会多一行 `脚本 ns(...) ≠ init ns(...)`，
+  此时 `service.sh` 会自动用 `nsenter -t 1 -m` 切过去）。
+- **② powerkeeper 一直在崩、AMS 也不再自动拉** → AMS 的崩溃退避会退到 1h/2h。
+  手工补一次：`adb shell su -c 'am start-service -n com.miui.powerkeeper/.PowerKeeperBackgroundService'`
+  （前提是挂载已经对 App 可见）。
 - **③ 日志说监视器仍在运行** → 看 `getprop init.svc.dynbpfloader`。如果它是 `running` 且
   `ctl.stop` 三次都没停掉，说明这个 ROM 上该服务不是 `disabled` 的 —— 那就得回到
   [docs/bpfmon-stop.md](docs/bpfmon-stop.md) 重新评估。
@@ -222,16 +298,17 @@ module/                      ← 打包根（zip 根目录即模块根目录）
 ├── config                   运行配置（3 个开关）
 ├── sepolicy.rule            ⑭ 的两条规则
 ├── customize.sh             安装期：权限位 + 升级时保住用户的 config
-├── post-fs-data.sh          ② bind mount + ⑭ 显式应用策略
-├── service.sh               ③④⑭ 开机动作 + --status/--json/--set/--sepolicy
+├── post-fs-data.sh          ② bind mount（供 PMS 扫描）+ ⑭ 显式应用策略
+├── service.sh               ② boot_completed 后重挂并拉起进程 + ③④⑭ + --status/--json/--set/--sepolicy
 ├── uninstall.sh             卸载说明（不做恢复动作）
-├── payload/PowerKeeper.apk  ② 的 payload（已入库）
+├── payload/app/PowerKeeper.apk  ② 的 payload（已入库；放在子目录里是为了能挂父目录）
 └── webroot/index.html       精简 WebUI
 
 payload-src/                 ← ② 的重建流程（原厂 APK 不入库）
-├── patch_powerkeeper.py     坏点 a：return v0 → return-void
+├── patch_powerkeeper.py     坏点 a：return v0 → return-void（只产出 classes-patched.dex）
 ├── fix_static.py            坏点 b：移入 direct_methods + ACC_STATIC + ins_size 1→0
-└── repack_payload.py        重新塞回 zip 容器
+├── apk_inplace.py           等长原地替换条目 —— 保住 APK Signing Block 的关键
+└── repack_payload.py        用 apk_inplace 把新 dex 塞回去（不做 zip 重建）
 
 tools/
 ├── check-helpers.py         未定义函数检查（"调用了但没定义"会被 sh 静默忽略）

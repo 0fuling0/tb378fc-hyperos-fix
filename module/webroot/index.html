@@ -149,14 +149,17 @@ async function readCfg() {
 const ITEMS = [
   {
     num: "②", key: "FIX_POWERKEEPER", title: "PowerKeeper 补丁",
-    desc: "把修好的 PowerKeeper.apk 用 bind mount 盖到 /system_ext/app/PowerKeeper/PowerKeeper.apk，" +
-          "修补移植者改坏的两处字节码（void 方法里 return 了值、静态方法丢了 static）。" +
-          "不做的话 com.miui.powerkeeper 每次开机 VerifyError 崩溃。",
-    st: s => s.POWERKEEPER_MOUNTED === 1
-      ? { k: "ok",  t: "已挂载（本次开机生效）" }
-      : (s.POWERKEEPER_PAYLOAD === 1
-          ? { k: "mid", t: "未挂载 —— 重启后生效" }
-          : { k: "bad", t: "payload 缺失，无法修补" })
+    desc: "把修好的 PowerKeeper.apk 用 bind mount 盖到 /system_ext/app/PowerKeeper（挂父目录，" +
+          "顺带盖掉 ROM 预编译的 oat/），修补移植者改坏的两处字节码（void 方法里 return 了值、" +
+          "静态方法丢了 static）。不做的话 com.miui.powerkeeper 每次开机 VerifyError 崩溃。" +
+          "注意：挂载要等 boot_completed 之后才对 App 进程可见，所以开机早期它仍会崩几次，随后自动恢复。",
+    st: s => s.POWERKEEPER_SEEN === 1
+      ? { k: "ok",  t: "PowerKeeper 已在跑且读到了补丁版" }
+      : (s.POWERKEEPER_MOUNTED === 1
+          ? { k: "mid", t: "已挂载，但进程还没读到（开机早期，稍后会自愈）" }
+          : (s.POWERKEEPER_PAYLOAD === 1
+              ? { k: "mid", t: "未挂载 —— 重启后生效" }
+              : { k: "bad", t: "payload 缺失，无法修补" }))
   },
   {
     num: "③", key: "FIX_BPFMON", title: "停 BPF 监视器",
@@ -165,9 +168,9 @@ const ITEMS = [
           "reboot,recovery（实测：不开容器时忍着，一旦用 DroidSpaces 容器就触发）。" +
           "该服务是 init 里的 disabled 服务、只由开机触发器拉起一次，所以停一次即永久生效。",
     st: s => {
-      if (s.BPFMON_RUNNING === 1) return { k: "bad", t: "监视器仍在运行" };
-      if (s.BPFMON_SVC === "stopped") return { k: "ok", t: "已停（init.svc.dynbpfloader=stopped）" };
-      return { k: "mid", t: "init.svc.dynbpfloader=" + (s.BPFMON_SVC || "(空)") };
+      if (s.BPFMON_RUNNING === 1) return { k: "bad", t: "BPF 监视器仍在运行" };
+      if (s.BPFMON_SVC === "stopped") return { k: "ok", t: "BPF 监视器已停（init.svc.dynbpfloader=stopped）" };
+      return { k: "mid", t: "BPF 监视器状态未知（init.svc.dynbpfloader=" + (s.BPFMON_SVC || "空") + "）" };
     }
   },
   {
@@ -177,8 +180,8 @@ const ITEMS = [
           "NullPointerException 每秒崩几百次，白烧 zygote / system_server。" +
           "停用状态写在 packages.xml 里，跨重启保持。",
     st: s => s.TELEPHONY_DONE === 1
-      ? { k: "ok",  t: "已处理" + (s.TELEPHONY_STATE ? "：" + s.TELEPHONY_STATE : "") }
-      : { k: "bad", t: "仍有未停用的包：" + (s.TELEPHONY_STATE || "?") }
+      ? { k: "ok",  t: "电话栈已处理" + (s.TELEPHONY_STATE ? "：" + s.TELEPHONY_STATE : "") }
+      : { k: "bad", t: "电话栈仍有未停用的包：" + (s.TELEPHONY_STATE || "?") }
   }
 ];
 
@@ -206,7 +209,10 @@ function buildItem(it) {
   const t = el("div", "title");
   t.appendChild(el("span", "n", it.title));
   const d = el("div", "d");
-  d.textContent = (CFG[it.key] === 1 ? "开" : "关");
+  // 这里写「修复已启用」而不是「开」：开关说的是"要不要做这项修复"，
+  // 不是"被修的那个东西现在是什么状态"。③ 尤其容易被读反 ——
+  // 「停 BPF 监视器 开」会被看成「监视器开着」，其实正好相反。
+  d.textContent = (CFG[it.key] === 1 ? "修复已启用" : "修复已关闭");
   t.appendChild(d);
   head.appendChild(t);
 
@@ -222,7 +228,7 @@ function buildItem(it) {
   card.appendChild(el("div", "desc", it.desc));
 
   const st = it.st(CFG);
-  d.textContent = (CFG[it.key] === 1 ? "开" : "关") + " · " + st.t;
+  d.textContent = (CFG[it.key] === 1 ? "修复已启用" : "修复已关闭") + " · " + st.t;
   card.appendChild(statusPill(st));
   return card;
 }

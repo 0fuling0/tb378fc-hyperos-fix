@@ -81,7 +81,7 @@ const CFG = { FIX_POWERKEEPER: 1, FIX_BPFMON: 1, FIX_TELEPHONY: 1 };
 const STATE = {
   NEED_APP: 0, VERSION: 'v1.0',
   BPFMON_SVC: 'stopped', BPFMON_RUNNING: 0,
-  POWERKEEPER_MOUNTED: 1, POWERKEEPER_PAYLOAD: 1,
+  POWERKEEPER_MOUNTED: 1, POWERKEEPER_SEEN: 1, POWERKEEPER_PAYLOAD: 1,
   TELEPHONY_DONE: 1, TELEPHONY_STATE: ' com.qti.phone:absent',
   MARKERS: ''
 };
@@ -233,17 +233,28 @@ function expect(errs, cond, msg) { if (!cond) errs.push(msg); }
     else console.log('✓ 场景 5 通过：③ 的状态文案随实际状态变化（有判别力）');
   }
 
-  /* ---- 场景 6：② payload 缺失 / 未挂载 的文案 ---- */
+  /* ---- 场景 6：② 的四种状态文案 ---- */
   {
     const errs = [];
-    STATE.POWERKEEPER_MOUNTED = 0;
+    // 已挂载但进程还没读到（开机早期）—— 这时必须说"稍后会自愈"，不能说"生效了"
+    STATE.POWERKEEPER_SEEN = 0;
+    STATE.POWERKEEPER_MOUNTED = 1;
     STATE.POWERKEEPER_PAYLOAD = 1;
     CALLS.length = 0;
     await documentStub.querySelector('#refresh').fire('click');
     await sleep(60);
     let t = pills().map(p => p.textContent).join('|');
+    expect(errs, /还没读到/.test(t), `已挂载但进程没读到时应如实说明，实际：${t}`);
+
+    // 挂载也没有
+    STATE.POWERKEEPER_MOUNTED = 0;
+    CALLS.length = 0;
+    await documentStub.querySelector('#refresh').fire('click');
+    await sleep(60);
+    t = pills().map(p => p.textContent).join('|');
     expect(errs, /未挂载/.test(t) && /重启后生效/.test(t), `未挂载时应提示重启后生效，实际：${t}`);
 
+    // payload 都没有
     STATE.POWERKEEPER_PAYLOAD = 0;
     CALLS.length = 0;
     await documentStub.querySelector('#refresh').fire('click');
@@ -251,13 +262,47 @@ function expect(errs, cond, msg) { if (!cond) errs.push(msg); }
     t = pills().map(p => p.textContent).join('|');
     expect(errs, /payload 缺失/.test(t), `payload 缺失时应明确报出，实际：${t}`);
 
+    // 全部正常：进程活着且读到补丁
     STATE.POWERKEEPER_MOUNTED = 1;
     STATE.POWERKEEPER_PAYLOAD = 1;
+    STATE.POWERKEEPER_SEEN = 1;
+    CALLS.length = 0;
+    await documentStub.querySelector('#refresh').fire('click');
+    await sleep(60);
+    t = pills().map(p => p.textContent).join('|');
+    expect(errs, /读到了补丁版/.test(t), `一切正常时应说进程读到了补丁版，实际：${t}`);
     if (errs.length) { console.log('✗ 场景 6 失败:'); errs.forEach(e => console.log('   - ' + e)); failed++; }
-    else console.log('✓ 场景 6 通过：② 的三种状态文案正确');
+    else console.log('✓ 场景 6 通过：② 的四种状态文案正确');
   }
 
-  /* ---- 场景 7：--json 读不到时必须给出可读错误，且不崩 ---- */
+  /* ---- 场景 7：开关标签不能被读成"监视器在运行" ----
+     真实踩过的坑：③ 卡片原来是「停 BPF 监视器  开 · 已停（…）」，
+     「开」是"这项修复启用了吗"，紧跟在标题后面却被读成"监视器：开"。 */
+  {
+    const errs = [];
+    STATE.BPFMON_RUNNING = 0;
+    STATE.BPFMON_SVC = 'stopped';
+    CFG.FIX_BPFMON = 1;
+    CALLS.length = 0;
+    await documentStub.querySelector('#refresh').fire('click');
+    await sleep(60);
+
+    const sub = texts('d').join('|');
+    expect(errs, /修复已启用/.test(sub), `开关状态应写明"修复已启用"，实际副标题：${sub}`);
+    // 不能出现孤零零的"开"/"关"当开关标签（会被读成被修对象的运行状态）
+    expect(errs, !/(^|\|)\s*开\s*(\||$)/.test(sub), `副标题里不该出现裸的"开"，实际：${sub}`);
+    expect(errs, !/(^|\|)\s*关\s*(\||$)/.test(sub), `副标题里不该出现裸的"关"，实际：${sub}`);
+
+    // ③ 那一行必须同时把"修复启用"和"监视器已停"说清楚
+    const line3 = texts('d').find(x => x.includes('BPF 监视器'));
+    expect(errs, !!line3, `找不到 ③ 的副标题，实际：${sub}`);
+    expect(errs, line3 && /修复已启用/.test(line3) && /BPF 监视器已停/.test(line3),
+      `③ 副标题应同时说清"修复已启用"和"监视器已停"，实际：${line3}`);
+    if (errs.length) { console.log('✗ 场景 8 失败:'); errs.forEach(e => console.log('   - ' + e)); failed++; }
+    else console.log('✓ 场景 7 通过：开关标签不会被误读成"监视器在运行"');
+  }
+
+  /* ---- 场景 8：--json 读不到时必须给出可读错误，且不崩 ---- */
   {
     const errs = [];
     JSON_BROKEN = true;
@@ -273,8 +318,8 @@ function expect(errs, cond, msg) { if (!cond) errs.push(msg); }
     await documentStub.querySelector('#refresh').fire('click');
     await sleep(60);
     expect(errs, /版本 v1\.0/.test(documentStub.querySelector('#ver').textContent), '恢复后应能正常刷新');
-    if (errs.length) { console.log('✗ 场景 7 失败:'); errs.forEach(e => console.log('   - ' + e)); failed++; }
-    else console.log('✓ 场景 7 通过：读不到状态时给出可读错误且可恢复');
+    if (errs.length) { console.log('✗ 场景 8 失败:'); errs.forEach(e => console.log('   - ' + e)); failed++; }
+    else console.log('✓ 场景 8 通过：读不到状态时给出可读错误且可恢复');
   }
 
   console.log('');

@@ -5,11 +5,11 @@
 #                           不含二进制，几秒就能出包。
 #   ./build.sh --pack       同上（保留这个写法是为了 CI 兼容，.github/workflows/release.yml 用它）
 #   ./build.sh --payload    额外从 payload-src/PowerKeeper-stock.apk 重建 ② 的 payload
-#                           （module/payload/PowerKeeper.apk 已入库，平时不需要重建）
+#                           （module/payload/app/PowerKeeper.apk 已入库，平时不需要重建）
 #   ./build.sh --clean      删掉 out/ 与 payload-src 下的中间产物
 #
 # 产物
-#   module/payload/PowerKeeper.apk   ② 的 bind mount payload（已入库；--payload 才重建）
+#   module/payload/app/PowerKeeper.apk  ② 的 bind mount payload（已入库；--payload 才重建）
 #   out/<id>-<version>.zip           KernelSU 模块包（zip 根目录即模块根目录）
 #
 # 与 Full 分支的差别：这里没有 app/（TbFix.apk + LSPosed 模块）、没有 module/bin/
@@ -57,22 +57,24 @@ MOD_VER=$(sed -n 's/^version=//p' "$MODULE/module.prop" | head -1)
 
 # ---------- ② PowerKeeper payload ----------
 # 输入是移植包原厂 APK（payload-src/PowerKeeper-stock.apk，**不入库**，体积太大），
-# 两步补丁后重新塞回 zip 容器。详见 payload-src/repack_payload.py 的模块注释。
+# 两步等长补丁后**原地**替换 classes.dex —— 绝不重建 zip（重建会丢 APK Signing Block，
+# Android 11+ 的 PMS 会直接拒绝扫描，详见 payload-src/apk_inplace.py）。
 build_payload() {
-  echo "== 重建 PowerKeeper payload（从原厂 APK）"
+  echo "== 重建 PowerKeeper payload（从原厂 APK，原地等长补丁）"
   local stock="$HERE/payload-src/PowerKeeper-stock.apk"
   [ -f "$stock" ] || { echo "缺少 $stock（原厂 APK 不入库，需要自行从移植包提取）" >&2; exit 1; }
   [ -n "$PY" ] || { echo "需要 python3 才能重建 payload" >&2; exit 1; }
   local tmp
   tmp=$(mktemp -d)
+  # 清理失败不能拖垮构建（有些环境会用安全删除包装 rm，可能直接失败）
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp' >/dev/null 2>&1 || true" RETURN
   cp "$stock" "$tmp/PowerKeeper.apk"
-  cp "$HERE/payload-src/patch_powerkeeper.py" "$HERE/payload-src/fix_static.py" "$tmp/"
+  cp "$HERE/payload-src/patch_powerkeeper.py" "$HERE/payload-src/fix_static.py" \
+     "$HERE/payload-src/apk_inplace.py" "$tmp/"
   ( cd "$tmp" && "$PY" patch_powerkeeper.py && "$PY" fix_static.py >/dev/null )
   "$PY" "$HERE/payload-src/repack_payload.py" \
-    "$tmp/PowerKeeper-patched.apk" "$tmp/classes-patched2.dex" "$MODULE/payload/PowerKeeper.apk"
-  sha256sum "$MODULE/payload/PowerKeeper.apk" | cut -c1-16
+    "$tmp/PowerKeeper.apk" "$tmp/classes-patched2.dex" "$MODULE/payload/app/PowerKeeper.apk"
 }
 
 # ---------- 脚本自检 ----------
@@ -84,11 +86,15 @@ check_scripts() {
   sh -n "$MODULE/post-fs-data.sh"
   sh -n "$MODULE/customize.sh"
   sh -n "$MODULE/uninstall.sh"
+  # 设备端验收脚本不进包，但同样要能跑 —— 语法错了只有拿到设备上才发现太晚
+  sh -n "$HERE/tools/acceptance.sh"
 
   if [ -n "$PY" ]; then
     "$PY" "$HERE/tools/check-helpers.py" \
       "$MODULE/service.sh" "$MODULE/post-fs-data.sh" \
-      "$MODULE/customize.sh" "$MODULE/uninstall.sh"
+      "$MODULE/customize.sh" "$MODULE/uninstall.sh" "$HERE/tools/acceptance.sh"
+    # payload 的原地补丁解析器自检（签名块识别 / 等长替换 / 只改该改的地方）
+    "$PY" "$HERE/payload-src/apk_inplace.py"
   else
     echo "跳过未定义函数检查（没找到 python3）"
   fi
@@ -108,7 +114,7 @@ check_scripts() {
   # 模块必需文件齐不齐 —— 少一个装到设备上就是静默不工作
   local f
   for f in module.prop config sepolicy.rule customize.sh post-fs-data.sh \
-           service.sh uninstall.sh payload/PowerKeeper.apk webroot/index.html; do
+           service.sh uninstall.sh payload/app/PowerKeeper.apk webroot/index.html; do
     [ -f "$MODULE/$f" ] || { echo "模块里缺少 $f" >&2; exit 1; }
   done
   echo "模块必需文件齐全"
