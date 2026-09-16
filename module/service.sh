@@ -210,6 +210,16 @@ penring_watch_pids() {
         NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)penring$/ && $0 ~ /--watch/ { print $1 }'
 }
 
+# 本脚本某个子命令的进程（用于"接管"，清掉上一轮留下的 setsid 守护）。
+# 为什么需要：--stopbpfmon / --fixtelephony / --stoprompen 是 setsid 拉起的常驻循环，
+# restart.sh 有意不杀它们（它们只在"开关被关掉"时自退）。于是开关一直开着的时候，
+# 每按一次 WebUI 开关 → restart.sh → setup 分支就又拉一份，旧的那份没人收 ——
+# 实测泄漏到 8 份 --stopbpfmon 同时在跑，每份都 60 秒一轮 setprop ctl.stop，还一起刷日志。
+svc_pids() {
+    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh $1" '
+        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { print $1 }'
+}
+
 # 可选配置项；未知键自然被忽略
 REFRESH_SECONDS=0
 CAPSULE=1
@@ -1566,6 +1576,14 @@ case "$1" in
     # 同步执行（不是 setsid &）：要在下面拉起看护之前确定生效。
     # 本项没有 disable 标记：它是崩溃修复，不是可选功能。
     /system/bin/sh "$0" --sepolicy >> "$LOG" 2>&1
+
+    # 接管：下面这三个守护是 setsid 拉起的常驻循环，restart.sh 有意不杀它们（它们只在
+    # "开关被关掉"时自退）。于是开关一直开着的时候，每按一次 WebUI 开关 → restart.sh →
+    # 回到这个分支就又拉一份，旧的那份没人收 —— 实测泄漏到 8 份 --stopbpfmon 同时在跑。
+    # 和上面的 brushwatch/penring 一样：启动前先把旧的一份清掉。
+    for p in $(svc_pids --stopbpfmon) $(svc_pids --fixtelephony) $(svc_pids --stoprompen); do
+        kill -9 "$p" 2>/dev/null
+    done
 
     # ③ BPF 监视器拆弹、④ 死电话栈、⑥ 停 ROM 笔桥三者各自独立，互不依赖。
     # 判据走 *_enabled()：config 键（WebUI 可改）与 disable-* 标记文件都算。
