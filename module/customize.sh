@@ -2,7 +2,7 @@
 # 安装期脚本（KernelSU / Magisk 在刷入时执行；设备上的 /data/adb/modules 里不会保留它，
 # 这份是从 v2.0 的安装包里恢复出来、按 v3.1 的文件清单更新过的）。
 ui_print " "
-ui_print "- TB378FC HyperOS 修复 v3.8"
+ui_print "- TB378FC HyperOS 修复 v3.9"
 ui_print "- 系统修复  : ② PowerKeeper  ③ 停 BPF 监视器  ④ 停死电话栈  ⑭ 开发者选项"
 ui_print "- 手势与书写: ⑥ 手势桥  ⑦ 笔刷触感  ⑫ 设置→笔 下发"
 ui_print "- 手写笔连接: ① 唤醒  ⑤ 电量胶囊  ⑨ 休眠档  ⑬ 屏幕指令"
