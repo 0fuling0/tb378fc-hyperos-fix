@@ -1,7 +1,7 @@
-name: 构建并发布模块
+name: 构建并发布模块（Lite）
 
 # 触发方式
-#   1) 推一个 v* 的 tag —— 常规路径（例如 git push origin v3.6）
+#   1) 推一个 v* 的 tag —— 常规路径（例如 git push origin v1.0）
 #   2) 手动：Actions 页面 → 本 workflow → Run workflow（tag 留空就用 module.prop 里的 version）
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag（例如 v3.6）。留空则用 module/module.prop 里的 version。'
+        description: '要发布的 tag（例如 v1.0）。留空则用 module/module.prop 里的 version。'
         required: false
         type: string
 
@@ -75,9 +75,10 @@ jobs:
           fi
           echo "✓ tag 与 module.prop 一致：$RELEASE_TAG"
 
-      # module/bin/TbFix.apk 和 module/bin/penring 已经入库，所以 --pack 不需要 Android SDK/NDK。
-      # 顺带把三项自检跑一遍（sh -n、未定义函数、WebUI 渲染与交互）。
-      - name: 脚本自检 + 打包
+      # Lite 分支不需要 Android SDK / NDK —— 模块里没有 App、没有二进制，--pack 就是
+      # 自检 + 打包 + 产物校验，几秒出包。四道自检：sh -n、未定义函数、
+      # WebUI 渲染与交互、产物校验（行尾 / 残留 / 权限位 / 版本 / payload 完整性）。
+      - name: 脚本自检 + 打包 + 产物校验
         run: |
           set -euo pipefail
           chmod +x build.sh
@@ -104,16 +105,31 @@ jobs:
           cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
           KernelSU 模块包（zip 根目录即模块根目录）。
 
+          ## 这个版本做什么
+          **只做系统修复，不含任何常驻守护进程，不安装任何 APK，不需要 LSPosed。**
+
+          - **② PowerKeeper**：修补移植包改坏的两处字节码（`void` 方法里 `return` 值、
+            静态方法丢了 `static`），恢复 MIUI 省电管理 —— 否则 `com.miui.powerkeeper` 开机即崩。
+          - **③ 停 BPF 监视器**：开机后一次性停掉 `hyper_bpfloader` 的监视器（`dynbpfloader`），
+            避免它因为 6.10+ 内核的私有 BPF 程序在 6.6.82 上加载不了而判定"系统损坏"、
+            写 recovery 引导块并重启进 recovery。
+          - **④ 停死电话栈**：本机 `ro.baseband=apq` 无 modem，停掉每秒崩数百次的三个电话包。
+          - **⑭ 开发者选项**：补两条最小 SELinux 权限，否则 Enforcing 下打开
+            「设置 → 开发者选项」必现闪退。**没有开关，永远生效。**
+
+          ②③④ 全部是"开机后做一次就结束"，⑭ 在 post-fs-data 与开机后各补一次 ——
+          **运行期没有任何常驻进程**，不占内存、不耗电、不需要看护。
+
           ## 安装
           1. 把下面的 zip 丢给 KernelSU 管理器安装（或 `magisk --install-module`）。
           2. 重启。
-          3. 在 KernelSU 管理器的模块页打开 WebUI，逐项开关功能（四类各有总开关）。
+          3. 装完在 KernelSU 管理器的模块页打开 WebUI，可以逐项开关并看实时状态。
 
-          ## 默认状态
-          - **系统修复**（② PowerKeeper、③ 停 BPF 监视器、④ 停死电话栈、⑭ 开发者选项）：默认开，不需要 App。
-          - **手势与书写**（⑥ 手势桥等）：默认开。
-          - **手写笔连接 / 注视感知**（① ⑤ ⑦ ⑧ ⑨ ⑫ ⑬）：依赖 `dev.tb378fc.fix`，**默认关**，
-            所以默认不安装任何 APK；打开其中任意一项才会自动装 `bin/TbFix.apk`，全部关掉会自动卸载。
+          ## 注意
+          - 需要 App 的手写笔功能（唤醒 / 电量胶囊 / 手势桥 / 笔刷触感 / 注视感知等）
+            在**同仓库 Full 分支**，本分支不包含。
+          - 本模块 id 是 `tb378fc_hyperos_fix_lite`，与 Full 分支的模块 **id 不同、可以共存**，
+            但两项会争同一个 PowerKeeper 挂载点，**请只开其中一个**。
 
           详细说明见仓库 README.md。
           NOTES

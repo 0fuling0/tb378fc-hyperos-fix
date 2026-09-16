@@ -8,9 +8,13 @@ com.miui.powerkeeper dies on every boot (VerifyError) and MIUI power management 
 
 Fix: flip opcode 0x0f -> 0x0e at the instruction, then recompute the dex header's
 adler32 checksum and SHA-1 signature (the dex spec covers bytes [12:] and [32:]).
+
+This step only produces `classes-patched.dex`.  The dex is spliced back into the original
+APK **in place** by repack_payload.py — do NOT rebuild the zip here: rewriting the archive
+with `zipfile` drops the APK Signing Block, and Android 11+ then refuses to scan the package
+("No APK Signature Scheme v2 signature in package").  See apk_inplace.py for the full story.
 """
 import hashlib
-import shutil
 import struct
 import sys
 import zipfile
@@ -19,7 +23,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC_APK = HERE / "PowerKeeper.apk"
-OUT_APK = HERE / "PowerKeeper-patched.apk"
 PATCHED_DEX = HERE / "classes-patched.dex"
 # file offset of the `return v0` instruction (0x0f 0x00), from `dexdump -d`
 PATCH_OFFSET = 0x172ECA
@@ -31,7 +34,6 @@ def main() -> None:
     with zipfile.ZipFile(SRC_APK) as z:
         info = z.getinfo("classes.dex")
         dex = bytearray(z.read("classes.dex"))
-        entries = [(i, z.read(i.filename)) for i in z.infolist()]
 
     if dex[:8] != b"dex\n039\0":
         raise SystemExit(f"unexpected dex magic {dex[:8]!r}")
@@ -46,21 +48,12 @@ def main() -> None:
     # header: checksum over [12:], signature over [32:]
     dex[12:32] = hashlib.sha1(bytes(dex[32:])).digest()
     dex[8:12] = struct.pack("<I", zlib.adler32(bytes(dex[12:])) & 0xFFFFFFFF)
+    if len(dex) != info.file_size:
+        raise SystemExit(f"dex 长度变了：{len(dex)} != {info.file_size} —— 补丁本应等长")
     PATCHED_DEX.write_bytes(dex)
     print(f"dex patched: 0x{OLD:02x} -> 0x{NEW:02x} at 0x{PATCH_OFFSET:x}, "
           f"size unchanged={len(dex) == info.file_size}")
-
-    with zipfile.ZipFile(OUT_APK, "w") as out:
-        for zi, data in entries:
-            if zi.filename == "classes.dex":
-                data = bytes(dex)
-            new_info = zipfile.ZipInfo(zi.filename, date_time=zi.date_time)
-            new_info.compress_type = zi.compress_type
-            new_info.external_attr = zi.external_attr
-            new_info.internal_attr = zi.internal_attr
-            new_info.create_system = zi.create_system
-            out.writestr(new_info, data)
-    print(f"wrote {OUT_APK}")
+    print(f"wrote {PATCHED_DEX}")
 
 
 if __name__ == "__main__":

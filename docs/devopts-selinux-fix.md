@@ -3,8 +3,9 @@
 `TB378FC` + HyperOS 移植包在 **SELinux Enforcing** 下，「设置 → 开发者选项」**必现闪退**；
 `setenforce 0` 就正常。这里是根因、在模块里的接法、以及验证方法。
 
-> 本项在 **v3.6 并入主模块**（之前是个独立模块 `devopts-selinux-fix`）。
-> 现在没有单独的包，也没有 disable 标记 —— 它是崩溃修复，不是可选功能。
+> 本项在 **v3.6 并入 Full 分支的主模块**（之前是个独立模块 `devopts-selinux-fix`），
+> **v1.0 起 Lite 分支也包含它**。没有单独的包，也没有 disable 标记 ——
+> 它是崩溃修复，不是可选功能。
 
 ---
 
@@ -46,21 +47,21 @@ allow system_app logpersistd_logging_prop property_service set
 
 | 位置 | 做了什么 |
 |---|---|
-| `module/sepolicy.rule` | 末尾加两条规则（KernelSU 开机声明式加载） |
-| `module/post-fs-data.sh` | 末尾用 `ksud sepolicy apply "$MODDIR/sepolicy.rule"` **显式再应用一次**，结果写 `wake.log` |
-| `module/service.sh` 的 setup | 同步再跑一次 `sh "$0" --sepolicy`（刷掉开机期可能被缓存的拒绝） |
-| `module/service.sh --sepolicy` | 新子命令：**免重启手动重应用**，顺带打印 `getenforce` 与两个属性当前值 |
-| `module/action.sh` | 状态面板加一行 ⑭：判据是"开机以来有没有 logpersistd 拒绝" |
+| `module/sepolicy.rule` | 只有两条规则（KernelSU 开机声明式加载） |
+| `module/post-fs-data.sh` | 末尾用 `ksud sepolicy apply "$MODDIR/sepolicy.rule"` **显式再应用一次**，结果写 `lite.log` |
+| `module/service.sh` 的 `do_sepolicy` | 等 `boot_completed` 后再跑一次（刷掉开机期可能被缓存的拒绝） |
+| `module/service.sh --sepolicy` | 子命令：**免重启手动重应用** |
+| `module/webroot/index.html` | ⑭ 那一行带「重新应用（免重启）」按钮，走的就是上面这条子命令 |
 
 手动重应用：
 
 ```sh
-sh /data/adb/modules/tb378fc_hyperos_fix/service.sh --sepolicy
+sh /data/adb/modules/tb378fc_hyperos_fix_lite/service.sh --sepolicy
 ```
 
 原理：`ksud sepolicy apply` 把规则注入**内存中的运行时策略**并触发一次策略重载，
 同时刷掉**内核 AVC** 与 **init 用户态 libselinux** 两边的陈旧拒绝缓存 → **立即生效、无需重启**。
-代价是只在内存里，重启后由 `post-fs-data.sh` 与 setup 自动重放。
+代价是只在内存里，重启后由 `post-fs-data.sh` 与开机动作自动重放。
 
 ---
 
@@ -71,9 +72,10 @@ KernelSU 开机会自动加载模块的 `sepolicy.rule`，但实测在 **ReSukiS
 所以两个开机脚本里各用 ksud 的运行时通道显式再应用一遍（实测开机 `rc=0`，稳定生效）。
 
 顺带一个**重要边界**：`ksud sepolicy apply` 是"按传入文件重新推导并应用"，**不跨调用累积**。
-所以传给它的必须是**完整**的 `sepolicy.rule`（含 ⑧b 的三条），不能只传 ⑭ 那两条 ——
-否则会把 ⑧b 的 AON 规则覆盖掉。同理，**如果以后还有别的模块也用 `ksud sepolicy apply`，
-两个模块会互相覆盖**；正确做法是把规则合并进本文件，只留一个应用方。
+所以传给它的必须是**完整**的 `sepolicy.rule`。Lite 分支里这个文件就只有 ⑭ 这两条
+（Full 分支还含 ⑧b AON 的三条 —— 如果你从 Full 切过来，注意别把两边混用）。
+同理，**如果还有别的模块也用 `ksud sepolicy apply`，两个模块会互相覆盖**；
+正确做法是把规则合并进同一个文件，只留一个应用方。
 
 ---
 

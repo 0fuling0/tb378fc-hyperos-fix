@@ -1,0 +1,28 @@
+# 行尾统一为 LF。
+#
+# 为什么必须显式写死：Android 的 sh（mksh）**不能执行 CRLF 脚本** —— 会报
+#     "xxx: inaccessible or not found"   或   "syntax error: unexpected '&&'"
+# 而 Windows 上 core.autocrlf=true 会把 checkout 出来的文本文件全变成 CRLF。
+#
+# 这个坑在本仓库已经踩到两次：
+#   * 模块脚本带 CR 进包 → 装到设备上整个模块静默不工作
+#     （build.sh 里"暂存副本 + sed 归一化行尾"就是为它加的）；
+#   * tools/acceptance.sh 直接 adb push 到设备 → mksh 拒绝执行
+#     （报的就是上面那两条，但看起来像"脚本写错了"，很容易查错方向）。
+#
+# 有这条之后，无论谁在什么平台上 clone / checkout，文本文件都是 LF，
+# build.sh 里那层归一化就退化成双保险。
+* text=auto eol=lf
+
+# 二进制文件，别做任何转换（否则会被当文本改坏）
+*.apk     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.jks     binary
+*.keystore binary
+*.dex     binary
+*.odex    binary
+*.vdex    binary
+*.zip     binary
+*.idsig   binary

@@ -1,23 +1,19 @@
 # 构建产物
 out/
-app/*/build/
-app/*/*.apk.idsig
-extras/PenStylusHook/build/
-extras/PenStylusHook/PenStylusHook.apk
 
-# 中间产物（payload-src 下的原厂 APK 不入库，规则脚本入库）
+# payload 中间产物（payload-src 下的原厂 APK 不入库 —— 体积大且版权在原厂；
+# 补丁脚本 patch_powerkeeper.py / fix_static.py / repack_payload.py 入库）
 payload-src/PowerKeeper-patched.apk
 payload-src/classes-patched*.dex
 payload-src/payload.apk
 payload-src/PowerKeeper-stock.apk
 
-# 设备/调试残留
+# 设备/调试残留 —— 模块目录下这些是**运行期**文件，既不能进仓库也不能进包
 *.log
 *.pid
 brush.*
 wake.log*
 __pycache__/
 *.pyc
-
-# 设备上那份由 build.sh 重建（penring 保留入库便于对比）
-module/bin/TbFix.apk
+module/disable
+module/disable-*

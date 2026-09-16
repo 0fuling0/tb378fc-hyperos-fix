@@ -1,950 +1,339 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="light dark">
-<title>TB378FC HyperOS 修复</title>
+<title>TB378FC HyperOS 修复 Lite</title>
 <style>
-/* ==========================================================================
-   设计令牌 —— Material Design 3（M3）
-   色板取 M3 蓝（source #415F91）的官方 tonal 映射：亮/暗各一套语义色。
-   形状用 M3 Expressive 的更大圆角（文本框 12dp、卡片 16dp、按钮全圆）。
-   为什么全部内联：KernelSU 的 WebUI 跑在本地 WebView 里，**没有网络**，
-   不能引 CDN，也不能依赖任何外部字体/图标（图标一律内联 SVG path）。
-   ========================================================================== */
 :root{
-  /* ---- 主色 ---- */
-  --primary:#415F91;            --on-primary:#FFFFFF;
-  --primary-container:#D6E3FF;  --on-primary-container:#001B3E;
-  --secondary:#565F71;          --on-secondary:#FFFFFF;
-  --secondary-container:#DAE2F9;--on-secondary-container:#131C2B;
-  --tertiary:#705575;           --on-tertiary:#FFFFFF;
-  --tertiary-container:#FAD8FD; --on-tertiary-container:#28132E;
-  --error:#BA1A1A;              --on-error:#FFFFFF;
-  --error-container:#FFDAD6;    --on-error-container:#410002;
-  /* ---- 表面（M3 有 5 级 surface container，层次靠它们而不是阴影）---- */
-  --surface:#F9F9FF;            --on-surface:#191C20;
-  --surface-variant:#E0E2EC;    --on-surface-variant:#44474E;
-  --s-lowest:#FFFFFF;
-  --s-low:#F3F3FA;
-  --s-container:#EDEDF4;
-  --s-high:#E7E8EE;
-  --s-highest:#E2E2E9;
-  --outline:#74777F;            --outline-variant:#C4C6D0;
-  --inverse-surface:#2E3135;    --inverse-on-surface:#EFF0F7;
-  --scrim:rgba(0,0,0,.32);
-  /* ---- 高度（M3 elevation 1/2/3）---- */
-  --e1:0 1px 2px rgba(0,0,0,.30),0 1px 3px 1px rgba(0,0,0,.15);
-  --e2:0 1px 2px rgba(0,0,0,.30),0 2px 6px 2px rgba(0,0,0,.15);
-  --e3:0 4px 8px 3px rgba(0,0,0,.15),0 1px 3px rgba(0,0,0,.30);
-  /* ---- 形状 ---- */
-  --r-xs:4px; --r-s:8px; --r-m:12px; --r-l:16px; --r-xl:28px; --r-full:999px;
+  --bg:#f6f6f4; --card:#ffffff; --line:rgba(0,0,0,.10); --line2:rgba(0,0,0,.18);
+  --fg:#1c1c1a; --fg2:#5f5e5a; --fg3:#8a8880;
+  --ok:#0f6e56; --okbg:#e1f5ee;
+  --bad:#a32d2d; --badbg:#fcebeb;
+  --warn:#854f0b; --warnbg:#faeeda;
+  --accent:#185fa5;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
-html[data-theme="dark"]{
-  --primary:#A9C7FF;            --on-primary:#082F5F;
-  --primary-container:#284777;  --on-primary-container:#D6E3FF;
-  --secondary:#BEC6DC;          --on-secondary:#283141;
-  --secondary-container:#3E4759;--on-secondary-container:#DAE2F9;
-  --tertiary:#DDBCE0;           --on-tertiary:#3F2844;
-  --tertiary-container:#573E5C; --on-tertiary-container:#FAD8FD;
-  --error:#FFB4AB;              --on-error:#690005;
-  --error-container:#93000A;    --on-error-container:#FFDAD6;
-  --surface:#111318;            --on-surface:#E2E2E9;
-  --surface-variant:#44474E;    --on-surface-variant:#C4C6D0;
-  --s-lowest:#0C0E13;
-  --s-low:#191C20;
-  --s-container:#1D2024;
-  --s-high:#282A2F;
-  --s-highest:#33353A;
-  --outline:#8E9099;            --outline-variant:#44474E;
-  --inverse-surface:#E2E2E9;    --inverse-on-surface:#2E3135;
-  --scrim:rgba(0,0,0,.5);
-  --e1:0 1px 2px rgba(0,0,0,.55),0 1px 3px 1px rgba(0,0,0,.35);
-  --e2:0 1px 2px rgba(0,0,0,.55),0 2px 6px 2px rgba(0,0,0,.35);
-  --e3:0 4px 8px 3px rgba(0,0,0,.35),0 1px 3px rgba(0,0,0,.55);
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#1b1b19; --card:#242422; --line:rgba(255,255,255,.12); --line2:rgba(255,255,255,.22);
+    --fg:#f0efe9; --fg2:#b4b2a9; --fg3:#888780;
+    --ok:#9fe1cb; --okbg:#085041;
+    --bad:#f7c1c1; --badbg:#501313;
+    --warn:#fac775; --warnbg:#412402;
+    --accent:#85b7eb;
+  }
 }
-
-/* ========================================================================== 基础
-   M3 排版尺度：title-large 22/28、title-medium 16/24、body-large 16/24、
-   body-medium 14/20、body-small 12/16、label-large 14/20、label-medium 12/16 */
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{
-  background:var(--surface);color:var(--on-surface);
-  font:400 14px/20px Roboto,-apple-system,"Noto Sans CJK SC","Source Han Sans SC",
-       "PingFang SC","Microsoft YaHei",sans-serif;
-  -webkit-tap-highlight-color:transparent;
-  -webkit-text-size-adjust:100%;
-  padding-bottom:40px;
-  letter-spacing:.1px;
-}
-.wrap{max-width:840px;margin:0 auto;padding:0 12px}
-code{font-family:ui-monospace,Menlo,Consolas,"Noto Sans Mono CJK SC",monospace;font-size:.92em}
-
-/* ========================================================================== M3 Top App Bar
-   静息态是 surface 且无阴影；滚动后升到 surfaceContainer（M3 的滚动行为）。 */
-.appbar{position:sticky;top:0;z-index:20;background:var(--surface);transition:background .2s}
-.appbar.scrolled{background:var(--s-container)}
-.appbar .bar{
-  max-width:840px;margin:0 auto;padding:8px 6px 8px 12px;
-  display:flex;align-items:center;gap:4px;min-height:64px;
-}
-.appbar .mark{
-  width:40px;height:40px;border-radius:var(--r-m);flex:0 0 auto;
-  background:var(--primary-container);color:var(--on-primary-container);
-  display:flex;align-items:center;justify-content:center;
-  font-weight:600;font-size:13px;letter-spacing:-.3px;
-}
-.appbar .t1{font-size:22px;line-height:28px;font-weight:400}
-.appbar .t2{font-size:12px;line-height:16px;color:var(--on-surface-variant);margin-top:2px}
-.appbar .grow{flex:1;min-width:0;padding-left:6px}
-/* M3 icon button：40dp 触达、全圆、状态层靠 ::after */
-.iconbtn{
-  position:relative;width:40px;height:40px;border:0;border-radius:var(--r-full);
-  background:transparent;color:var(--on-surface-variant);cursor:pointer;flex:0 0 auto;
-  display:flex;align-items:center;justify-content:center;overflow:hidden;
-}
-.iconbtn::after{
-  content:"";position:absolute;inset:0;background:currentColor;opacity:0;
-  transition:opacity .12s;
-}
-.iconbtn:hover::after{opacity:.08}
-.iconbtn:active::after{opacity:.12}
-.iconbtn svg{width:22px;height:22px;fill:currentColor;position:relative;z-index:1}
-.iconbtn:focus-visible{outline:3px solid var(--primary);outline-offset:2px}
-/* M3 线性进度条：4dp 轨道 + 全圆指示条 */
-#prog{height:4px;background:transparent;overflow:hidden;border-radius:var(--r-full);margin:0 12px}
-#prog.on{background:var(--s-highest)}
-#prog.on::after{
-  content:"";display:block;height:100%;width:35%;background:var(--primary);
-  border-radius:var(--r-full);
-  animation:slide 1.1s cubic-bezier(.2,0,0,1) infinite;
-}
-@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(320%)}}
-
-/* ========================================================================== M3 Card（filled）
-   M3 用 surface container 层级表达层次，阴影很克制 —— 这里只在 hover 时给 e1。 */
-.card{
-  background:var(--s-low);border-radius:var(--r-l);
-  margin-top:12px;overflow:hidden;
-}
-.card>.head{padding:16px 16px 12px;display:flex;align-items:flex-start;gap:12px}
-.card>.head .grow{flex:1;min-width:0}
-.card .ctitle{font-size:16px;line-height:24px;font-weight:500;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.card .cnote{font-size:12px;line-height:16px;color:var(--on-surface-variant);margin-top:4px}
-.card .body{padding:0 0 4px}
-.card .foot{padding:8px 16px 16px}
-
-/* ========================================================================== M3 List item
-   56dp 最小高度、16dp 水平内边距；分隔线用 outlineVariant。 */
-.row{
-  display:flex;align-items:center;gap:12px;
-  padding:12px 16px;min-height:56px;
-}
-.row+.row{box-shadow:inset 0 1px 0 var(--outline-variant)}
-.row.sub{min-height:48px;padding:10px 16px 10px 44px}
-.row .lab{flex:1;min-width:0}
-.row .pri{font-size:14px;line-height:20px;font-weight:500;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.row .sec{font-size:12px;line-height:16px;color:var(--on-surface-variant);margin-top:3px}
-.row .ctl{flex:0 0 auto;display:flex;align-items:center;gap:10px}
-/* 父项关着 → 整行降不透明度，三级开关也跟着暗下去（并已显示为关，见 itemRow） */
-.row.disabled .pri,.row.disabled .sec{opacity:.55}
-.row.disabled .sw,.row.disabled .sel{opacity:.55}
-
-/* 功能编号徽章（M3 没有对应件，做成 tonal 小药丸） */
-.badge{
-  display:inline-flex;align-items:center;justify-content:center;
-  min-width:22px;height:22px;padding:0 6px;border-radius:var(--r-full);
-  background:var(--primary-container);color:var(--on-primary-container);
-  font-size:11px;font-weight:600;line-height:1;flex:0 0 auto;
-}
-
-/* ========================================================================== M3 Chip（assist / label）
-   32dp 高、8dp 圆角；这里为了信息密度压到 26dp，形状仍是 M3 的。 */
-.chip{
-  display:inline-flex;align-items:center;gap:4px;
-  height:26px;padding:0 10px;border-radius:var(--r-s);
-  font-size:11px;font-weight:500;line-height:1;letter-spacing:.2px;
-  border:1px solid transparent;white-space:nowrap;
-}
-.chip.ok  {background:var(--primary-container);  color:var(--on-primary-container)}
-.chip.warn{background:var(--tertiary-container); color:var(--on-tertiary-container)}
-.chip.err {background:var(--error-container);    color:var(--on-error-container)}
-.chip.info{background:var(--secondary-container);color:var(--on-secondary-container)}
-.chip.mute{background:transparent;color:var(--on-surface-variant);border-color:var(--outline-variant)}
-
-/* ========================================================================== M3 Switch
-   轨道 52×32、全圆；滑块 16dp（关）→ 24dp（开，带对勾）。
-   混合态 M3 没有原生件，做成"轨道+短横"，语义仍是"部分开启"。 */
-.sw{
-  position:relative;width:52px;height:32px;border-radius:var(--r-full);
-  background:var(--s-highest);box-shadow:inset 0 0 0 2px var(--outline);
-  flex:0 0 auto;cursor:pointer;
-  transition:background .2s,box-shadow .2s;
-}
-.sw .thumb{
-  position:absolute;top:8px;left:8px;width:16px;height:16px;border-radius:50%;
-  background:var(--outline);z-index:1;
-  display:flex;align-items:center;justify-content:center;
-  transition:top .2s,left .2s,width .2s,height .2s,background .2s;
-}
-.sw .thumb svg{width:16px;height:16px;display:block;fill:var(--primary);opacity:0;transition:opacity .15s}
-.sw.on{background:var(--primary);box-shadow:none}
-.sw.on .thumb{top:4px;left:24px;width:24px;height:24px;background:var(--on-primary)}
-.sw.on .thumb svg{opacity:1}
-/* 混合：轨道保持中性，滑块里一条短横 */
-.sw.ind .thumb::after{content:"";width:10px;height:2px;border-radius:1px;background:var(--on-surface-variant)}
-/* 状态层：M3 是"以滑块圆心为中心的 40dp 圆"。滑块圆心：关=16px、开=36px。 */
-.sw::after{
-  content:"";position:absolute;top:50%;left:16px;width:40px;height:40px;
-  border-radius:50%;background:var(--on-surface);transform:translate(-50%,-50%);
-  opacity:0;pointer-events:none;z-index:0;
-  transition:opacity .12s,left .2s;
-}
-.sw.on::after{left:36px}
-.sw:hover::after{opacity:.08}
-.sw:active::after{opacity:.12}
-.sw:focus-visible{outline:3px solid var(--primary);outline-offset:2px}
-.sw.busy{opacity:.55;pointer-events:none}
-
-/* ========================================================================== M3 Text field（outlined，Expressive 12dp 圆角）
-   原生 <select> 不能放子元素，箭头只能用 data-URI，因此明暗各写一份。 */
-.sel{
-  appearance:none;-webkit-appearance:none;
-  background:var(--s-lowest);color:var(--on-surface);
-  border:1px solid var(--outline);border-radius:var(--r-m);
-  padding:9px 34px 9px 12px;font-size:13px;line-height:18px;font-family:inherit;
-  min-width:146px;cursor:pointer;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M7 10l5 5 5-5z' fill='%2374777F'/></svg>");
-  background-repeat:no-repeat;background-position:right 8px center;background-size:20px 20px;
-}
-html[data-theme="dark"] .sel{
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M7 10l5 5 5-5z' fill='%238E9099'/></svg>");
-}
-.sel:hover{border-color:var(--on-surface)}
-.sel:focus{outline:none;border-color:var(--primary);box-shadow:inset 0 0 0 1px var(--primary)}
-.sel:disabled{opacity:.45;cursor:default}
-
-/* ========================================================================== M3 Button
-   filled / tonal / outlined / text 四种；40dp 高、20dp 圆角（= 高度一半）。 */
-.btn{
-  appearance:none;border:0;border-radius:var(--r-full);
-  font-family:inherit;font-size:14px;line-height:20px;font-weight:500;letter-spacing:.1px;
-  height:40px;padding:0 24px;cursor:pointer;
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  position:relative;overflow:hidden;
-  transition:box-shadow .15s,background .15s;
-}
-.btn::after{content:"";position:absolute;inset:0;background:currentColor;opacity:0;transition:opacity .12s}
-.btn:hover::after{opacity:.08}
-.btn:active::after{opacity:.12}
-.btn.filled{background:var(--primary);color:var(--on-primary)}
-.btn.filled:hover{box-shadow:var(--e1)}
-.btn.tonal{background:var(--secondary-container);color:var(--on-secondary-container)}
-.btn.outlined{background:transparent;color:var(--primary);box-shadow:inset 0 0 0 1px var(--outline)}
-.btn.text{background:transparent;color:var(--primary);padding:0 12px}
-.btn:disabled{background:var(--on-surface);color:var(--surface);opacity:.12;cursor:default;box-shadow:none}
-.btn:disabled::after{opacity:0}
-.btn:focus-visible{outline:3px solid var(--primary);outline-offset:2px}
-.btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-
-/* ========================================================================== M3 提示块
-   M3 没有 Alert，用 tonal container 表达语义（info=primary、warn=tertiary、err=error）。 */
-.alert{
-  display:flex;gap:10px;align-items:flex-start;
-  border-radius:var(--r-m);padding:12px 14px;font-size:12px;line-height:16px;
-  margin:10px 16px 0;
-}
-.alert.warn{background:var(--tertiary-container);color:var(--on-tertiary-container)}
-.alert.err {background:var(--error-container);   color:var(--on-error-container)}
-.alert.info{background:var(--primary-container); color:var(--on-primary-container)}
-.alert b{font-weight:600}
-.alert code{background:rgba(0,0,0,.06);border-radius:4px;padding:0 3px}
-
-/* ========================================================================== 分组小标题（M3 title-small） */
-.sechead{
-  display:flex;align-items:center;gap:8px;
-  padding:16px 16px 8px;font-size:14px;line-height:20px;font-weight:500;
-  color:var(--on-surface-variant);
-}
-.sechead::after{content:"";flex:1;height:1px;background:var(--outline-variant)}
-
-/* ========================================================================== 日志（M3 surfaceContainerHighest 上的等宽块） */
-#log{
-  white-space:pre-wrap;word-break:break-all;
-  font:12px/16px ui-monospace,Menlo,Consolas,"Noto Sans Mono CJK SC",monospace;
-  color:var(--on-surface-variant);
-  background:var(--s-highest);border-radius:var(--r-m);
-  max-height:190px;overflow:auto;margin:0 16px 16px;padding:12px;
-}
-#log .bad{color:var(--error)}
-#log .good{color:var(--primary)}
-
-/* ========================================================================== M3 Snackbar
-   inverseSurface 底 + inverseOnSurface 字，4dp 圆角，elevation 3。 */
-.snack{
-  position:fixed;left:50%;bottom:20px;transform:translateX(-50%) translateY(200%);
-  background:var(--inverse-surface);color:var(--inverse-on-surface);
-  font-size:14px;line-height:20px;
-  padding:14px 16px;border-radius:var(--r-xs);box-shadow:var(--e3);
-  max-width:88vw;z-index:60;transition:transform .25s cubic-bezier(.2,0,0,1);
-  display:flex;align-items:center;gap:10px;
-}
-.snack.show{transform:translateX(-50%) translateY(0)}
-.snack .dot{width:8px;height:8px;border-radius:50%;background:var(--inverse-primary,#A9C7FF);flex:0 0 auto}
-.snack.bad .dot{background:var(--error)}
-
-.foot-note{color:var(--on-surface-variant);font-size:12px;line-height:16px;padding:16px 4px 0;text-align:center}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;padding:16px 14px 28px;background:var(--bg);color:var(--fg);
+  font:400 14px/1.6 -apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+h1{margin:0;font-size:17px;font-weight:500}
+.sub{margin:4px 0 14px;font-size:12px;color:var(--fg2)}
+.row{display:flex;align-items:center;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:10px}
+.head{display:flex;align-items:flex-start;gap:10px}
+.num{flex:0 0 auto;width:24px;height:24px;border-radius:7px;background:var(--bg);
+  border:1px solid var(--line);display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:500;color:var(--fg2)}
+.title{flex:1 1 auto;min-width:0}
+.title .n{font-size:15px;font-weight:500;display:block}
+.title .d{font-size:12px;color:var(--fg2);margin-top:2px}
+.desc{margin:10px 0 0;font-size:12.5px;color:var(--fg2)}
+.st{margin-top:10px;display:inline-flex;align-items:center;gap:6px;
+  font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid transparent}
+.st.ok{color:var(--ok);background:var(--okbg)}
+.st.bad{color:var(--bad);background:var(--badbg)}
+.st.mid{color:var(--warn);background:var(--warnbg)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:0 0 auto}
+.sw{flex:0 0 auto;width:48px;height:28px;border-radius:999px;border:1px solid var(--line2);
+  background:var(--bg);position:relative;cursor:pointer;transition:background .15s,border-color .15s}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;
+  background:var(--card);border:1px solid var(--line2);transition:transform .15s}
+.sw[aria-checked="true"]{background:var(--okbg);border-color:var(--ok)}
+.sw[aria-checked="true"]::after{transform:translateX(20px);background:var(--ok);border-color:var(--ok)}
+.sw[disabled]{opacity:.45;cursor:default}
+.fixed{font-size:12px;color:var(--ok);background:var(--okbg);padding:3px 9px;border-radius:999px;flex:0 0 auto}
+.btn{border:1px solid var(--line2);background:var(--bg);color:var(--fg);border-radius:9px;
+  padding:7px 12px;font-size:13px;cursor:pointer;font-family:inherit}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.5;cursor:default}
+.btn.primary{color:var(--accent);border-color:var(--accent)}
+.note{border:1px solid var(--line);background:var(--card);border-radius:12px;padding:12px 14px;
+  font-size:12.5px;color:var(--fg2);margin-bottom:10px}
+.note b{color:var(--fg);font-weight:500}
+.bar{display:flex;gap:8px;align-items:center;margin:14px 0 10px;flex-wrap:wrap}
+.mono{font-family:var(--mono);font-size:11.5px;word-break:break-all}
+.log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;
+  max-height:230px;overflow:auto;font-family:var(--mono);font-size:11.5px;color:var(--fg2);
+  white-space:pre-wrap;word-break:break-all}
+.log .ok{color:var(--ok)} .log .bad{color:var(--bad)} .log .warn{color:var(--warn)}
+.mark{font-size:12px;color:var(--fg2);margin-bottom:10px}
+.foot{margin-top:14px;font-size:11.5px;color:var(--fg3);text-align:center}
 </style>
 </head>
 <body>
 
-<header class="appbar" id="appbar">
-  <div class="bar">
-    <div class="mark">TB</div>
-    <div class="grow">
-      <div class="t1">TB378FC HyperOS 修复</div>
-      <div class="t2" id="sub">正在读取配置…</div>
-    </div>
-    <button class="iconbtn" id="btnReload" title="重新读取配置" aria-label="重新读取配置">
-      <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-    </button>
-    <button class="iconbtn" id="btnTheme" title="切换明暗主题" aria-label="切换明暗主题">
-      <svg id="icoTheme" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-5.4-5.4c0-1.81.89-3.42 2.26-4.4C12.92 3.04 12.46 3 12 3z"/></svg>
-    </button>
-  </div>
-  <div id="prog"></div>
-</header>
+<h1>TB378FC HyperOS 修复 <span style="color:var(--fg2)">Lite</span></h1>
+<div class="sub" id="ver">正在读取状态…</div>
 
-<main class="wrap" id="app"></main>
-<div class="foot-note">改动写入模块 <code>config</code>，守护约 20 秒后重启生效</div>
+<div class="note">
+  <b>这一版只做系统修复，没有任何常驻进程。</b>三个开关都在开机后执行一次就结束 ——
+  所以改完开关需要<b>重启设备</b>才生效（不是重启模块）。
+  需要 App 的手写笔功能见同仓库 Full 分支。
+</div>
 
-<div class="snack" id="snack"><span class="dot"></span><span id="snackTxt"></span></div>
+<div id="items"></div>
+
+<div id="s14"></div>
+
+<div class="bar">
+  <button class="btn primary" id="refresh">刷新状态</button>
+  <button class="btn" id="status">查看文本状态</button>
+  <span class="mono" id="busy" style="color:var(--fg3)"></span>
+</div>
+
+<div class="mark" id="markers"></div>
+<div class="log" id="log">就绪。</div>
+<div class="foot">Lite 版：只做系统修复 · 无守护进程 · 不安装 APK</div>
 
 <script>
-/* ==========================================================================
-   KernelSU WebUI 桥
-   ========================================================================== */
-const M = "/data/adb/modules/tb378fc_hyperos_fix";
+"use strict";
+const M = "/data/adb/modules/tb378fc_hyperos_fix_lite";
+const $ = s => document.querySelector(s);
 
-const $ = (s, r) => (r || document).querySelector(s);
-const el = (tag, cls, txt) => {
+let CFG = {};
+let busy = false;
+const LOG = [];
+
+function logLine(msg, kind) {
+  const d = new Date();
+  const p2 = n => String(n).padStart(2, "0");
+  const ts = p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
+  LOG.push({ ts: ts, msg: String(msg), kind: kind || "" });
+  if (LOG.length > 300) LOG.shift();
+  paintLog();
+}
+function paintLog() {
+  const box = $("#log");
+  box.textContent = "";
+  for (const l of LOG) {
+    const s = document.createElement("span");
+    s.className = l.kind;
+    s.textContent = l.ts + "  " + l.msg + "\n";
+    box.appendChild(s);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+const q = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
+
+async function run(cmd) {
+  if (!window.ksu || !ksu.exec) throw new Error("KernelSU WebUI API 不可用（请用 KernelSU 管理器打开本页）");
+  const r = await ksu.exec(cmd);
+  const out = (typeof r === "string") ? r : ((r && (r.stdout || r.result)) || "");
+  const err = (r && r.stderr) || "";
+  if (err) logLine("stderr: " + err, "warn");
+  return { out: out || "", err: err || "" };
+}
+
+async function readCfg() {
+  const r = await run("sh " + q(M + "/service.sh") + " --json");
+  const m = /\{[\s\S]*\}/.exec(r.out || "");
+  if (!m) throw new Error("读不到状态（--json 没有输出）");
+  return JSON.parse(m[0]);
+}
+
+/* ==========================================================================
+   功能模型：Lite 只有四项
+   ========================================================================== */
+const ITEMS = [
+  {
+    num: "②", key: "FIX_POWERKEEPER", title: "PowerKeeper 补丁",
+    desc: "把修好的 PowerKeeper.apk 用 bind mount 盖到 /system_ext/app/PowerKeeper（挂父目录，" +
+          "顺带盖掉 ROM 预编译的 oat/），修补移植者改坏的两处字节码（void 方法里 return 了值、" +
+          "静态方法丢了 static）。不做的话 com.miui.powerkeeper 每次开机 VerifyError 崩溃。" +
+          "注意：挂载要等 boot_completed 之后才对 App 进程可见，所以开机早期它仍会崩几次，随后自动恢复。",
+    st: s => s.POWERKEEPER_SEEN === 1
+      ? { k: "ok",  t: "PowerKeeper 已在跑且读到了补丁版" }
+      : (s.POWERKEEPER_MOUNTED === 1
+          ? { k: "mid", t: "已挂载，但进程还没读到（开机早期，稍后会自愈）" }
+          : (s.POWERKEEPER_PAYLOAD === 1
+              ? { k: "mid", t: "未挂载 —— 重启后生效" }
+              : { k: "bad", t: "payload 缺失，无法修补" }))
+  },
+  {
+    num: "③", key: "FIX_BPFMON", title: "停 BPF 监视器",
+    desc: "hyper_bpfloader 的监视器会检查 MIUI 私有 BPF 程序是否已 pin；那套 .o 引用 6.10+ 内核符号、" +
+          "而本机内核是 6.6.82，89 个程序一个都加载不了 → 它判定「系统损坏」，写 recovery 引导块并 " +
+          "reboot,recovery（实测：不开容器时忍着，一旦用 DroidSpaces 容器就触发）。" +
+          "该服务是 init 里的 disabled 服务、只由开机触发器拉起一次，所以停一次即永久生效。",
+    st: s => {
+      if (s.BPFMON_RUNNING === 1) return { k: "bad", t: "BPF 监视器仍在运行" };
+      if (s.BPFMON_SVC === "stopped") return { k: "ok", t: "BPF 监视器已停（init.svc.dynbpfloader=stopped）" };
+      return { k: "mid", t: "BPF 监视器状态未知（init.svc.dynbpfloader=" + (s.BPFMON_SVC || "空") + "）" };
+    }
+  },
+  {
+    num: "④", key: "FIX_TELEPHONY", title: "停死电话栈",
+    desc: "本机 ro.baseband=apq，纯应用处理器、没有集成 modem，框架没有 FEATURE_TELEPHONY；" +
+          "移植包却搬来了声明成 persistent 的小米/QTI 电话栈 → getSystemService 返回 null → " +
+          "NullPointerException 每秒崩几百次，白烧 zygote / system_server。" +
+          "停用状态写在 packages.xml 里，跨重启保持。",
+    st: s => s.TELEPHONY_DONE === 1
+      ? { k: "ok",  t: "电话栈已处理" + (s.TELEPHONY_STATE ? "：" + s.TELEPHONY_STATE : "") }
+      : { k: "bad", t: "电话栈仍有未停用的包：" + (s.TELEPHONY_STATE || "?") }
+  }
+];
+
+function el(tag, cls, txt) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (txt !== undefined && txt !== null) n.textContent = txt;
   return n;
-};
-
-let CFG = {};        // --json 的结果
-let APPST = {installed: 0, needed: 0};
-let LOGLINES = [];   // 本页面的操作日志（重绘时按这个数组重放，不用 innerHTML）
-let busy = false;
-
-function log(msg, kind) {
-  const d = new Date();
-  const p2 = n => String(n).padStart(2, "0");
-  const item = {
-    msg: msg, kind: kind || "",
-    t: p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds())
-  };
-  LOGLINES.push(item);
-  if (LOGLINES.length > 300) LOGLINES.shift();
-  const box = $("#log");
-  if (!box) return;
-  box.appendChild(logLine(item));
-  box.scrollTop = box.scrollHeight;
 }
 
-function logLine(item) {
-  const line = el("div", item.kind === "bad" ? "bad" : (item.kind === "good" ? "good" : ""));
-  line.textContent = item.t + "  " + item.msg;
-  return line;
+function statusPill(st) {
+  const cls = st.k === "ok" ? "ok" : (st.k === "bad" ? "bad" : "mid");
+  const p = el("span", "st " + cls);
+  p.appendChild(el("span", "dot"));
+  p.appendChild(el("span", null, st.t));
+  return p;
 }
 
-function setBusy(on) {
-  const v = !!on;
-  const changed = (v !== busy);
+function buildItem(it) {
+  const card = el("div", "card");
+  const head = el("div", "head");
+
+  head.appendChild(el("div", "num", it.num));
+
+  const t = el("div", "title");
+  t.appendChild(el("span", "n", it.title));
+  const d = el("div", "d");
+  // 这里写「修复已启用」而不是「开」：开关说的是"要不要做这项修复"，
+  // 不是"被修的那个东西现在是什么状态"。③ 尤其容易被读反 ——
+  // 「停 BPF 监视器 开」会被看成「监视器开着」，其实正好相反。
+  d.textContent = (CFG[it.key] === 1 ? "修复已启用" : "修复已关闭");
+  t.appendChild(d);
+  head.appendChild(t);
+
+  const sw = el("button", "sw");
+  sw.type = "button";
+  sw.setAttribute("role", "switch");
+  sw.setAttribute("aria-checked", CFG[it.key] === 1 ? "true" : "false");
+  sw.setAttribute("aria-label", it.title);
+  sw.addEventListener("click", () => toggle(it, sw));
+  head.appendChild(sw);
+
+  card.appendChild(head);
+  card.appendChild(el("div", "desc", it.desc));
+
+  const st = it.st(CFG);
+  d.textContent = (CFG[it.key] === 1 ? "修复已启用" : "修复已关闭") + " · " + st.t;
+  card.appendChild(statusPill(st));
+  return card;
+}
+
+function buildFixed() {
+  const card = el("div", "card");
+  const head = el("div", "head");
+  head.appendChild(el("div", "num", "⑭"));
+  const t = el("div", "title");
+  t.appendChild(el("span", "n", "开发者选项 sepolicy"));
+  t.appendChild(el("div", "d", "崩溃修复 · 没有开关 · 永远生效"));
+  head.appendChild(t);
+  head.appendChild(el("span", "fixed", "常开"));
+  card.appendChild(head);
+  card.appendChild(el("div", "desc",
+    "移植包的策略没给 system_app 授权写 logpersistd_logging_prop，于是「设置 → 开发者选项」在 " +
+    "Enforcing 下必现闪退（setenforce 0 就正常）：Settings 在 onResume 里写 logd.logpersistd，" +
+    "被拒后 native_set 抛 RuntimeException 且没接住。这里只补两条最小权限，不放开别的任何东西。"));
+  const bar = el("div", "bar");
+  const b = el("button", "btn", "重新应用（免重启）");
+  b.addEventListener("click", async () => {
+    if (busy) return;
+    setBusy(true, "正在重新应用 sepolicy…");
+    try {
+      await run("sh " + q(M + "/service.sh") + " --sepolicy");
+      logLine("已重新应用 sepolicy", "ok");
+    } catch (e) {
+      logLine("失败: " + e.message, "bad");
+    } finally {
+      setBusy(false);
+    }
+  });
+  bar.appendChild(b);
+  card.appendChild(bar);
+  return card;
+}
+
+function setBusy(v, txt) {
   busy = v;
-  $("#prog").classList.toggle("on", busy);
-  /* 忙碌时要让所有控件变成不可点（.busy），结束后要恢复 —— 靠重绘来同步，
-     否则开关会一直停在灰掉的状态上。render() 本身不会再调 setBusy，不会递归。 */
-  if (changed && $("#app")) render();
+  $("#busy").textContent = txt || "";
+  for (const b of document.querySelectorAll("button")) b.disabled = v;
 }
 
-let snackTimer = null;
-function snack(msg, bad) {
-  $("#snackTxt").textContent = msg;
-  $("#snack").classList.toggle("bad", !!bad);
-  $("#snack").classList.add("show");
-  clearTimeout(snackTimer);
-  snackTimer = setTimeout(() => $("#snack").classList.remove("show"), 3200);
-}
-
-function q(v) { return "'" + String(v).replace(/'/g, "'\\''") + "'"; }
-
-async function run(cmd) {
+async function toggle(it, sw) {
+  if (busy) return;
+  const next = CFG[it.key] === 1 ? 0 : 1;
+  setBusy(true, "正在写入 " + it.key + "…");
   try {
-    if (!window.ksu || !ksu.exec) throw new Error("KernelSU WebUI API 不可用（请用 KernelSU 管理器打开本页）");
-    const r = await ksu.exec(cmd);
-    const out = (typeof r === "string") ? r : ((r && (r.stdout || r.result)) || "");
-    const err = (r && r.stderr) || "";
-    if (err) log("stderr: " + err, "bad");
-    return {out: out || "", err: err || ""};
+    const r = await run("sh " + q(M + "/service.sh") + " --set " + it.key + " " + next);
+    if (r.err) throw new Error(r.err);
+    CFG[it.key] = next;
+    sw.setAttribute("aria-checked", next === 1 ? "true" : "false");
+    logLine(it.key + " → " + next + "（重启设备后生效）", "ok");
+    render();
   } catch (e) {
-    log("执行失败: " + e.message, "bad");
-    return {out: "", err: String(e)};
+    logLine("写入失败: " + e.message, "bad");
+  } finally {
+    setBusy(false);
   }
-}
-
-/* ==========================================================================
-   功能模型：分类 → 功能项
-   on/off = 该键"开/关"时写进 config 的值（手势映射是键码，不是 1/0）
-   app    = 需要那个 APK（dev.tb378fc.fix）
-   lsp    = 还额外需要 LSPosed 钩子
-   fixed  = 没有开关（崩溃修复），只在界面上说明
-   ========================================================================== */
-const CATS = [
-  {
-    id: "sys", name: "系统修复",
-    note: "移植包自身的问题，只靠模块（root + 内核/属性/包管理）就能修，不需要 App",
-    items: [
-      {k:"FIX_POWERKEEPER", on:"1", off:"0", n:"②", t:"PowerKeeper 修复",
-       d:"修补移植包改坏的两处字节码，恢复 MIUI 省电管理"},
-      {k:"FIX_BPFMON", on:"1", off:"0", n:"③", t:"停 BPF 监视器",
-       d:"避免 hyper_bpfloader 判定「系统损坏」去写 recovery 引导块"},
-      {k:"FIX_TELEPHONY", on:"1", off:"0", n:"④", t:"停死电话栈",
-       d:"本机无 modem，停掉每秒崩数百次的三件套"},
-      {n:"⑭", t:"开发者选项（SELinux）", fixed:true,
-       d:"补 system_app → logpersistd_logging_prop 两条最小权限，否则 Enforcing 下打开必闪退"}
-    ]
-  },
-  {
-    id: "conn", name: "手写笔连接",
-    note: "唤醒、电量胶囊、休眠档、屏幕指令 —— 都要 App 的 BLE 栈",
-    items: [
-      {k:"PEN_WAKE", on:"1", off:"0", n:"①", t:"手写笔休眠唤醒", app:1,
-       d:"磁吸取下时发 {5,5} 把睡死的笔叫起来"},
-      {k:"CAPSULE", on:"1", off:"0", n:"⑤", t:"吸附电量胶囊", app:1,
-       d:"读反向无线充电线圈看到的笔电量，弹 HyperOS 原生胶囊",
-       subs:[
-         {k:"CAPSULE_FAST",   on:"1", off:"0", t:"抢跑",     d:"先用上一次的线圈电量弹（~0.2s），1~2 秒后刷新"},
-         {k:"CAPSULE_DIRECT", on:"1", off:"0", t:"守护直发", d:"跳过 App 一跳，自己直接发原生 STYLUS_STATE_SOC"},
-         {k:"CAPSULE_GATT",   on:"1", off:"0", t:"GATT 校正",d:"直发后再用 GATT 读真电量，不同则补弹一条"}
-       ]},
-      {k:"PEN_REST", on:"1", off:"0", n:"⑨", t:"笔休眠档", app:1,
-       d:"吸在平板上且充满 → 停掉一切主动动作并断开缓存 BLE 连接"},
-      {k:"SCREEN_CMD", on:"1", off:"0", n:"⑬", t:"屏幕亮/灭告诉笔", app:1,
-       d:"亮发 {5,2}、灭发 {5,1}（ZUX buildScreenOnOffCmd）",
-       subs:[{k:"SCREEN_SWAP", on:"1", off:"0", t:"亮灭互换", d:"发反了（比如亮时笔反而睡）就打开"}]}
-    ]
-  },
-  {
-    id: "input", name: "手势与书写",
-    note: "手势桥只靠模块；触感与设置下发需要 App（其中画布状态、即时下发还要 LSPosed）",
-    items: [
-      {k:"GESTURE", on:"1", off:"0", n:"⑥", t:"手势桥",
-       d:"把联想笔的捏/双击/上滑/下滑/笔尾桥成小米触控膜笔（type-8 虚拟笔 + 自定义 kl）",
-       gestures:true},
-      {k:"BRUSH", on:"1", off:"0", n:"⑦", t:"笔刷触感", app:1, lsp:1,
-       d:"笔记/小米创作切笔刷 → 给笔发对应 CON 波形；只在画布前台时开",
-       waves:true},
-      {k:"SETTINGS_SYNC", on:"1", off:"0", n:"⑫", t:"设置 → 笔 下发", app:1, lsp:1,
-       d:"设置里改双击/轻捏/力度，路由给笔（没有钩子时守护每 2 秒兜一次）"}
-    ]
-  },
-  {
-    id: "aon", name: "注视感知",
-    note: "AON：真实前摄 + 人脸检测，让系统真正拿到「有没有人在看」；依赖 LSPosed 钩子",
-    items: [
-      {k:"AON", on:"1", off:"0", n:"⑧", t:"注视感知（AON）", app:1, lsp:1,
-       d:"含 ⑧b HAL 补库与 ⑧c 设置页可见性"}
-    ]
-  }
-];
-
-/* ⑥ 的手势映射：值就是 Android 键码，-1 = 关掉这一条 */
-const GESTURES = [
-  {k:"GESTURE_RING",       n:"轻捏",   def:194, d:"HyperOS 快捷环（系统级，任何 App 都弹）",
-   opts:[{v:194,t:"194 快捷环"},{v:-1,t:"关闭"}]},
-  {k:"GESTURE_DOUBLE",     n:"双击",   def:195, d:"MIUI 双击功能（只有小米创作 / 开过触控膜的 App 有反应）",
-   opts:[{v:195,t:"195 双击"},{v:-1,t:"关闭"}]},
-  {k:"GESTURE_SLIDE_UP",   n:"上滑",   def:196, d:"白名单 App 会被 MIUI 转成 92/93 翻页",
-   opts:[{v:196,t:"196 上滑"},{v:92,t:"92 截图键"},{v:93,t:"93 速记键"},{v:-1,t:"关闭"}]},
-  {k:"GESTURE_SLIDE_DOWN", n:"下滑",   def:197, d:"白名单 App 会被 MIUI 转成 92/93 翻页",
-   opts:[{v:197,t:"197 下滑"},{v:92,t:"92 截图键"},{v:93,t:"93 速记键"},{v:-1,t:"关闭"}]},
-  {k:"GESTURE_TAIL",       n:"笔尾键", def:92,  d:"92 = 截图键（按住 + 点屏幕 = 截图标注）",
-   opts:[{v:92,t:"92 截图键"},{v:93,t:"93 速记键"},{v:-1,t:"关闭"}]}
-];
-
-/* ⑦ 的波形选择 */
-const WAVES = [0,1,3,6,7,32,33,34,35,36,37,38,39,40,41,42];
-const WNAME = {0:"0 关",1:"1 点击",3:"3 触感已启用",6:"6 识别完成",7:"7 按下",
-  32:"32 圆珠笔",33:"33 铅笔",34:"34 马克笔",35:"35 橡皮",36:"36 联想笔刷",
-  37:"37 无音效·圆珠笔",38:"38 无音效·铅笔",39:"39 无音效·马克笔",
-  40:"40 无音效·毛笔",41:"41 无音效·边缘",42:"42 边缘警告"};
-const WAVE_ROWS = [
-  {id:"w1",   lab:"钢笔 (1)",       brush:"1"},
-  {id:"w2",   lab:"圆珠笔 (2)",     brush:"2"},
-  {id:"w3",   lab:"铅笔 (3)",       brush:"3"},
-  {id:"w4",   lab:"马克笔 (4)",     brush:"4"},
-  {id:"w10",  lab:"毛笔 (10)",      brush:"10"},
-  {id:"ai",   lab:"AI 笔",          key:"BRUSH_AI_WAVE",      def:36},
-  {id:"lasso",lab:"框选笔",         key:"BRUSH_LASSO_WAVE",   def:36},
-  {id:"eraser",lab:"笔尾（橡皮端）",key:"BRUSH_ERASER",       def:35},
-  {id:"deflt",lab:"未识别笔刷",     key:"BRUSH_DEFAULT_WAVE", def:36}
-];
-
-/* ==========================================================================
-   取值辅助
-   ========================================================================== */
-const isOn = v => v === 1 || v === "1" || v === true;
-const cfgOf = k => CFG[k];
-
-function mapOf(key) {
-  const o = {};
-  String(CFG[key] || "").split(",").forEach(kv => {
-    const p = kv.split(":");
-    if (p.length === 2 && p[0].trim() !== "") o[p[0].trim()] = p[1].trim();
-  });
-  return o;
-}
-function anyAppOn() {
-  for (const c of CATS) for (const it of c.items) {
-    if (it.k && it.app && isOn(CFG[it.k])) return true;
-  }
-  return false;
-}
-/* "到底需不需要那个 APK"：**优先用 service.sh 算好的 NEED_APP**。
-   它才是权威 —— 它还看得见 disable-* 标记文件（标记会把功能强制关掉），
-   而本地 anyAppOn() 只看 config 键。两个来源并存时界面会撒谎：
-   例如有 disable 标记 → 模块认为七项全关（不装 APK），本地算法却还认为"有功能需要它"，
-   于是卡片上写着「有功能需要它」但 APK 被卸了。读不到 NEED_APP 才退回本地算。 */
-function needApp() {
-  const v = CFG.NEED_APP;
-  if (v === undefined || v === null || v === "") return anyAppOn();
-  return isOn(v);
-}
-/* 分类总开关的状态：on / off / ind（混合） */
-function catState(cat) {
-  const keys = cat.items.filter(i => i.k);
-  let on = 0;
-  for (const it of keys) if (isOn(CFG[it.k])) on++;
-  if (on === 0) return "off";
-  if (on === keys.length) return "on";
-  return "ind";
-}
-
-/* ==========================================================================
-   写入配置
-   pairs: [[key, value], ...] —— 一次写完再统一重启守护（见 service.sh --set）
-   ========================================================================== */
-async function writePairs(pairs, note) {
-  if (!pairs.length) return;
-  setBusy(true);
-  pairs.forEach(([k, v]) => { CFG[k] = String(v); });
-  render();                                   // 先本地乐观更新，界面立刻响应
-  log("保存 " + pairs.map(p => p[0] + "=" + p[1]).join(" ") + (note ? "（" + note + "）" : "") + " …");
-  const args = pairs.map(p => p[0] + " " + q(p[1])).join(" ");
-  const r = await run("sh " + M + "/service.sh --set " + args);
-  if (/^ok\b/.test(r.out.trim())) {
-    log("已保存（守护 ~20 秒后重启生效）", "good");
-    snack("已保存，约 20 秒后生效");
-  } else {
-    log("保存返回: " + (r.out || r.err), "bad");
-    snack("保存失败：" + (r.out || r.err || "无输出"), true);
-  }
-  /* 分组"需要 App"的项变了 → 立刻对齐 APK（该装就装、该卸就卸） */
-  if (pairs.some(p => p[0] === "AON" || p[0] === "PEN_WAKE" || p[0] === "CAPSULE" ||
-                      p[0] === "BRUSH" || p[0] === "PEN_REST" ||
-                      p[0] === "SETTINGS_SYNC" || p[0] === "SCREEN_CMD")) {
-    await syncApk(true);
-  }
-  setBusy(false);
-}
-
-async function syncApk(silent) {
-  if (!silent) setBusy(true);
-  const before = APPST.installed;
-  const r = await run("sh " + M + "/service.sh --apksync");
-  const m = /installed=([01])/.exec(r.out || "");
-  APPST.installed = m ? Number(m[1]) : APPST.installed;
-  APPST.needed = needApp() ? 1 : 0;
-  if (!silent) {
-    log("APK 对齐完成：installed=" + APPST.installed, "good");
-    snack(APPST.installed ? "APK 已安装" : "APK 未安装（当前没有功能需要它）");
-  } else if (before !== APPST.installed) {
-    log("APK 状态变化：" + (APPST.installed ? "已自动安装" : "已自动卸载"), "good");
-    snack(APPST.installed ? "已自动安装 APK" : "已自动卸载 APK");
-  }
-  render();
-  if (!silent) setBusy(false);
-}
-
-/* ==========================================================================
-   渲染
-   ========================================================================== */
-/* M3 Switch：state = on / off / ind。ind（混合）用滑块里的短横表示。 */
-function switchNode(state, onClick) {
-  const s = el("div", "sw" + (state === "on" ? " on" : (state === "ind" ? " ind" : "")));
-  const th = el("span", "thumb");
-  /* 对勾图标用 innerHTML 塞进去：SVG 得用 createElementNS 才认命名空间，
-     而那个 API 在测试的 DOM 桩里没有；innerHTML 在真浏览器里解析 SVG 一样正确。
-     内容是自己写死的常量，没有注入面。 */
-  th.innerHTML = "<svg viewBox='0 0 24 24'><path d='M9.55 17.6 4 12.05l1.4-1.4 4.15 4.15 9.05-9.05 1.4 1.4z'/></svg>";
-  s.appendChild(th);
-  if (busy) s.classList.add("busy");
-  s.onclick = onClick;
-  return s;
-}
-
-function selectNode(options, cur, onChange, disabled) {
-  const sel = el("select", "sel");
-  let hit = false;
-  options.forEach(o => {
-    const op = el("option", "", o.t);
-    op.value = String(o.v);
-    if (String(o.v) === String(cur)) { op.selected = true; hit = true; }
-    sel.appendChild(op);
-  });
-  /* 当前值不在候选里（有人手改过 config）时补一条，别让界面显示成第一个选项 —— 那会撒谎 */
-  if (!hit && cur !== undefined && cur !== null && cur !== "") {
-    const op = el("option", "", String(cur) + "（当前值）");
-    op.value = String(cur);
-    op.selected = true;
-    sel.insertBefore(op, sel.firstChild);
-  }
-  sel.disabled = !!disabled;
-  sel.onchange = () => onChange(sel.value);
-  return sel;
-}
-
-function waveOptions() {
-  return WAVES.map(w => ({v: w, t: WNAME[w] || String(w)}));
-}
-
-/* 一个功能项"连带"要写的键：自己 + 自己的三级子项。
-   为什么必须连带：三级子项只在父项开着时才有意义。原来拨父项只写父项自己，
-   于是把 ⑤ 打开后三个子项**还是灭的**（它们自己的值就是 0）—— 用户看到的就是
-   "三级开关不跟随"。现在父项一拨，整组跟着拨。
-   手势映射的值是键码、不是 1/0，所以规则不同：打开时把"关掉(-1)"的那些补成默认键码；
-   **关掉时不动映射** —— 那存的是"用户选了哪个键"，清掉就丢了他的选择。
-   （显示上仍然跟随：父项关着时子行整行置灰、开关显示为关，见 itemRow。） */
-function itemPairs(it, turnOn) {
-  const pairs = [[it.k, turnOn ? it.on : it.off]];
-  if (it.subs) {
-    it.subs.forEach(sb => pairs.push([sb.k, turnOn ? sb.on : sb.off]));
-  }
-  if (it.gestures && turnOn) {
-    GESTURES.forEach(g => {
-      const cur = Number(cfgOf(g.k));
-      if (cur === -1 || isNaN(cur)) pairs.push([g.k, g.def]);
-    });
-  }
-  return pairs;
-}
-
-function itemRow(it, parentOn) {
-  const row = el("div", "row");
-  const lab = el("div", "lab");
-  const pri = el("div", "pri");
-  if (it.n) pri.appendChild(el("span", "badge", it.n));
-  pri.appendChild(el("span", "", it.t));
-  if (it.app) pri.appendChild(el("span", "chip " + (it.lsp ? "warn" : "info"),
-      it.lsp ? "需要 App + LSPosed" : "需要 App"));
-  if (it.fixed) pri.appendChild(el("span", "chip mute", "始终启用"));
-  lab.appendChild(pri);
-  if (it.d) lab.appendChild(el("div", "sec", it.d));
-  row.appendChild(lab);
-
-  const ctl = el("div", "ctl");
-  if (it.fixed) {
-    ctl.appendChild(el("span", "chip ok", "✓"));
-  } else {
-    const on = isOn(cfgOf(it.k));
-    /* 拨父项 = 拨整组（自己 + 三级子项），见 itemPairs */
-    ctl.appendChild(switchNode(on ? "on" : "off", () => {
-      writePairs(itemPairs(it, !on));
-    }));
-  }
-  row.appendChild(ctl);
-
-  const frag = document.createDocumentFragment();
-  frag.appendChild(row);
-
-  /* ⑤ / ⑬ 的子开关（三级）：
-     显示状态跟随父项 —— 父项关着就显示为关（并置灰），父项一开回来就恢复原来的值。
-     为什么不跟着改 config：这些子项只在父项开着时才有意义，替用户改写会丢掉他的设置；
-     界面显示为关 + 点它提示"请先打开上一级开关"，语义已经足够清楚。 */
-  if (it.subs) {
-    it.subs.forEach(sb => {
-      const sr = el("div", "row sub" + (parentOn ? "" : " disabled"));
-      const sl = el("div", "lab");
-      const sp = el("div", "pri");
-      sp.appendChild(el("span", "", sb.t));
-      sl.appendChild(sp);
-      sl.appendChild(el("div", "sec", sb.d));
-      sr.appendChild(sl);
-      const sc = el("div", "ctl");
-      const son = isOn(cfgOf(sb.k));
-      sc.appendChild(switchNode(parentOn && son ? "on" : "off", () => {
-        if (!parentOn) { snack("请先打开上一级开关"); return; }
-        writePairs([[sb.k, son ? sb.off : sb.on]]);
-      }));
-      sr.appendChild(sc);
-      frag.appendChild(sr);
-    });
-  }
-
-  /* ⑥ 的手势映射：开关（= 是否 -1）+ 目标键码选择
-     开关与下拉必须一致 —— 原来开关只看"值是不是 -1"，⑥ 关掉后下拉显示「关闭」
-     而开关还是亮的，自相矛盾。现在两者都乘上 parentOn。 */
-  if (it.gestures) {
-    GESTURES.forEach(g => {
-      const cur = Number(cfgOf(g.k));
-      const enabled = cur !== -1 && !isNaN(cur);
-      const shown = parentOn && enabled;
-      const sr = el("div", "row sub" + (parentOn ? "" : " disabled"));
-      const sl = el("div", "lab");
-      const sp = el("div", "pri");
-      sp.appendChild(el("span", "", g.n));
-      sl.appendChild(sp);
-      sl.appendChild(el("div", "sec", g.d));
-      sr.appendChild(sl);
-
-      const sc = el("div", "ctl");
-      /* 下拉只在**父项关着**时才禁用。父项开着、这一条是"关闭"时也要能直接选键码 ——
-         选了就等于把这一条打开（原来这种情况下拉是灰的，必须先用开关打开再改，两步）。 */
-      sc.appendChild(selectNode(g.opts, shown ? cur : -1, v => {
-        if (!parentOn) { snack("请先打开上一级开关"); return; }
-        writePairs([[g.k, v]]);
-      }, !parentOn));
-      sc.appendChild(switchNode(shown ? "on" : "off", () => {
-        if (!parentOn) { snack("请先打开上一级开关"); return; }
-        writePairs([[g.k, enabled ? -1 : g.def]]);
-      }));
-      sr.appendChild(sc);
-      frag.appendChild(sr);
-    });
-    const tip = el("div", "row sub");
-    tip.appendChild(el("div", "lab", ""));
-    tip.firstChild.appendChild(el("div", "sec",
-      "键码：194 快捷环 · 195 双击 · 196/197 上下滑 · 92 截图键 · 93 速记键 · -1 关闭。" +
-      "改完重启模块生效。笔端触控膜功能位只能由 App 经 BLE 写入 —— 首次使用请先开一次上面那组的任一项。"));
-    frag.appendChild(tip);
-  }
-
-  /* ⑦ 的波形选择 */
-  if (it.waves) {
-    const bmap = mapOf("BRUSH_MAP");
-    WAVE_ROWS.forEach(w => {
-      const sr = el("div", "row sub" + (parentOn ? "" : " disabled"));
-      const sl = el("div", "lab");
-      sl.appendChild(el("div", "pri", w.lab));
-      sr.appendChild(sl);
-      const sc = el("div", "ctl");
-      const cur = w.brush
-        ? (bmap[w.brush] !== undefined ? bmap[w.brush] : 36)
-        : (cfgOf(w.key) !== undefined ? cfgOf(w.key) : w.def);
-      sc.appendChild(selectNode(waveOptions(), cur, v => {
-        if (!parentOn) { snack("请先打开上一级开关"); return; }
-        if (w.brush) {
-          const m = mapOf("BRUSH_MAP");
-          m[w.brush] = String(v);
-          const order = ["1","2","3","4","10"].filter(x => m[x] !== undefined);
-          writePairs([["BRUSH_MAP", order.map(x => x + ":" + m[x]).join(",")]]);
-        } else {
-          writePairs([[w.key, v]]);
-        }
-      }, !parentOn));
-      sr.appendChild(sc);
-      frag.appendChild(sr);
-    });
-    const tip = el("div", "row sub");
-    const tl = el("div", "lab");
-    tl.appendChild(el("div", "sec",
-      "波形：0 关 · 32 圆珠笔 · 33 铅笔 · 34 马克笔 · 35 橡皮 · 36 联想笔刷 · " +
-      "37-41 无音效版 · 42 边缘警告 · 1/3/6/7 系统提示音"));
-    tip.appendChild(tl);
-    frag.appendChild(tip);
-  }
-
-  return frag;
-}
-
-function categoryCard(cat) {
-  const card = el("section", "card cat");
-  const head = el("div", "head");
-  const grow = el("div", "grow");
-  const title = el("div", "ctitle");
-  title.appendChild(el("span", "", cat.name));
-  const st = catState(cat);
-  title.appendChild(el("span", "chip " + (st === "on" ? "ok" : (st === "off" ? "mute" : "warn")),
-      st === "on" ? "全部开启" : (st === "off" ? "全部关闭" : "部分开启")));
-  grow.appendChild(title);
-  grow.appendChild(el("div", "cnote", cat.note));
-  head.appendChild(grow);
-  head.appendChild(switchNode(st, () => {
-    /* 一级总开关也要一路拨到三级 —— 只写二级成员的话，用户把「手写笔连接」全开后
-       ⑤ 的三个子项还是灭的，同样看着"没跟随"。 */
-    const turnOn = (st !== "on");          // 全开 → 全关；混合/全关 → 全开
-    const pairs = [];
-    cat.items.filter(i => i.k).forEach(i => {
-      itemPairs(i, turnOn).forEach(p => pairs.push(p));
-    });
-    writePairs(pairs, cat.name + " 总开关 → " + (turnOn ? "全开" : "全关"));
-  }));
-  card.appendChild(head);
-
-  const body = el("div", "body");
-  cat.items.forEach(it => body.appendChild(itemRow(it, !it.k || isOn(cfgOf(it.k)))));
-  card.appendChild(body);
-  return card;
-}
-
-function appCard() {
-  const card = el("section", "card");
-  const head = el("div", "head");
-  const grow = el("div", "grow");
-  const title = el("div", "ctitle");
-  title.appendChild(el("span", "", "App / APK"));
-  title.appendChild(el("span", "chip " + (APPST.installed ? "ok" : "mute"),
-      APPST.installed ? "已安装" : "未安装"));
-  const need = needApp();
-  title.appendChild(el("span", "chip " + (need ? "warn" : "mute"),
-      need ? "有功能需要它" : "当前没有功能需要它"));
-  grow.appendChild(title);
-  grow.appendChild(el("div", "cnote",
-    "dev.tb378fc.fix —— 它同时是 LSPosed 钩子。默认不安装；" +
-    "只有「需要 App」的功能被打开时才会自动装上，全部关闭后会自动卸载。"));
-  head.appendChild(grow);
-  card.appendChild(head);
-
-  const body = el("div", "body");
-  const btnrow = el("div", "btnrow");
-  btnrow.style.padding = "4px 16px 12px";
-  const b1 = el("button", "btn filled", "立即对齐 APK 状态");
-  b1.onclick = () => syncApk(false);
-  const b2 = el("button", "btn outlined", "重新读取配置");
-  b2.onclick = () => load();
-  btnrow.appendChild(b1); btnrow.appendChild(b2);
-  body.appendChild(btnrow);
-
-  const note = el("div", "alert info");
-  note.appendChild(el("div", "", need
-    ? "有功能依赖这个 App：开着就会自动装。关掉这些功能后它会自动卸载。"
-    : "所有依赖 App 的功能都关着，所以模块不会安装它（也不会去碰你已经装的版本，直到你按下上面的按钮）。"));
-  body.appendChild(note);
-
-  card.appendChild(body);
-  return card;
-}
-
-function markersAlert() {
-  const raw = String(CFG.MARKERS || "").trim();
-  if (!raw) return null;
-  const box = el("div", "alert warn");
-  const body = el("div");
-  body.appendChild(el("b", "", "存在标记文件（优先级高于 config）"));
-  body.appendChild(el("div", "", "这些功能被强制关闭，界面上会显示为关：" + raw));
-  body.appendChild(el("div", "", "要恢复就把模块目录下对应的 disable-* 文件删掉。"));
-  box.appendChild(body);
-  return box;
-}
-
-function logCard() {
-  const card = el("section", "card");
-  const head = el("div", "head");
-  const grow = el("div", "grow");
-  const title = el("div", "ctitle");
-  title.appendChild(el("span", "", "操作日志"));
-  grow.appendChild(title);
-  grow.appendChild(el("div", "cnote", "只记录本页面发起的操作"));
-  head.appendChild(grow);
-  card.appendChild(head);
-  const box = el("div");
-  box.id = "log";
-  LOGLINES.forEach(item => box.appendChild(logLine(item)));
-  card.appendChild(box);
-  return card;
 }
 
 function render() {
-  const app = $("#app");
-  app.textContent = "";
+  const box = $("#items");
+  box.textContent = "";
+  for (const it of ITEMS) box.appendChild(buildItem(it));
 
-  const mk = markersAlert();
-  if (mk) app.appendChild(mk);
-  app.appendChild(appCard());
-  CATS.forEach(c => app.appendChild(categoryCard(c)));
-  app.appendChild(logCard());
+  const box14 = $("#s14");
+  box14.textContent = "";
+  box14.appendChild(buildFixed());
 
-  const nOn = CATS.reduce((a, c) => a + c.items.filter(i => i.k && isOn(cfgOf(i.k))).length, 0);
-  const nAll = CATS.reduce((a, c) => a + c.items.filter(i => i.k).length, 0);
-  $("#sub").textContent = "已开启 " + nOn + " / " + nAll + " 项 · APK " +
-    (APPST.installed ? "已安装" : "未安装");
+  const mk = (CFG.MARKERS || "").trim();
+  $("#markers").textContent = mk ? ("存在的标记文件：" + mk + "（优先级高于开关）") : "没有 disable-* 标记文件。";
+  $("#ver").textContent = "版本 " + (CFG.VERSION || "?") + " · 模块目录 " + M;
 }
 
-/* ==========================================================================
-   加载
-   ========================================================================== */
-async function load() {
-  setBusy(true);
-  const r = await run("sh " + M + "/service.sh --json");
-  let ok = false;
+async function refresh(quiet) {
+  if (busy) return;
+  if (!quiet) setBusy(true, "正在读取状态…");
   try {
-    const txt = (r.out || "").trim().split("\n").pop();
-    CFG = JSON.parse(txt);
-    ok = true;
+    CFG = await readCfg();
+    render();
+    if (!quiet) logLine("状态已刷新", "ok");
   } catch (e) {
-    log("配置解析失败: " + e.message, "bad");
-    log("原始输出: " + (r.out || r.err), "bad");
+    logLine("读取失败: " + e.message, "bad");
+    $("#ver").textContent = "读取失败：" + e.message;
+  } finally {
+    if (!quiet) setBusy(false);
   }
-  const a = await run("sh " + M + "/service.sh --appstat");
-  const mi = /installed=([01])/.exec(a.out || "");
-  if (mi) APPST.installed = Number(mi[1]);
-  APPST.needed = needApp() ? 1 : 0;
-
-  render();
-  setBusy(false);
-  if (ok) log("已读取配置（" + Object.keys(CFG).length + " 个键）", "good");
 }
 
-/* ==========================================================================
-   主题
-   ========================================================================== */
-function applyTheme(t) {
-  document.documentElement.dataset.theme = t;
-  $("#icoTheme").innerHTML = (t === "dark")
-    ? "<path d='M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm0-5l2 3h-4l2-3zm0 20l-2-3h4l2 3zM2 12l3-2v4l-3-2zm20 0l-3 2v-4l3 2zM4.9 4.9l3.5 1.4-2.1 2.1L4.9 4.9zm14.2 14.2l-1.4-3.5 2.1-2.1 1.4 3.5-2.1 2.1zM19.1 4.9l-1.4 3.5-2.1-2.1 3.5-1.4zM4.9 19.1l1.4-3.5 2.1 2.1-3.5 1.4z'/>"
-    : "<path d='M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-5.4-5.4c0-1.81.89-3.42 2.26-4.4C12.92 3.04 12.46 3 12 3z'/>";
-}
-(function initTheme() {
-  let t = null;
-  try { t = localStorage.getItem("tb378fc.theme"); } catch (e) {}
-  if (t !== "light" && t !== "dark") {
-    t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+$("#refresh").addEventListener("click", () => refresh(false));
+$("#status").addEventListener("click", async () => {
+  if (busy) return;
+  setBusy(true, "正在读取…");
+  try {
+    const r = await run("sh " + q(M + "/service.sh") + " --status");
+    for (const line of String(r.out || "").split("\n")) if (line.trim()) logLine(line);
+  } catch (e) {
+    logLine("失败: " + e.message, "bad");
+  } finally {
+    setBusy(false);
   }
-  applyTheme(t);
-})();
-$("#btnTheme").onclick = () => {
-  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  applyTheme(t);
-  try { localStorage.setItem("tb378fc.theme", t); } catch (e) {}
-};
-$("#btnReload").onclick = () => load();
+});
 
-/* M3 Top App Bar 的滚动行为：滚下去之后底色升到 surfaceContainer。
-   （window.addEventListener 在测试的 DOM 桩里是空实现，所以这里不必特判。） */
-(function initScrollBar() {
-  const bar = $("#appbar");
-  if (!bar || !window.addEventListener) return;
-  const onScroll = () => bar.classList.toggle("scrolled", (window.scrollY || 0) > 4);
-  window.addEventListener("scroll", onScroll, {passive: true});
-  onScroll();
-})();
-
-load();
+refresh(true);
 </script>
 </body>
 </html>

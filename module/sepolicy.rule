@@ -1,20 +1,5 @@
-# ⑧b AON HAL（mifaced）需要的 SELinux 规则。域是 hal_miface_default，移植包的策略里缺这几条，
-# 表现是一个比一个隐蔽：先是读不到配置、然后是 camera worker 子进程直接 127 退出（前摄永远不开）。
-# KernelSU 开机应用本文件；也可热打：ksud sepolicy patch 'allow ...'（注意是 magiskpolicy 语法，
-# 没有冒号、没有分号）。
-
-# 1) 读 /mi_ext/product/etc/cust_features/*.xml（模块 bind 过去的，上下文是 system_file）
-allow hal_miface_default system_file file { getattr open read map }
-
-# 2) camera worker = 重新 exec 自己跑 --camera-worker。缺这条会：
-#    avc: denied { execute_no_trans } for path="/odm/bin/hw/mifaced"
-#    → 子进程 exit(127)，前摄永远打不开，attention 恒为"无人注视"
-allow hal_miface_default hal_miface_default_exec file { execute execute_no_trans }
-
-# 3) camera worker 线程要读一个 vendor 属性文件（frc）
-allow hal_miface_default vendor_frc_prop file { getattr open read map }
-
-# ---------------------------------------------------------------- ⑭ 开发者选项（system_app）
+# ⑭ 开发者选项（system_app）—— 崩溃修复，永远生效，没有开关。
+#
 # 移植包的策略没给 system_app 授权写 logpersistd_logging_prop，于是「设置 → 开发者选项」在
 # Enforcing 下**必现闪退**（setenforce 0 就正常）。
 #
@@ -29,10 +14,15 @@ allow hal_miface_default vendor_frc_prop file { getattr open read map }
 #          tcontext=u:object_r:logpersistd_logging_prop:s0 tclass=property_service permissive=0
 #     avc: denied { read } ... tcontext=u:object_r:logpersistd_logging_prop:s0 tclass=file
 #
-# 只补这两条最小权限，不放开别的任何东西。细节见 docs/devopts-selinux-fix.md。
+# 只补这两条最小权限，不放开别的任何东西。
+#
+# 应用方式：KernelSU 开机会声明式加载本文件；此外 post-fs-data.sh 与 service.sh 还会用
+# ksud 的运行时通道显式再应用一遍（实测在 ReSukiSU 4.x late-load LKM 上，纯声明式加载
+# 出现过"删掉模块重启后原始 denial 又回来了"的情况）。
+# 免重启手动重应用：sh service.sh --sepolicy
 
-# 4) 读属性文件本身（少了会先报 tclass=file 的 read）
+# 1) 读属性文件本身（少了会先报 tclass=file 的 read）
 allow system_app logpersistd_logging_prop file { getattr open read map }
 
-# 5) 写 logd.logpersistd / persist.logd.logpersistd.buffer
+# 2) 写 logd.logpersistd / persist.logd.logpersistd.buffer
 allow system_app logpersistd_logging_prop property_service set
