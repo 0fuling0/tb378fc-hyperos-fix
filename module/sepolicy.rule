@@ -13,3 +13,26 @@ allow hal_miface_default hal_miface_default_exec file { execute execute_no_trans
 
 # 3) camera worker 线程要读一个 vendor 属性文件（frc）
 allow hal_miface_default vendor_frc_prop file { getattr open read map }
+
+# ---------------------------------------------------------------- ⑭ 开发者选项（system_app）
+# 移植包的策略没给 system_app 授权写 logpersistd_logging_prop，于是「设置 → 开发者选项」在
+# Enforcing 下**必现闪退**（setenforce 0 就正常）。
+#
+# com.android.settings 以 uid 1000 跑在 system_app 域，打开开发者选项时
+# AbstractLogpersistPreferenceController.updateLogpersistValues() 在 onResume 里依次写两个属性：
+#     logd.logpersistd                 （类型 logpersistd_logging_prop）
+#     persist.logd.logpersistd.buffer  （同类型）
+# 写入被拒 → SystemProperties.native_set() 抛 RuntimeException → onResume 没接住 → Activity 崩。
+# 关键点：mLogpersistCleared 是在失败的 set() **之后**才赋值的，标志位永远锁不上 —— 必现，不是偶发。
+#
+#     avc: denied { set } for property=logd.logpersistd scontext=u:r:system_app:s0
+#          tcontext=u:object_r:logpersistd_logging_prop:s0 tclass=property_service permissive=0
+#     avc: denied { read } ... tcontext=u:object_r:logpersistd_logging_prop:s0 tclass=file
+#
+# 只补这两条最小权限，不放开别的任何东西。细节见 docs/devopts-selinux-fix.md。
+
+# 4) 读属性文件本身（少了会先报 tclass=file 的 read）
+allow system_app logpersistd_logging_prop file { getattr open read map }
+
+# 5) 写 logd.logpersistd / persist.logd.logpersistd.buffer
+allow system_app logpersistd_logging_prop property_service set
