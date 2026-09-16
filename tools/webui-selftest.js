@@ -147,17 +147,17 @@ setTimeout(async () => {
   console.log('=== 场景 1：默认状态 ===');
   console.log('调用过的命令:');
   CALLS.forEach(c => console.log('   ' + c));
-  console.log('开关 =', count(app, 'mui-switch'),
-              ' 下拉 =', count(app, 'mui-select'),
+  console.log('开关 =', count(app, 'sw'),
+              ' 下拉 =', count(app, 'sel'),
               ' row =', count(app, 'row'),
               ' 子行(disabled) =', count(app, 'disabled'));
 
   /* 每个功能项都要有一个开关（fixed 项用 chip 代替）*/
-  const nSw = count(app, 'mui-switch');
+  const nSw = count(app, 'sw');
   // 4 个分类总开关 + 11 个功能项开关 + 5 个手势开关 + 8 个子开关(3 capsule + 1 screen + 4? ) 
   // 4 个分类总开关 + 11 个功能项 + ⑤/⑬ 的 4 个子项 + ⑥ 的 5 个手势 = 24
   if (nSw !== 24) errs.push('开关数量应为 24，实际 ' + nSw);
-  const nSel = count(app, 'mui-select');
+  const nSel = count(app, 'sel');
   // 5 个手势目标 + 9 个波形
   // 5 个手势目标键 + 9 个波形 = 14
   if (nSel !== 14) errs.push('下拉数量应为 14，实际 ' + nSel);
@@ -186,7 +186,7 @@ setTimeout(async () => {
   /* 下拉的当前值要对 */
   const selVals = [];
   walk(app, x => {
-    if (!String(x.className).includes('mui-select')) return;
+    if (!String(x.className).includes('sel')) return;
     const hit = x.children.find(o => o.selected);
     selVals.push(hit ? hit.value : '');
   });
@@ -223,7 +223,7 @@ setTimeout(async () => {
   console.log('\n=== 场景 2：全开 + 标记文件 ===');
   console.log('调用过的命令:');
   CALLS.forEach(c => console.log('   ' + c));
-  console.log('开关 =', count(app, 'mui-switch'), ' 下拉 =', count(app, 'mui-select'),
+  console.log('开关 =', count(app, 'sw'), ' 下拉 =', count(app, 'sel'),
               ' 混合总开关 =', count(app, 'ind'));
 
   if (!text.includes('存在标记文件')) errs.push('没有提示标记文件');
@@ -255,7 +255,7 @@ function rowByText(root, txt){
 }
 function switchOf(node){
   let hit = null;
-  walk(node, x => { if (!hit && String(x.className).split(/\s+/).includes('mui-switch')) hit = x; });
+  walk(node, x => { if (!hit && String(x.className).split(/\s+/).includes('sw')) hit = x; });
   return hit;
 }
 function selectVal(sel){
@@ -316,5 +316,64 @@ setTimeout(async () => {
   if (count(app, 'ind') !== 0) errs.push('全开后不该还有混合总开关');
   if (errs.length) { console.log('✗ 场景 4 失败:'); errs.forEach(e => console.log('   - ' + e)); process.exit(1); }
   console.log('✓ 场景 4 通过');
+
+  /* ---- 场景 5：三级（子项）开关必须跟随二级（父项）----
+     回归点：以前子开关只看自己那个键，父项关掉后子开关还显示为"开"（只是变灰），
+     看着像"关了没生效"。现在父项关 → 子项显示为关；父项开回来 → 恢复原来的值。 */
+  console.log('\n=== 场景 5：三级子开关跟随二级父项 ===');
+  const errs5 = [];
+  const SUBNAMES = ['抢跑', '守护直发', 'GATT 校正'];
+  const subStates = () => SUBNAMES.map(n => {
+    const r = rowByText(app, n);
+    const s = r && switchOf(r);
+    return s && s.classList.contains('on');
+  });
+  const parentRow = () => rowByText(app, '吸附电量胶囊');
+
+  const before = subStates();
+  if (!switchOf(parentRow()).classList.contains('on')) errs5.push('前置条件不对：⑤ 该是开');
+  if (!before.some(v => v)) errs5.push('前置条件不对：⑤ 开着时至少有一个子项是开（否则这条测不出东西）');
+
+  // 关掉 ⑤ → 三个子项应立刻全部变成"关"
+  CALLS.length = 0;
+  switchOf(parentRow()).onclick();
+  await new Promise(r => setTimeout(r, 100));
+  const afterOff = subStates();
+  if (afterOff.some(v => v)) errs5.push('⑤ 关掉后子项还显示为开: ' + JSON.stringify(afterOff));
+  // 而且不能偷偷改 config —— 子项的值要留着
+  const setOff = CALLS.filter(c => c.includes('--set')).join(' ');
+  if (/CAPSULE_(FAST|DIRECT|GATT)/.test(setOff)) errs5.push('⑤ 关掉时不该改写子项的值: ' + setOff);
+
+  // 再开回来 → 子项恢复成关之前的样子（说明值确实留住了）
+  CALLS.length = 0;
+  switchOf(parentRow()).onclick();
+  await new Promise(r => setTimeout(r, 100));
+  const afterOn = subStates();
+  if (JSON.stringify(afterOn) !== JSON.stringify(before)) {
+    errs5.push('⑤ 开回来后子项没恢复: 期望 ' + JSON.stringify(before) + ' 实际 ' + JSON.stringify(afterOn));
+  }
+
+  // ⑥ 的手势行：开关与下拉必须一致（以前开关看"值≠-1"、下拉看 parentOn，两者会打架）
+  CALLS.length = 0;
+  const gesRow = rowByText(app, '轻捏');
+  const gesSw = switchOf(gesRow);
+  const gesSel = (() => { let h = null; walk(gesRow, x => { if (!h && String(x.className).split(/\s+/).includes('sel')) h = x; }); return h; })();
+  const selVal = gesSel && selectVal(gesSel);
+  if (gesSw.classList.contains('on') !== (selVal !== '-1')) {
+    errs5.push('手势行开关与下拉不一致: 开关=' + (gesSw.classList.contains('on') ? 'on' : 'off') + ' 下拉=' + selVal);
+  }
+  // ⑥ 关掉 → 手势行整行置灰，且开关与下拉同时变成"关"
+  switchOf(rowByText(app, '手势桥')).onclick();
+  await new Promise(r => setTimeout(r, 100));
+  const gesRow2 = rowByText(app, '轻捏');
+  const gesSw2 = switchOf(gesRow2);
+  const gesSel2 = (() => { let h = null; walk(gesRow2, x => { if (!h && String(x.className).split(/\s+/).includes('sel')) h = x; }); return h; })();
+  if (gesSw2.classList.contains('on')) errs5.push('⑥ 关掉后手势开关还是开的');
+  if (selectVal(gesSel2) !== '-1') errs5.push('⑥ 关掉后手势下拉应显示「关闭」，实际 ' + selectVal(gesSel2));
+  if (!gesRow2.classList.contains('disabled')) errs5.push('⑥ 关掉后手势行没置灰');
+
+  if (errs5.length) { console.log('✗ 场景 5 失败:'); errs5.forEach(e => console.log('   - ' + e)); process.exit(1); }
+  console.log('✓ 场景 5 通过');
+
   console.log('\n全部场景通过 ✓');
 }, 700);
