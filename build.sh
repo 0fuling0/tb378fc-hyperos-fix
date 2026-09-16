@@ -16,7 +16,14 @@
 #   out/<id>-v<version>.zip              KernelSU 模块包（zip 根目录即模块根目录）
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# git-bash（MSYS）下 pwd 返回 /c/Users/... 这种 POSIX 路径，而 Windows 原生的 python3 / zip
+# 认不出来 —— 会把 /c/Users/... 当成 C:\c\Users\...，报 "No such file or directory"。
+# 有 pwd -W 就拿盘符路径（C:/Users/...），这样本地 Windows 和 CI 的 Linux 都能跑。
+if HERE_TMP="$(cd "$(dirname "$0")" && pwd -W 2>/dev/null)"; then
+  HERE="$HERE_TMP"
+else
+  HERE="$(cd "$(dirname "$0")" && pwd)"
+fi
 MODULE="$HERE/module"
 OUT="$HERE/out"
 SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}}"
