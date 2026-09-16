@@ -1,8 +1,12 @@
 #!/system/bin/sh
 # 在 zygote 之前运行 —— 也就是早于 PackageManager 扫描包。
 #
-# 本模块只做一件事（②）：把修好的 PowerKeeper 覆盖移植包里那个坏的。
-# （另两项 ①手写笔唤醒、③停 BPF 监视器 在 service.sh 里。）
+# Lite 版只做两件事：
+#   ② 把修好的 PowerKeeper 覆盖移植包里那个坏的（**必须**在 PMS 扫描之前做）
+#   ⑭ 显式再应用一次 sepolicy（「设置 → 开发者选项」崩溃修复）
+#
+# ③④ 不在这里：它们要等 boot_completed（init 的 dynbpfloader 服务在那之后才被拉起），
+# 见 service.sh。本脚本跑完就退出，不留任何进程。
 #
 # 移植者手工改过 MIUI 的 PowerKeeper，改坏了**两处**：
 #
@@ -21,131 +25,63 @@
 #      并把 code_item 的 ins_size 从 1 改成 0；**改写是等长的（1639 → 1639 字节），
 #      文件内所有偏移不变**，只重算了 dex 头部的 adler32 与 SHA-1。
 #
-# 两处都在 payload/PowerKeeper.apk 里逐字节修好（重建脚本见 tools/），APK 其余部分完全一致。
-# PMS 接受这个改过的 APK，是因为这个移植包是 user 构建却标了 ro.debuggable=1。
+# 两处都在 payload/PowerKeeper.apk 里逐字节修好（重建脚本见 payload-src/，用法见 build.sh --payload），
+# APK 其余部分完全一致。PMS 接受这个改过的 APK，是因为这个移植包是 user 构建却标了 ro.debuggable=1。
 #
 # 效果：com.miui.powerkeeper 能起来并常驻（PowerStateMachineService /
 # PowerKeeperBackgroundService / FeedbackControlService），不再开机即崩。
-#
-# 复现：tools/patch_powerkeeper.py（字节补丁）+ tools/fix_static.py（结构性补丁），
-# 对着原始 PowerKeeper.apk 跑一遍即可重建 payload。
 
 MODDIR=${0%/*}
-LOG="$MODDIR/wake.log"
+LOG="$MODDIR/lite.log"
 PAYLOAD="$MODDIR/payload/PowerKeeper.apk"
 TARGET=/system_ext/app/PowerKeeper/PowerKeeper.apk
+CFG="$MODDIR/config"
 
 log_msg() { echo "$(date '+%F %T') [post-fs-data] $*" >> "$LOG"; }
 
-# 功能开关：与 service.sh 同一套 config 键（WebUI 里改）。这里只关心两个：
-#   FIX_POWERKEEPER  ② PowerKeeper 补丁
-#   AON              ⑧ / ⑧b 注视感知（含 HAL 补库）
-# 旧的 disable-powerkeeper / disable-aon / disable-aonlib 标记文件仍然有效（见下面各段）。
-CFG="$MODDIR/config"
-[ -f "$CFG" ] && . "$CFG" 2>/dev/null
-FIX_POWERKEEPER=${FIX_POWERKEEPER:-1}
-AON=${AON:-0}
-pk_enabled()  { case "$FIX_POWERKEEPER" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
-aon_enabled() { case "$AON" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+# ---------------------------------------------------------------- 配置读取
+# 为什么**不用** `. "$CFG"`：那样 config 会被当 shell 代码执行 —— 值里出现
+# 空格、& | ` $ 或引号就会破坏解析（空格会让后半段被当成命令，& 会变成后台分隔符，
+# 反引号 / $( ) 会真的执行）。WebUI 的 --set 是逐字写入的，所以这条路迟早会踩到。
+# 这里只按行取键值，不执行任何东西。
+cfg_raw() { [ -f "$CFG" ] && sed -n "s/^$1=//p" "$CFG" 2>/dev/null | tail -1; }
+cfg_on()  { case "$1" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+key_on()  { cfg_on "$(cfg_raw "$1")"; }
+pk_enabled() { [ -e "$MODDIR/disable-powerkeeper" ] && return 1; key_on FIX_POWERKEEPER; }
 
-# ---- 开机清锁。必须放在本脚本任何一处 exit 0 之前，否则可能被前面的分支跳过。----
-# service.sh 的 setup 靠 .monitor.lock/pid 判断"supervisor 是不是已经在跑"，判据是 kill -0。
-# 但 supervisor 不可能跨重启存活，这个 pid 文件开机时必然是上一轮的残留，而 pid 会被复用：
-# 实测重启后 2914 被 vendor.qti.hardware.soter-service 占用，setup 于是误判
-# "supervisor already alive pid=2914" 并提前 exit 0 —— 而那句 exit 0 在 ③④① 的启动之前，
-# 结果 BPF 拆弹、死电话栈、唤醒守护一个都没起来，整个模块等于没跑（只有 ② 因为走
-# post-fs-data 这条独立路径幸免）。post-fs-data 严格早于 service.sh，在这里清锁即可
-# 彻底消掉这个跨重启竞态。
-rm -f "$MODDIR/aon.restarted" 2>/dev/null    # ⑧ AON app 每次开机清进程的"本轮已做"标记
-
-LOCK="$MODDIR/.monitor.lock"
-if [ -e "$LOCK/pid" ]; then
-    log_msg "cleared stale supervisor lock (was pid $(cat "$LOCK/pid" 2>/dev/null))"
-    rm -rf "$LOCK" 2>/dev/null
-fi
-
-# 注意：这一段**不能 exit 0** —— 以前这里每个失败分支都直接 exit，结果只要 PowerKeeper
-# 的 payload 缺失/已挂载，后面的 ⑧ AON 与 ⑧b libcamera2ndk 就整段被跳过（跨修复项的隐蔽耦合）。
-# 现在改成条件分支，脚本只有一个结尾 exit 0。
+# ---------------------------------------------------------------- ② PowerKeeper
+# 注意：这一段**不能 exit 0**。早期版本每个失败分支都直接 exit，结果只要 payload 缺失
+# 或已挂载，后面的 ⑭ 就整段被跳过（跨修复项的隐蔽耦合）。现在改成条件分支，
+# 脚本只有一个结尾 exit 0。
 if [ -e "$MODDIR/disable-powerkeeper" ]; then
-    log_msg "PowerKeeper patch disabled by marker"
+    log_msg "② PowerKeeper 补丁被标记文件 disable-powerkeeper 关闭"
 elif ! pk_enabled; then
     log_msg "② PowerKeeper 补丁已关闭（config FIX_POWERKEEPER=0）"
 elif [ ! -f "$PAYLOAD" ]; then
-    log_msg "PowerKeeper payload missing"
+    log_msg "ERROR ② payload 缺失: $PAYLOAD"
 elif [ ! -f "$TARGET" ]; then
-    log_msg "PowerKeeper target missing"
+    log_msg "ERROR ② 目标缺失: $TARGET"
 elif grep -q " $TARGET " /proc/mounts 2>/dev/null; then
-    log_msg "PowerKeeper patch already mounted"
+    log_msg "② PowerKeeper 补丁已挂载（跳过）"
 else
     chown 0:0 "$PAYLOAD" 2>/dev/null
     chmod 0644 "$PAYLOAD" 2>/dev/null
     chcon u:object_r:system_file:s0 "$PAYLOAD" 2>/dev/null
     if mount -t none -o bind "$PAYLOAD" "$TARGET" 2>/dev/null; then
-        log_msg "PowerKeeper patch mounted ($(sha256sum "$PAYLOAD" 2>/dev/null | cut -c1-16))"
+        log_msg "② PowerKeeper 补丁已挂载 ($(sha256sum "$PAYLOAD" 2>/dev/null | cut -c1-16))"
     else
-        log_msg "ERROR PowerKeeper bind mount failed"
+        log_msg "ERROR ② PowerKeeper bind mount 失败"
     fi
 fi
 
-# ---------------------------------------------------------------- ⑧ AON / 注视感知
-# HyperOS 的客户特性解析器写死了 /mi_ext/product/etc/cust_features/device_features.xml
-# （CustFeatureResolveHelper.DEFAULT_CUST_FEATURE_PATH），而移植包把它放到了
-# /product/etc/cust_features/，Lenovo 机型又没有 mi_ext 分区（/mi_ext 是个空目录）
-# → config_supported_aon_devices 取默认 false → PMS 不返回 com.xiaomi.aon
-# → AttentionManagerService 起不来 → "注视感知"被 removePreference（设置里没这一项）。
-# 这里在 post-fs-data（SystemServer 起来之前）把那份目录 bind mount 过去。
-# 关掉：config AON=0（默认），或建 marker 文件 disable-aon。
-AON_SRC=/product/etc/cust_features
-AON_WORK="$MODDIR/mi_ext/product/etc/cust_features"   # 可写的工作副本（/ 是 erofs 只读）
-AON_DST=/mi_ext/product/etc/cust_features
-if [ ! -e "$MODDIR/disable-aon" ] && aon_enabled && [ -d "$AON_SRC" ]; then
-    mkdir -p "$AON_WORK" 2>/dev/null
-    cp -a "$AON_SRC"/. "$AON_WORK"/ 2>/dev/null
-    # 解析器可能只读 cust_features.xml（实测里面没有 config_supported_aon_devices，
-    # 它在 device_features.xml 里）→ 两边都保证有 true
-    for f in "$AON_WORK/cust_features.xml" "$AON_WORK/device_features.xml"; do
-        [ -f "$f" ] || continue
-        if ! grep -q config_supported_aon_devices "$f" 2>/dev/null; then
-            sed -i 's#<cust_feature>#<cust_feature>\n        <bool name="config_supported_aon_devices">true</bool>#' "$f" 2>/dev/null
-            log_msg "⑧ 往 $(basename "$f") 注入 config_supported_aon_devices=true"
-        fi
-    done
-    # /mi_ext 在只读 erofs 上：先 tmpfs 盖一层再建目录
-    mount -t tmpfs tmpfs /mi_ext 2>/dev/null
-    if mkdir -p "$AON_DST" 2>/dev/null && mount --bind "$AON_WORK" "$AON_DST" 2>/dev/null; then
-        log_msg "⑧ mi_ext cust_features ok (工作副本 → $AON_DST)"
-    else
-        log_msg "⑧ ERROR mi_ext cust_features 挂载失败"
-    fi
-elif [ ! -e "$MODDIR/disable-aon" ] && ! aon_enabled; then
-    log_msg "⑧ AON 已关闭（config AON=0），跳过 mi_ext cust_features"
-fi
-
-# ⑧c「设置里让注视感知那一页出现」不再在这里做 —— 曾经用 tmpfs 盖 /product/overlay 挂 RRO，
-# 结果 cp 过去的 83 个 MIUI/SystemUI overlay 丢了 SELinux 标签（tmpfs:s0）被 system_server 拒读，
-# 锁屏时钟、控制中心整批消失。现在改成在设置进程里按资源名放行 getBoolean（见 TbFixHook）。
-# 教训：**不要用 tmpfs + cp 去镜像系统 overlay 目录**，标签/verity 都不是拷过来的。
-
-# ------------------------------------------- ⑧b AON HAL：/odm/lib64 里补 libcamera2ndk.so
-# mifaced 起不来就没有 IAlwaysOn → AON app 拿不到 HAL → "注视感知"永远给不出结果。
-# 细节见 module/bin/aonlib.sh（幂等；可用 config AON=0 或 disable-aonlib 关掉）。同理不能 exit 0。
-if aon_enabled && [ ! -e "$MODDIR/disable-aon" ] && [ ! -e "$MODDIR/disable-aonlib" ]; then
-    MODDIR="$MODDIR" sh "$MODDIR/bin/aonlib.sh" 2>&1 | while read -r l; do log_msg "$l"; done
-fi
-
-# ------------------------------------------- ⑭ 开发者选项：显式再应用一次 sepolicy
-# 移植包的策略没给 system_app 授权写 logpersistd_logging_prop，「设置 → 开发者选项」在 Enforcing
-# 下必现闪退（细节见 sepolicy.rule 尾部注释与 docs/devopts-selinux-fix.md）。
-#
-# 规则已经写在 sepolicy.rule 里（KernelSU 开机会自动加载），但实测在 ReSukiSU 4.x late-load LKM 上
-# **纯声明式加载并不可靠** —— 出现过"删掉模块重启后原始 denial 又回来了"的情况。
+# ---------------------------------------------------------------- ⑭ sepolicy
+# 规则已经写在 sepolicy.rule 里（KernelSU 开机会自动加载），但实测在 ReSukiSU 4.x
+# late-load LKM 上**纯声明式加载并不可靠** —— 出现过"删掉模块重启后原始 denial 又回来了"的情况。
 # 所以这里用 ksud 的运行时通道显式再应用一遍：它会触发一次策略重载，顺带刷新内核 AVC 与
-# init 用户态 libselinux 里的陈旧拒绝缓存。service.sh 的 setup 里还会补一次。
+# init 用户态 libselinux 里的陈旧拒绝缓存。service.sh 开机后还会补一次。
 #
-# 注意 1：本项**没有 disable 标记** —— 它是崩溃修复，不是可选功能。
-# 注意 2：ksud sepolicy apply 是"按传入文件重新推导并应用"，**不会跨调用累积**，
-#         所以这里必须传**完整**的 sepolicy.rule（含 ⑧b 的三条），不能只传 ⑭ 那两条。
+# 注意：ksud sepolicy apply 是"按传入文件重新推导并应用"，**不会跨调用累积**，
+# 所以必须传**完整**的 sepolicy.rule。
 KSUD=""
 for c in /data/adb/ksud /data/adb/ksu/bin/ksud; do
     if [ -x "$c" ]; then KSUD="$c"; break; fi

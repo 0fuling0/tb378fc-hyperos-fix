@@ -1,975 +1,149 @@
 #!/system/bin/sh
-# TB378FC HyperOS 修复 —— 服务脚本
+# TB378FC HyperOS 修复 Lite —— 服务脚本
 #
-# 本模块做五件事：
-#   ① 手写笔唤醒   —— 否则笔闲置后 MCU 休眠、蓝牙却仍显示已连接，笔看起来"死了"
-#   ② PowerKeeper  —— 见 post-fs-data.sh（修补移植包改坏的两处字节码）
-#   ③ 停 BPF 监视器 —— 否则开 DroidSpaces 容器后会被 hyper_bpfloader 重启进 recovery
-#   ④ 停死电话栈   —— 否则移植包自带的 persistent 电话组件每秒崩几百次，
-#                     白烧 zygote / system_server，并连带把系统 feature flags 反复重置
-#   ⑤ 手写笔胶囊   —— 吸附时弹 HyperOS 原生的电量胶囊（否则这支联想笔在系统眼里不存在）
+# 与 Full 分支最大的区别：**这里没有任何常驻进程**。
+# 三个修复都是"开机后做一次就完"：③ 停 BPF 监视器、④ 停死电话栈、⑭ 补一次 sepolicy。
+# 做完脚本自己退出 —— 没有 supervisor、没有 monitor、没有 penring、没有看护循环。
 #
-# ① 的原理
+# 调用方式
 # --------
-# 笔闲置后 MCU 休眠，但蓝牙控制器继续维持 HOGP 连接 —— 所以"蓝牙还连着"是假象。
-# 休眠期间笔尖不出信号、滑条不响应、马达不振动。只有线圈（磁吸）能唤醒它。
-# 联想自己的软件（ZUX）会在磁吸"取下"的边沿发一条 BLE 唤醒命令：
-#     service        0000fe40-cc7a-482a-984a-7f2ed5b3e512
-#     characteristic 0000fe41-cc7a-482a-984a-7f2ed5b3e512
-#     payload        {0x05, 0x05}
-# HyperOS 没有手写笔软件栈，没人发这条命令，所以本模块补上。
+#   service.sh                 开机自动调用（KernelSU 在 late_start 阶段跑本脚本）。
+#                              它把自己放到后台等 boot_completed，**立刻返回**，不阻塞开机。
+#   service.sh --boot          上面那个后台动作的本体（等 boot_completed → ③④⑭ → 退出）
+#   service.sh --status        人读的状态摘要
+#   service.sh --json          机器读的状态（WebUI 用）
+#   service.sh --set K V [...] 改 config（按行重写；值逐字写入，不经过 shell）
+#   service.sh --sepolicy      只重打一遍 sepolicy（免重启修「开发者选项」闪退）
 #
-# 触发源只认吸附状态（/sys/class/power_supply/wls_tx/attached），与屏幕状态无关：
-#     1 -> 0  取下笔      发唤醒命令
-#     0 -> 1  吸附笔      弹原生电量胶囊（见 ⑤）
-#     启动时若笔已取下    补发一次唤醒
+# 为什么 ③ 不需要看护进程
+# ----------------------
+# hyper_bpfloader.rc 里 dynbpfloader 是 `disabled` 服务，唯一的启动点是
+#     on property:sys.boot_completed=1 && property:ro.debuggable=1
+#         start dynbpfloader
+# 这个属性触发器每次开机只触发一次，所以开机后 `setprop ctl.stop dynbpfloader`
+# 一次就永久生效，init 不会把它拉回来。实测（Full 分支的看护日志）：停掉之后连续
+# 观察 1 小时以上，`stopped again` 一次都没出现。
 #
-# ⑤ 的原理
-# --------
-# 胶囊不是 SystemUI 画的，而是 SecurityCoreAdd（com.miui.securitycore）里
-# com.miui.miinput.stylus 那套；原生由小米笔的 MIPP/BLE 协议栈
-# （BluetoothExtension 的 MiuiBleOobHelperService）发广播驱动：
-#     com.android.settings.stylus.STYLUS_STATE_SOC   extras: battery / state / connect
-# 联想笔走普通 BT HID，不说 MIPP，所以谁都不发。这里在吸附边沿读反向无线充电线圈看到的
-# 笔电量（/sys/class/power_supply/wls_tx/level），把 ATTACH 广播交给 TbFix，
-# 由它转成上面那条原生广播；GATT 能读到真值时再补一条校正。
-# 参数语义、前置条件与踩坑见 docs/native-stylus-capsule.md。
+# 为什么不能改用"覆盖 .rc 删掉这个服务"
+# ------------------------------------
+# 1) init 在 second stage 的 LoadBootScripts() 里一次性解析完所有 .rc，
+#    早于 post-fs-data 阶段的模块挂载 —— 覆盖上去也赶不上解析。
+# 2) 本机的 KernelSU 是 ReSukiSU 4.x late-load LKM 形态，模块文件**根本不会**被叠到
+#    真实文件系统上。实测：往模块里放 system_ext/etc/init/zzprobe.rc，重启后
+#    /system_ext/etc/init/zzprobe.rc 不存在，里面那个 `on boot / setprop` 也没生效。
+#    （这也正是本模块没有 system/ 目录、② 靠脚本里显式 mount -o bind 的原因。）
 #
-# ③ 的原理
-# --------
-# hyper_bpfloader 的监视器（dynbpfloader，boot_completed 后由 init 启动）会检查 MIUI
-# 私有 BPF 程序 MiuiMmStat / MiuiMmTrace 是否已 pin。这套 .o 带 min_kver/max_kver
-# 检查并引用 6.10+ 的内核符号，而本机内核是 6.6.82，89 个程序一个都加载不了。
-# 监视器据此判定"系统损坏"，于是写 recovery 引导块并 reboot,recovery ——
-# 实测：不开容器时它会一直忍着，一旦使用 DroidSpaces 容器就会触发（已复现 3 次）。
-# 那 89 个程序是内存遥测数据，缺了不影响使用；监视器在本内核上唯一还在干的事就是重启设备。
-# 所以这里在开机后把它停掉。开机期由 hyper_bpfloader 本体加载的约 50 个 BPF 不受影响。
-#
-# ④ 的原理
-# --------
-# 本机 ro.baseband=apq —— 纯应用处理器，没有集成 modem，是 Wi-Fi 版。厂商的
-# init.class_main.sh 正是对 apq|sda|qcs 置 ro.vendor.radio.noril=yes，再经
-# init.qcom.rc 传播成 ro.radio.noril。框架因此**没有 FEATURE_TELEPHONY**。
-#
-# 但移植包原样搬来了小米/QTI 的电话栈，而且声明成 persistent：
-#     /system_ext/priv-app/QtiTelephony/QtiTelephony.apk   → com.qti.phone
-# 没有 telephony 特性 → CarrierConfigManager 根本不注册 → getSystemService 返回 null：
-#     ExtTelephonyServiceImpl.<init>(ExtTelephonyServiceImpl.java:178)
-#       → new NrUwbConfigsController(...)
-#         → NrUwbConfigsController.java:67 对 null 调 registerCarrierConfigChangeListener
-#         → NullPointerException → FATAL EXCEPTION: main，进程当场死
-#
-# 而 com.android.phone 和 com.android.systemui 各持一条到
-# com.qti.phone/.ExtTelephonyService 的活绑定（dumpsys activity 里 connections=3，
-# 服务本身 app=null 但客户端不松手），服务又是 persistent，AMS 便以 0ms 延迟
-# 无限重启它。实测约 670 次/秒：
-#     Start proc ...:com.qti.phone for restart → has died: pers PER
-#     → Re-adding persistent process → Scheduling restart of crashed service in 0ms
-#     → has crashed too many times, killing! → 再来一遍
-#
-# 代价全记在 zygote 和 system_server 头上（静置时尤其明显，因为别的负载都停了）：
-#     每次循环 fork 一个新进程    → zygote64 11~15% CPU（主线程除了 fork 什么都不干）
-#     每次循环走一遍 AMS 进程管理 → system_server 30~46% CPU，其中内核态约 22%
-#     异常栈写日志               → logd 7%，约 440 KB/s，开机 11 分钟 703 MB
-# 连带 init 的 flags_health_check 每秒被触发几十次，反复重置系统 feature flags；
-# RescueParty 持续为这三个 persistent 包评估 remediation。
-#
-# 硬件上 modem 分区虽然在（modem_a/modem_b/fsg/fsc/modemst1/2），但 ro.baseband=apq
-# 说明没有可用 modem，电话功能永远起不来 —— 这三个包在本机是纯死代码，停掉零损失。
-#
-# 三个坑：
-#   1. 必须 root。HyperOS 的 PackageManagerServiceImpl.shouldRestrictEnabledSettingsChange
-#      会拒绝 shell 改系统包的启用状态（SecurityException: Cannot disable system packages），
-#      以 shell UID 跑 pm disable-user 一定失败。本脚本由 KernelSU 以 root 启动，正好可用。
-#   2. pm suspend 没用。实测 suspend 之后 persistent 进程照样被拉起，崩溃数纹丝不动；
-#      只有 package disable 才真正切断这条重启链。组件级 disable 在 root 下也可行，
-#      但包级更彻底（连 persistent 进程本身都不再启动）。
-#   3. 停用不会杀掉已经在跑的 persistent 进程，而且**手动 kill 也压不住**：实测 kill 之后
-#      AMS 立刻重新拉起一个新的（就是日志里那句 Re-adding persistent process），换一次
-#      kill 得一次重启，之后稳定成一个空转进程（约 131 MB RSS，0% CPU）。组件级 enabled
-#      设成 default 也一样。所以本模块不做这个无用的 kill —— 残留进程不烧 CPU，
-#      不影响修复效果；真正要命的那条崩溃重启链已经被 package disable 掐断了。
-#
-# 停用状态落在 /data/system/packages.xml，本身就跨重启保持。这里每次开机仍复查一次，
-# 以防 ROM 更新或包重装把状态冲掉；已是 disabled 的包不会重复处理。
-#
-# 注意：这三个包**不一定都在**。实测 HyperOS 3 的 TB378FC 上一个都没有，此时
-# pm disable-user 会抛 IllegalArgumentException: Unknown package 并刷 ERROR 日志，
-# 但 ④ 要保证的"没有空转 persistent 进程"本来就达成了。所以 fix_telephony() 会先查
-# 存在性，不存在的包直接跳过，不当作失败。
-#
-# 进程模型
-# --------
-#   service.sh                  一次性 setup，由 KernelSU 启动
-#     service.sh --supervise    用 setsid 脱离，持有锁，负责重启 monitor
-#     service.sh --monitor      实际的吸附状态机
-#     service.sh --stopbpfmon   等 boot_completed 后停掉 BPF 监视器
-#     service.sh --fixtelephony 等 boot_completed 后停掉死电话栈（一次即可，不需看护）
-#
-# 功能开关
-# --------
-# 每一项功能都有对应的 config 键（见 module/config，WebUI 里改），改完由 WebUI 触发一次
-# 守护重启即可生效。旧的 disable-* 标记文件仍然支持，且**优先级更高**（标记在 = 强制关）。
-#
-#   分组 A —— 纯模块功能（只靠 root + 内核/属性/包管理，不需要 App），默认全开：
-#     FIX_POWERKEEPER  ② PowerKeeper 字节码修补（post-fs-data.sh 消费）
-#     FIX_BPFMON       ③ BPF 监视器拆弹
-#     FIX_TELEPHONY    ④ 死电话栈
-#     GESTURE          ⑥ 手势桥（penring + 停掉 ROM 自带笔桥）
-#
-#   分组 B —— 需要 App（dev.tb378fc.fix，它同时是 LSPosed 钩子），默认全关：
-#     PEN_WAKE         ① 手写笔休眠唤醒
-#     CAPSULE          ⑤ 吸附电量胶囊
-#     BRUSH            ⑦ 笔刷触感
-#     AON              ⑧ 注视感知（含 ⑧b HAL 补库、⑧c 设置页可见性）
-#     PEN_REST         ⑨ 笔休眠档
-#     SETTINGS_SYNC    ⑫ 设置 → 笔 下发
-#     SCREEN_CMD       ⑬ 屏幕亮/灭告诉笔
-#
-#   **分组 B 里只要有一项为 1，开机就安装 bin/TbFix.apk；七项全为 0 就把它卸载掉。**
-#   判据是 need_app()。这就是"取消默认自动安装 APK"的实现：默认七项全是 0。
-#   手动对齐一次：sh service.sh --apksync      查状态：sh service.sh --appstat
-#
-# 旧的标记文件（仍有效，优先级高于 config）：
-#     disable              ① 手写笔守护
-#     disable-powerkeeper  ② PowerKeeper 补丁
-#     disable-bpfmon       ③ BPF 监视器拆弹
-#     disable-telephony    ④ 死电话栈
-#     disable-capsule      ⑤ 吸附胶囊
-#     disable-gesture      ⑥ 手势桥
-#     disable-brush        ⑦ 笔刷触感
-#     disable-aon          ⑧ 注视感知（post-fs-data.sh 消费）
-#     disable-aonlib       ⑧b AON HAL 补库
-#     disable-rest         ⑨ 笔休眠档
-#     disable-screen       ⑬ 屏幕指令
-#     disable-rompen       ⑥ 不停 ROM 自带笔桥
+# 为什么不能动 ro.debuggable
+# -------------------------
+# 上面那个触发器要求 ro.debuggable=1；把它改成 0 确实能让监视器不启动，但 ② 能装上
+# 修补过的 PowerKeeper 正是靠 ro.debuggable=1（这个移植包是 user 构建却标了它，
+# PMS 才接受改过的 APK）。关掉它等于把 ② 废掉。所以不动。
 
-MODDIR=${0%/*}
-LOG="$MODDIR/wake.log"
-LOCK="$MODDIR/.monitor.lock"
-DISABLE="$MODDIR/disable"
+MODDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || MODDIR=${0%/*}
+CFG="$MODDIR/config"
+LOG="$MODDIR/lite.log"
+
 DISABLE_BPFMON="$MODDIR/disable-bpfmon"
 DISABLE_TELEPHONY="$MODDIR/disable-telephony"
-DISABLE_CAPSULE="$MODDIR/disable-capsule"
-DISABLE_GESTURE="$MODDIR/disable-gesture"
-DISABLE_ROMPEN="$MODDIR/disable-rompen"
-DISABLE_BRUSH="$MODDIR/disable-brush"
-DISABLE_POWERKEEPER="$MODDIR/disable-powerkeeper"
-DISABLE_AON="$MODDIR/disable-aon"
-DISABLE_SCREEN="$MODDIR/disable-screen"
-PEN_TOUCH_NODE=/dev/input/event5        # NVTCapacitivePen（笔尖/笔尾都在这个节点上）
-BRUSH_STATE="$MODDIR/brush.state"       # 当前已经发给笔的波形（空 = 无）
-BRUSH_BASE="$MODDIR/brush.base"         # 当前笔刷对应的波形（笔尾离开时恢复它）
-BRUSH_TAIL="$MODDIR/brush.tail"         # 1 = 笔尾（橡皮端）在感应范围内
-# 由 LSPosed hook 写在**被 hook 的 App** 自己的 files 目录里（canvas=1/0），按顺序找
-BRUSH_LOCK="$MODDIR/brush.lock"    # 单实例锁（mkdir 原子；防止多个 brushwatch 各跑一份老代码）
-PENSTATE_LIST="/data/data/com.miui.creation/files/penstate /data/data/com.miui.notes/files/penstate"
-BRUSH_LOG="$MODDIR/brush.log"
-PENRING_BIN="$MODDIR/bin/penring"
-PENRING_PID="$MODDIR/penring.pid"
-CFG="$MODDIR/config"
-ATT=/sys/class/power_supply/wls_tx/attached
-# ⑤ 胶囊：反向无线充电线圈看到的笔电量/充电状态（root 才读得到）
-WLS_LEVEL=/sys/class/power_supply/wls_tx/level
-WLS_CHG=/sys/class/power_supply/wls_tx/charge_state
-# ⑨ 休眠档状态文件（brushwatch 是另一个进程，看不见 monitor 的变量，靠这个文件判断）
-PEN_REST_FILE="$MODDIR/pen.rest"
-PKG=dev.tb378fc.fix
-RCV="$PKG/.WakeReceiver"
-APK="$MODDIR/bin/TbFix.apk"
-A_WAKE=dev.tb378fc.fix.WAKE
-A_HAPTIC=dev.tb378fc.fix.HAPTIC
-A_ATTACH=dev.tb378fc.fix.ATTACH
-# ⑤ 原生胶囊广播（发给 SecurityCoreAdd）
-A_SOC=com.android.settings.stylus.STYLUS_STATE_SOC
-# ⑨ 休眠档广播：告诉 App 断掉"留给下一条手势"的缓存 BLE 连接
-A_REST=dev.tb378fc.fix.REST
-# ⑬ 屏幕状态交给 App 发（只有 App 有 BLE 栈）
-A_SCREEN=dev.tb378fc.fix.SCREEN
-SOC_RCV=com.miui.securitycore/com.miui.miinput.stylus.MiuiStylusReceiver
-
-# ④：本机无 modem（ro.baseband=apq），这三个包是移植包原样带过来的死代码
 TELEPHONY_PKGS="com.qti.phone com.qualcomm.qcrilmsgtunnel com.qualcomm.qti.telephonyservice"
+PAYLOAD="$MODDIR/payload/PowerKeeper.apk"
+PK_TARGET=/system_ext/app/PowerKeeper/PowerKeeper.apk
+
+VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -1)
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
-# 进程表匹配（排除自己）：$1 是 awk 正则。
-# 为什么不用 pid 文件：看护是 setsid 出来的，supervisor 被重启/杀掉后它们变成孤儿继续活着，
-# 此时 pid 文件已被覆盖/删除，只看 pid 文件会误判成"没有实例"→ 再拉一个 → 两个实例各发一份波形。
-# 为什么不用逐个读 /proc/<pid>/cmdline：300+ 进程时每次调用要 600+ 次 fork，几秒一轮就把 pid 耗尽。
-# 只认"shell 直接跑本脚本 --brushwatch"的进程：排除 timeout/setsid 这类包装进程
-# （它们的 cmdline 里也含同样的字符串，曾因此把自己人误判成"已有实例"）
-# 注意：下面这个 awk 程序**写成一行**是刻意的 —— tools/check-helpers.py 按行去掉引号内容，
-# 跨行写的 awk 程序（引号从上一行开、下一行才闭）会被当成 shell 代码，把里面的 p / par
-# 误报成"调用了未定义的函数"。改成多行请同时改检查器（它现在是逐行处理的）。
-brushwatch_pids() {
-    # 只认真实例：自己是 sh，且**父进程不是另一个 --brushwatch**。
-    # 为什么要排除"父进程是 brushwatch"的那个：brush_watch_loop 里有一句
-    #     penring --watch | while :; do ... done
-    # 这个管道的右半边在 mksh 里是 fork 出来的子 shell，它**没有 exec** —— 于是
-    # /proc/<pid>/cmdline 与父进程逐字相同，ps 上看起来就是"两个 --brushwatch"。
-    # 以前只按 cmdline 匹配会把它也算成实例：真实例被 kill 掉之后它还会残留一两秒，
-    # 这期间 brushwatch_alive 返回"活着"，ensure 就不去重建看护。
-    ps -A -o PID,PPID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh --brushwatch" 'NR>1 && $2+0 != me+0 && $3 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { pid[$1]=1; par[$1]=$2 } END { for (k in pid) if (!(par[k] in pid)) print k }'
+# ---------------------------------------------------------------- 配置读取
+# 为什么**不用** `. "$CFG"`：那样 config 会被当 shell 代码执行 —— 值里出现
+# 空格、& | ` $ 或引号就会破坏解析（空格让后半段被当成命令，& 变成后台分隔符，
+# 反引号 / $( ) 会真的执行）。--set 是逐字写入的，所以这条路迟早会踩到。
+# 这里只按行取键值，不执行任何东西。
+cfg_raw() { [ -f "$CFG" ] && sed -n "s/^$1=//p" "$CFG" 2>/dev/null | tail -1; }
+cfg_on()  { case "$1" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
+key_on()  { cfg_on "$(cfg_raw "$1")"; }
+
+# 每一项 = config 键 AND 没有对应 disable-* 标记文件（标记优先级更高）
+fix_powerkeeper_enabled() { [ -e "$MODDIR/disable-powerkeeper" ] && return 1; key_on FIX_POWERKEEPER; }
+fix_bpfmon_enabled()      { [ -e "$DISABLE_BPFMON" ]           && return 1; key_on FIX_BPFMON; }
+fix_telephony_enabled()   { [ -e "$DISABLE_TELEPHONY" ]        && return 1; key_on FIX_TELEPHONY; }
+
+# 给 JSON 用：函数为真输出 1，否则 0
+_b() { if "$@" >/dev/null 2>&1; then printf 1; else printf 0; fi; }
+
+# ---------------------------------------------------------------- 状态探测
+bpfmon_running() {
+    # 只认监视器那个进程。不能只用 pidof hyper_bpfloader —— 同一个二进制也是开机期
+    # 那个 oneshot 加载器（service hyper_bpfloader），会误判。
+    # [h] 这个写法是为了让 grep 自己的命令行不匹配到自己。
+    ps -A -o ARGS 2>/dev/null | grep -q '[h]yper_bpfloader --monitor-mode'
 }
 
-penring_pids() {
-    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" '
-        NR>1 && $1+0 != me+0 && ($2 == "penring" || $2 ~ /\/penring$/) { print $1 }'
-}
+pk_mounted() { grep -q " $PK_TARGET " /proc/mounts 2>/dev/null; }
 
-# penring --watch（笔刷看护的 inotify 子进程）
-penring_watch_pids() {
-    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" '
-        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)penring$/ && $0 ~ /--watch/ { print $1 }'
-}
-
-# 本脚本某个子命令的进程（用于"接管"，清掉上一轮留下的 setsid 守护）。
-# 为什么需要：--stopbpfmon / --fixtelephony / --stoprompen 是 setsid 拉起的常驻循环，
-# restart.sh 有意不杀它们（它们只在"开关被关掉"时自退）。于是开关一直开着的时候，
-# 每按一次 WebUI 开关 → restart.sh → setup 分支就又拉一份，旧的那份没人收 ——
-# 实测泄漏到 8 份 --stopbpfmon 同时在跑，每份都 60 秒一轮 setprop ctl.stop，还一起刷日志。
-svc_pids() {
-    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh $1" '
-        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { print $1 }'
-}
-
-# 可选配置项；未知键自然被忽略
-REFRESH_SECONDS=0
-CAPSULE=1
-# 吸附检测的轮询间隔（毫秒）。检测靠轮询 sysfs，间隔越小弹得越快：
-#   200 = 默认，最坏 0.2s 发现吸附；500/1000 更省电但更迟钝
-POLL_MS=200
-# 1 = 守护自己直接发原生 STYLUS_STATE_SOC（省掉 App 一跳，最快）
-# 0 = 只发 ATTACH 给 TbFix，由 App 组装（多一跳）
-CAPSULE_DIRECT=1
-# 1 = 直发之后，再让 TbFix 走 GATT 读一次真电量，不同则补一条校正
-CAPSULE_GATT=1
-# 1（默认）= 边沿一到就先用**上一次的线圈电量**弹一条（~0.2s 出胶囊），1~2 秒后拿新值刷新；
-# 0 = 不抢跑，等线圈报出新值再弹（慢 1~2 秒，但第一眼就是本次的电量）
-CAPSULE_FAST=0
-# ⑥ 笔端触控膜功能位 {8,6,mask}：63=0x3F 全开（双击/三击/上滑/下滑/捏合/笔尾）；
-#    -1 = 只唤醒不改位。位定义见 docs/zuxos-pen-protocol.md §2.1
-TOUCHFILM=63
-# ⑥ 手势桥开关（分组 A，默认开）：1 = 起 penring 并停掉 ROM 自带笔桥，0 = 不起；
-#    也可以建 disable-gesture 标记文件。
-#    注意：笔要**上报**手势，得先有人用 BLE 把笔端触控膜功能位 {8,6,mask} 写进去 ——
-#    那一步只有 App 能做。所以 ⑥ 虽然不需要 App 常驻，但至少要被分组 B 开过一次
-#    （笔会记住这个位，直到它重启/睡死）。
-GESTURE=1
-# ⑥ 手势 → Android 键码映射（改完重启模块生效；-1 = 关掉这一条）
-#   194 轻捏=快捷环 · 195 双击 · 196 上滑 · 197 下滑
-#   92 截图键 / 93 速记键（"按住 + 点屏幕"那套），笔尾那个键默认映射成截图键
-GESTURE_RING=194
-GESTURE_DOUBLE=195
-GESTURE_SLIDE_UP=196
-GESTURE_SLIDE_DOWN=197
-GESTURE_TAIL=92
-# ⑥ 把"设置 → 手写笔"里的双击开关/轻捏开关/轻捏力度实时路由给笔（1 = 开，默认）
-SETTINGS_SYNC=1
-# ⑦ 笔刷触感：读笔记/小米创作的当前笔刷，给笔发一次 CON 波形（笔自己就持续按这个手感振）
-BRUSH=1
-BRUSH_APPS="com.miui.notes com.miui.creation"
-BRUSH_LEVEL=3
-BRUSH_FRICTION=1
-# current_brush 编号（小米创作/笔记实测）-> CON 波形
-#   1 钢笔 / 2 圆珠笔 / 3 铅笔 / 4 马克笔 / 10 毛笔
-#   波形：32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 无音效版
-BRUSH_MAP="1:32,2:32,3:33,4:34,10:36"
-# 工具状态 select_state_save 取这些值时当作"橡皮"（UI 里选橡皮时 current_brush 不变）
-# 用一个新值就把它加进来，多个用空格分隔
-BRUSH_ERASER_STATES=""
-BRUSH_STATE_KEYS="current_brush select_state_save ai_type current_ai_brush"
-BRUSH_ERASER=35                              # 笔尾（橡皮端）靠近时用的波形
-# 工具栏工具值（select_state_save）实测：8 AI 笔 / 6 框选笔 / 7 橡皮
-BRUSH_AI_STATES="8"
-BRUSH_AI_WAVE=36
-# 框选笔：同样不改 current_brush，用 select_state_save 的值标识（看日志填，逗号分隔）
-BRUSH_LASSO_STATES="6"
-BRUSH_LASSO_WAVE=36
-# 认不出的编号统一用这个波形
-BRUSH_DEFAULT_WAVE=36
-BRUSH_EXIT_CHECK=1                           # 退出应用后自动停波形
-# ⑬ 屏幕亮/灭时告诉笔（分组 B，默认关；ZUX {5,2}=亮 / {5,1}=灭；SCREEN_SWAP=1 互换）
-SCREEN_CMD=0
-SCREEN_SWAP=0
-# ⑨ 休眠档（分组 B，默认关）：吸附在平板上且已充满 → 停掉一切对笔的主动动作
-#    （唤醒/胶囊/GATT 校正/波形），并让 App 断掉缓存 BLE 连接，让笔真正睡下去；
-#    取下或电量掉到 REST_RESUME 以下立刻恢复。
-PEN_REST=0
-REST_FULL=99          # 线圈报的电量 ≥ 此值且吸附 → 进入休眠
-REST_POLL=60          # 休眠期间线圈电量轮询间隔（秒）
-REST_IDLE=20          # charge_state 由 1 变 0 后，持续这么多秒就认定"充完了"
-
-# ---- 分组 A：纯模块功能（不需要 App），默认全开 ----
-# ② PowerKeeper 字节码修补（post-fs-data.sh 消费同一个键）
-FIX_POWERKEEPER=1
-# ③ 停 BPF 监视器（hyper_bpfloader）
-FIX_BPFMON=1
-# ④ 停死电话栈（com.qti.phone 等三个包）
-FIX_TELEPHONY=1
-
-# ---- 分组 B：需要 App（dev.tb378fc.fix），默认全关 ----
-# ① 手写笔休眠唤醒：磁吸取下时发 {5,5} 把睡死的笔叫起来（经 App 的 BLE）
-PEN_WAKE=0
-# ⑧ 注视感知（AON）：含 ⑧b HAL 补库与 ⑧c 设置页可见性，需要 LSPosed 钩子
-AON=0
-
-# ============================================================ 开关判定
-# "配置项算不算开"：1/true/yes/on 都算开（兼容 config 里的各种写法）
-cfg_on() { case "$1" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac; }
-
-# 每个功能的开关 = config 键 AND 没有对应 disable-* 标记文件（标记优先级更高，兼容老用法）
-fix_powerkeeper_enabled() { [ -e "$DISABLE_POWERKEEPER" ] && return 1; cfg_on "$FIX_POWERKEEPER"; }
-fix_bpfmon_enabled()      { [ -e "$DISABLE_BPFMON" ]      && return 1; cfg_on "$FIX_BPFMON"; }
-fix_telephony_enabled()   { [ -e "$DISABLE_TELEPHONY" ]   && return 1; cfg_on "$FIX_TELEPHONY"; }
-pen_wake_enabled()        { [ -e "$DISABLE" ]             && return 1; cfg_on "$PEN_WAKE"; }
-brush_enabled()           { [ -e "$DISABLE_BRUSH" ]       && return 1; cfg_on "$BRUSH"; }
-aon_enabled()             { [ -e "$DISABLE_AON" ]         && return 1; cfg_on "$AON"; }
-screen_enabled()          { [ -e "$DISABLE_SCREEN" ]      && return 1; cfg_on "$SCREEN_CMD"; }
-settings_sync_enabled()   { cfg_on "$SETTINGS_SYNC"; }
-# ⑬ 的"亮灭互换"子项。**必须走判定函数**，不能在 --json 里直接吐变量值 ——
-# 原来它写的是 "${SCREEN_SWAP:-0}"，于是 config 里手写成 true 时：
-# 模块认（下面 case 里有 true|yes|on）→ 真的互换，但 WebUI 的 isOn 只认 1/"1"
-# → 开关显示为**关**。界面与实际不符，和 capsule_* 那处是同一类问题。
-screen_swap_enabled()     { cfg_on "$SCREEN_SWAP"; }
-
-# 分组 B（需要 App）里只要有一项开着，就需要那个 APK —— 装；七项全关 —— 卸。
-# 这就是"取消默认自动安装 APK"的唯一判据：默认七项全是 0，所以默认不装。
-# 注意 capsule_enabled / pen_rest_enabled / gesture_enabled 定义在下面，这里是函数体，
-# 真正调用发生在守护启动之后（那时所有函数都已定义），所以顺序没问题。
-need_app() {
-    pen_wake_enabled      && return 0
-    capsule_enabled       && return 0
-    brush_enabled         && return 0
-    aon_enabled           && return 0
-    pen_rest_enabled      && return 0
-    settings_sync_enabled && return 0
-    screen_enabled        && return 0
-    return 1
-}
-
-[ -f "$CFG" ] && . "$CFG" 2>/dev/null
-
-refresh_seconds() {
-    local v="$REFRESH_SECONDS"
-    case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
-}
-
-# ⑤ 是否要弹胶囊：config CAPSULE（分组 B，默认 0）且没有 disable-capsule 标记
-capsule_enabled() {
-    [ -e "$DISABLE_CAPSULE" ] && return 1
-    cfg_on "$CAPSULE"
-}
-
-# ⑥ 手势桥 penring：把联想笔的捏/双击/上滑/下滑/笔尾桥成小米焦点触控笔的键。
-#    由 supervisor 看护（笔不在时它自己每 2 秒轮询，不占 CPU）。见 docs/stylus-gesture-bridge.md
-gesture_enabled() {
-    [ -e "$DISABLE_GESTURE" ] && return 1
-    case "$GESTURE" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
-}
-
-penring_alive() {
-    # 手势守护：/proc 扫描（pid 文件会被孤儿进程/pid 复用骗到）
-    [ -n "$(penring_pids)" ]
-}
-
-# ⑥ 把"设置 → 手写笔"里的开关/力度翻译成笔端命令：
-#     双击开/关   -> {8,6,mask} bit0（0x01）
-#     轻捏开/关   -> {8,6,mask} bit4（0x10）
-#     轻捏力度    -> {8,5,level}，level = stylus_pinch_pressure_adjust + 1（1 轻..5 重）
-#   上滑/下滑（bit2|3）和笔尾（bit5）由本模块的 GESTURE_* 决定，一直开着。
-#   MIUI 自己那份设置是给"小米笔"用的：它只会把阈值丢给自己的 BLE 服务，
-#   联想笔听不懂，所以得我们把等价的 ZUX 帧发过去。
-SLIDE_BITS=$(( (GESTURE_SLIDE_UP >= 0 ? 4 : 0) + (GESTURE_SLIDE_DOWN >= 0 ? 8 : 0) ))
-pen_mask=0
-pen_lvl=3
-sync_last_mask=""
-sync_last_lvl=""
-
-pen_sync_read() {
-    local dbl pinch adj lvl
-    dbl=$(settings get system stylus_double_click_status 2>/dev/null)
-    pinch=$(settings get system stylus_pinch_status 2>/dev/null)
-    adj=$(settings get system stylus_pinch_pressure_adjust 2>/dev/null)
-    case "$dbl"   in ''|null|*[!0-9]*) dbl=1 ;; esac     # 缺省按 MIUI 默认：双击开
-    case "$pinch" in ''|null|*[!0-9]*) pinch=5 ;; esac   # 0 = 轻捏关，其它 = 功能号（5=快捷环）
-    case "$adj"   in ''|null|*[!0-9]*) adj=2 ;; esac
-
-    pen_mask=$SLIDE_BITS
-    [ "$GESTURE_TAIL" -ge 0 ] 2>/dev/null && pen_mask=$((pen_mask | 32))
-    [ "$dbl" != "0" ]   && pen_mask=$((pen_mask | 1))
-    [ "$pinch" != "0" ] && pen_mask=$((pen_mask | 16))
-
-    lvl=$((adj + 1))
-    [ "$lvl" -gt 5 ] && lvl=5
-    [ "$lvl" -lt 1 ] && lvl=1
-    pen_lvl=$lvl
-}
-
-# 设置变了就下发（1 秒最多查一次，由 monitor 的秒级分支调用）
-sync_pen_settings() {
-    case "$SETTINGS_SYNC" in 0|false|no|off) return 0 ;; esac
-    [ -x "$PENRING_BIN" ] || return 0
-    pen_sync_read
-    # 休眠档：笔在平板上待机，别发任何东西去吵它。这里**故意不记账** —— 恢复后下一次
-    # 调用会看到"和上次不一致"从而补发一次真值。
-    pen_rest_on && return 1
-    # 注意：状态变量必须独立命名。曾经这里用 last_mask/last_lvl，而 monitor 主循环里
-    # last_lvl 是"无线线圈电量"（0..100）→ pen_lvl(1..5) 与它永远不相等 → 每 3 秒重发一次
-    # 唤醒广播（实测 1100+ 次），既费电又和胶囊/看护抢 BLE。
-    if [ "$pen_mask" != "$sync_last_mask" ] || [ "$pen_lvl" != "$sync_last_lvl" ]; then
-        log "settings->pen mask=$pen_mask squeeze=$pen_lvl (双击=$([ $((pen_mask & 1)) -ne 0 ] && echo on || echo off) 轻捏=$([ $((pen_mask & 16)) -ne 0 ] && echo on || echo off))"
-        sync_last_mask="$pen_mask"
-        sync_last_lvl="$pen_lvl"
-        send_extra "$A_WAKE" "settings-sync" --ei wake 0 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
-        return 0
-    fi
-    return 1
-}
-
-# ---------------------------------------------------------------- ⑦ 笔刷触感
-# 联想笔的 CON（连续振动）波形 id：
-#   32 圆珠笔 / 33 铅笔 / 34 马克笔 / 35 橡皮 / 36 联想笔刷 / 37..41 同上的"无音效"版
-#
-# 事件来源全部是"内核级、毫秒级"的，不用轮询：
-#   * 笔记/小米创作把当前工具写在 /data/data/<pkg>/shared_prefs/creation_shpref.xml
-#     （current_brush / select_state_save / ai_type / current_ai_brush）→ inotify 盯目录
-#   * 笔尾（橡皮端）进/出感应范围 → 直接读 /dev/input/event5 的 BTN_TOOL_RUBBER
-#     （getevent 走管道会全缓冲，慢半拍，所以用 penring --watch 自己读）
-# 波形基准（base）记在 brush.base：切笔刷时更新它；笔尾进范围发橡皮波形，
-# 笔尾离开就恢复 base。
-# 日志带毫秒（date +%s%3N 是可用的），方便量"谁慢"：inotify 收到的时间 vs prefs 的 mtime
-brush_log() { echo "$(date '+%F %T.%3N' | cut -c1-23) $*" >> "$BRUSH_LOG"; }
-
-# 当前前台包（本 ROM 打的是 topResumedActivity）
-pen_fg() {
-    dumpsys activity activities 2>/dev/null \
-        | sed -n 's/.*[Rr]esumedActivity=ActivityRecord{[^}]* \([a-zA-Z0-9._]*\)\/.*/\1/p' \
-        | head -1
-}
-
-brush_is_fg() {
-    case " $BRUSH_APPS " in *" $1 "*) return 0 ;; esac
-    return 1
-}
-
-brush_wave_of() {
-    local v="$1" pair
-    [ -n "$v" ] || return 0
-    for pair in $(echo "$BRUSH_MAP" | tr ',' ' '); do
-        case "$pair" in
-            "$v":*) echo "${pair#*:}"; return 0 ;;
-        esac
+telephony_summary() {
+    local p exist disabled n
+    exist=$(pm list packages 2>/dev/null)
+    disabled=$(pm list packages -d 2>/dev/null)
+    n=""
+    for p in $TELEPHONY_PKGS; do
+        printf '%s\n' "$disabled" | grep -qx "package:$p" && { n="$n $p:disabled"; continue; }
+        printf '%s\n' "$exist"    | grep -qx "package:$p" && { n="$n $p:enabled"; continue; }
+        n="$n $p:absent"
     done
-    echo ""
+    printf '%s' "$n"
 }
 
-# 读工具状态串：current_brush / select_state_save / ai_type / current_ai_brush
-brush_tool_sig() {
-    local f="$1"
-    # 一次 grep 读完所有键（原来是每个键一个 sed，事件多的时候会排队）
-    grep -oE 'name="(current_brush|select_state_save|ai_type|current_ai_brush)" value="[^"]*"' "$f" 2>/dev/null \
-        | sed 's/name="//; s/" value="/=/; s/"$//' | tr '\n' ' '
-}
-
-brush_tool_val() {
-    echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
-}
-
-# 该发哪个波形：橡皮状态 > current_brush > select_state_save
-brush_decide_wave() {
-    local sig="$1" cur sel w
-    cur=$(brush_tool_val "$sig" current_brush)
-    sel=$(brush_tool_val "$sig" select_state_save)
-
-    # select_state_save 是"工具栏当前工具"，**优先** —— 选 AI 笔/框选笔/橡皮时
-    # current_brush 还停在上一支真笔刷上（实测：AI 时 current_brush=4 但 select=8），
-    # 先查 current_brush 就会一直沿用上一支的手感。
-    # 实测值：8 AI 笔 / 6 框选笔 / 7 橡皮（普通笔刷时它等于 current_brush，不冲突）
-    # 三个特殊工具先按 select_state_save 精确匹配（用户实测值，优先级最高：
-    # current_ai_brush 是残留标记，选橡皮时它可能还是 true，不能让它抢答）
-    for w in $BRUSH_ERASER_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
-    done
-    for w in $BRUSH_AI_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_AI_WAVE"; return 0; }
-    done
-    for w in $BRUSH_LASSO_STATES; do
-        [ "$sel" = "$w" ] && { echo "$BRUSH_LASSO_WAVE"; return 0; }
-    done
-    for w in $BRUSH_ERASER_STATES; do
-        [ "$cur" = "$w" ] && { echo "$BRUSH_ERASER"; return 0; }
-    done
-    if [ "$(brush_tool_val "$sig" current_ai_brush)" = "true" ]; then
-        echo "$BRUSH_AI_WAVE"; return 0
-    fi
-
-    # 普通笔刷：查表（select_state_save 与 current_brush 一致，用哪个都行）
-    w=$(brush_wave_of "$cur")
-    [ -n "$w" ] && { echo "$w"; return 0; }
-    w=$(brush_wave_of "$sel")
-    [ -n "$w" ] && { echo "$w"; return 0; }
-    w=$(brush_tool_val "$sig" ai_type)
-    [ -n "$w" ] && [ "$w" != "0" ] && { echo "$BRUSH_AI_WAVE"; return 0; }
-    # 认不出的编号：联想笔刷
-    echo "$BRUSH_DEFAULT_WAVE"
-}
-
-# 应用里的工具换了：更新基准；不在橡皮态就立刻切过去
-brush_now()   { cat "$BRUSH_STATE" 2>/dev/null; }
-brush_base()  { cat "$BRUSH_BASE" 2>/dev/null; }
-brush_tail_in() { [ "$(cat "$BRUSH_TAIL" 2>/dev/null)" = "1" ]; }
-
-# 画布是否可写（hook 写的 penstate；优先读"前台那个 App"的文件，避免读到另一边的旧状态）
-brush_canvas() {
-    # 判据分三层（都是实测踩出来的）：
-    #   1) 前台不是笔记/创作 → 肯定不在画布（这条修掉"切出去触感还在"）
-    #   2) 前台是它们，但 penstate 文件不存在 / 里面没有 canvas= / 文件太久没更新（>20 秒，
-    #      说明钩子没在跑或 App 刚重装）→ **当未知，放行**。上一版这里要求"必须明确 canvas=1"，
-    #      结果重装 App（数据被清）或 LSPosed 没加载时波形永远不开（"笔刷触感又没了"）。
-    #   3) 只有拿到**新鲜的** canvas=0 才真正停（App 明确说"不在画布"）。
-    local f v fg now mt
-    fg=$(pen_fg)
-    [ -n "$fg" ] || return 0
-    case "$fg" in
-        com.miui.notes)    f=/data/data/com.miui.notes/files/penstate ;;
-        com.miui.creation) f=/data/data/com.miui.creation/files/penstate ;;
-        *) return 1 ;;
+telephony_done_from() {
+    # 输入是 telephony_summary 的输出；只要还有 :enabled 的包就算没做完
+    case "$1" in
+        *":enabled"*) return 1 ;;
+        *)            return 0 ;;
     esac
-    [ -f "$f" ] || return 0
-    v=$(sed -n 's/^canvas=//p' "$f" 2>/dev/null | head -1)
-    [ -n "$v" ] || return 0
-    now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null)
-    [ -n "$mt" ] && [ $((now - mt)) -gt 20 ] && return 0
-    [ "$v" = "1" ]
 }
 
-# 把笔尾状态广播给 App 里的 hook（动态注册的接收器能收到隐式广播）
-
-# $1 波形（0 = 停）；$2 原因；$3 非空表示"这是当前笔刷的基准波形"
-brush_send() {
-    local wave="$1" why="$2" setbase="$3" now tailin
-    [ -n "$wave" ] || return 0
-    # 休眠档：笔在平板上，别发波形（wave=0 的停止帧仍允许，用来清掉可能 latch 住的波形）
-    if [ "$wave" != "0" ] && pen_rest_on; then
-        brush_log "skip wave=$wave ($why)：休眠档（吸附已充满）"
+# ---------------------------------------------------------------- ③ 停 BPF 监视器
+do_bpfmon() {
+    if [ -e "$DISABLE_BPFMON" ]; then
+        log "③ 被标记文件 disable-bpfmon 关闭"
         return 0
     fi
-    now=$(brush_now)
-    tailin=$(cat "$BRUSH_TAIL" 2>/dev/null)
-    brush_log "send? wave=$wave now=${now:-空} base=$([ -n "$setbase" ] && echo yes || echo no) tail=${tailin:-0} why=$why"
-
-    if [ "$wave" = "0" ]; then
-        # 停止帧无条件发：本地记录可能是空的（守护重启过），但笔里可能还 latch 着波形
-        send_extra "$A_HAPTIC" "brush stop ($why)" --ei type 1 --ei wave 0 --ei level 0 \
-            --ei friction "$BRUSH_FRICTION" --ei ms 80
-        : > "$BRUSH_STATE"
-        brush_log "stop ($why)"
+    if ! fix_bpfmon_enabled; then
+        log "③ 已关闭（config FIX_BPFMON=0）"
         return 0
     fi
 
-    [ -n "$setbase" ] && echo "$wave" > "$BRUSH_BASE"
-    if [ -z "$setbase" ] && ! brush_canvas; then
-        brush_log "skip wave=$wave ($why)：画布未聚焦"
-        return 0
-    fi
-    [ "$wave" = "$now" ] && return 0
-    send_extra "$A_HAPTIC" "brush wave=$wave ($why)" --ei type 1 --ei wave "$wave" \
-        --ei level "$BRUSH_LEVEL" --ei friction "$BRUSH_FRICTION" --ei ms 80
-    echo "$wave" > "$BRUSH_STATE"
-    brush_log "wave=$wave ($why)"
-}
-
-brush_on_tool_change() {
-    local pkg="$1" sig="$2" wave
-    echo "$pkg" > "$MODDIR/brush.fg"
-    wave=$(brush_decide_wave "$sig")
-    brush_log "$pkg 工具 [$sig] -> ${wave:-未映射}"
-    [ -n "$wave" ] || return 0
-    echo "$wave" > "$BRUSH_BASE"
-    if brush_tail_in; then
-        brush_log "（笔尾在感应范围内，先不切）"
-    else
-        brush_send "$wave" "$pkg 工具切换" base
-    fi
-}
-
-# 应用退到后台/退出：停波形（只在有波形时查前台，避免白烧 dumpsys）
-BRUSH_MISS=0
-brush_exit_check() {
-    local fg
-    [ -n "$(brush_now)" ] || return 0
-    case "$BRUSH_EXIT_CHECK" in 0|false|no|off) return 0 ;; esac
-    # hook 说画布还在（canvas=1）就别停 —— 这条比 dumpsys 可靠
-    if brush_canvas; then BRUSH_MISS=0; return 0; fi
-    fg=$(pen_fg)
-    # dumpsys 偶尔拿不到前台包（空串），这种情况不计入"离开"，否则会误杀波形
-    [ -n "$fg" ] || return 0
-    if brush_is_fg "$fg"; then
-        BRUSH_MISS=0
-        return 0
-    fi
-    BRUSH_MISS=$((BRUSH_MISS+1))
-    if [ "$BRUSH_MISS" -ge 3 ]; then
-        brush_send 0 "app left ($fg)"
-        BRUSH_MISS=0
-        : > "$BRUSH_BASE"
-    # 关键：把 brush.last.<pkg> 一起清掉。brush_scan_one 有"签名没变就 return"的短路，
-    # 重启后这些文件还在 → 首次扫描直接跳过 → base 永远空 → 没有波形（重装后没触感的真根因）。
-    rm -f "$MODDIR"/brush.last.* 2>/dev/null
-    fi
-}
-
-# 只扫一个 App
-brush_scan_one() {
-    local pkg="$1" f sig lastf last
-    f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
-    [ -r "$f" ] || return 0
-    sig=$(brush_tool_sig "$f")
-    lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
-    last=$(cat "$lastf" 2>/dev/null)
-    [ "$sig" = "$last" ] && return 0
-    echo "$sig" > "$lastf"
-    brush_on_tool_change "$pkg" "$sig"
-}
-
-# 扫描一遍两个 App 的工具状态，变了就处理
-brush_scan_apps() {
-    local pkg f sig lastf last
-    for pkg in $BRUSH_APPS; do
-        f="/data/data/$pkg/shared_prefs/creation_shpref.xml"
-        [ -r "$f" ] || continue
-        sig=$(brush_tool_sig "$f")
-        lastf="$MODDIR/brush.last.$(echo "$pkg" | tr . _)"
-        last=$(cat "$lastf" 2>/dev/null)
-        [ "$sig" = "$last" ] && continue
-        echo "$sig" > "$lastf"
-        brush_on_tool_change "$pkg" "$sig"
+    local i
+    i=0
+    while [ "$i" -lt 3 ]; do
+        i=$((i+1))
+        if ! bpfmon_running && [ "$(getprop init.svc.dynbpfloader)" != "running" ]; then
+            [ "$i" = 1 ] && log "③ 监视器未在运行，无需处理"
+            break
+        fi
+        setprop ctl.stop dynbpfloader 2>/dev/null
+        sleep 2
     done
-}
 
-brush_watch_loop() {
-    local line pkg miss=0
-    # 每轮先对齐一次现状（App 可能已经在前台且选好了笔刷）
-    brush_scan_apps
-    # 如果启动时就已经在画布里（模块刚重装 / App 数据被清 / 看护被杀过），补发一次当前笔刷波形 ——
-    # 否则要等下一次事件才会开，表现就是"重装后触感没了"。
-    if brush_canvas; then
-        # 启动时还没 base（App 刚重装 / 数据被清 → 之前没有工具事件）→ 主动读一次前台 App 的笔刷
-        [ -n "$(brush_base)" ] || brush_scan_one "$(pen_fg)"
-        if [ -n "$(brush_base)" ]; then
-            brush_send "$(brush_base)" "watch start canvas"
-        else
-            brush_log "watch start：画布在前台但读不到笔刷（等一次工具事件）"
-        fi
-    fi
-    while [ ! -e "$DISABLE" ] && [ ! -e "$DISABLE_BRUSH" ]; do
-        # 2>/dev/null：penring 的 logf_ 已经自己写 --log 指定的文件，而 stderr 也会被本进程
-        # （其 stderr 已经指向同一个 brush.log）接住 → 不屏蔽的话每条日志都出现两遍。
-        "$PENRING_BIN" --watch 2>>"$BRUSH_LOG.err" \
-            --prefs /data/data/com.miui.notes/shared_prefs \
-            --prefs /data/data/com.miui.creation/shared_prefs \
-            --prefs /data/data/dev.tb378fc.fix/files \
-            --prefs /data/data/com.miui.notes/files \
-            --prefs /data/data/com.miui.creation/files \
-            --touch "$PEN_TOUCH_NODE" --log "$BRUSH_LOG" \
-        | while :; do
-            if IFS= read -r -t 2 line 2>/dev/null; then
-                miss=0
-                case "$line" in
-                    FILE*)
-                        # FILE <dir> <name>：只读事件所属的那个 App
-                        set -- $line
-                        case "$2" in
-                            */com.miui.notes/*)    pkg=com.miui.notes ;;
-                            */com.miui.creation/*) pkg=com.miui.creation ;;
-                            *) pkg="" ;;
-                        esac
-                        fg=$(pen_fg)
-                        [ -n "$fg" ] && echo "$fg" > "$MODDIR/brush.fg"
-                        [ -n "$pkg" ] && brush_scan_one "$pkg"
-                        case "$line" in
-                            *" penstate")
-                                if brush_canvas; then
-                                    # 每次进入画布都重扫一遍（不同笔记本可能记着不同笔刷），
-                                    # 然后按当前笔刷下发波形
-                                    brush_scan_apps
-                                    [ -n "$(brush_base)" ] && brush_send "$(brush_base)" "canvas focused"
-                                else
-                                    brush_send 0 "canvas lost"
-                                fi ;;
-                        esac ;;
-                    "TAIL down")
-                        echo 1 > "$BRUSH_TAIL"
-                        if [ -n "$(brush_base)" ]; then
-                            brush_send "$BRUSH_ERASER" "tail(eraser) in range"
-                        fi ;;
-                    "TAIL up")
-                        echo 0 > "$BRUSH_TAIL"
-                        if [ -n "$(brush_base)" ]; then
-                            brush_send "$(brush_base)" "tip back"
-                        fi ;;
-                esac
-            else
-                # read 超时或管道断了。若 penring --watch 已经没了，必须立刻跳出内层让外层重建：
-                # 否则 read 会立刻返回失败 → 空转，而且每轮都跑 brush_exit_check（里面有 dumpsys）
-                # → 几秒内几千次 fork（实测把 pid 都耗到绕回）。
-                # 每 8 次超时才做一次进程表扫描：守卫本身要 fork，而且扫得太勤会在 penring
-                # 刚被重建的空档里误判"已退出"，导致看护反复重建（实测 1 秒 3 次抖动）。
-                miss=$((miss+1))
-                if [ $((miss % 8)) -eq 0 ] && [ -z "$(penring_watch_pids)" ]; then
-                    brush_log "watch: penring --watch 已退出，重建看护"
-                    break
-                fi
-                brush_exit_check
-            fi
-        done
-        sleep 1
-    done
-}
-
-penring_ensure() {
-    gesture_enabled || return 0
-    # 自愈：ksud 安装（或某些管理器解包）会丢可执行位，曾导致"卸载重装后手势/触感全没"
-    [ -x "$PENRING_BIN" ] || chmod 755 "$PENRING_BIN" 2>/dev/null
-    [ -x "$PENRING_BIN" ] || return 0
-    penring_alive && return 0
-    setsid "$PENRING_BIN" --moddir "$MODDIR" >>"$LOG.ring" 2>&1 </dev/null &
-    sleep 1
-    log "penring started pid=$(cat "$PENRING_PID" 2>/dev/null)"
-}
-
-# 单实例判定：直接扫 /proc（pid 文件在孤儿进程场景下不可靠，见 pids_of 注释）
-brushwatch_alive() { [ -n "$(brushwatch_pids)" ]; }
-
-brushwatch_ensure() {
-    [ -e "$DISABLE" ] && return 0
-    [ -e "$DISABLE_BRUSH" ] && return 0
-    case "$BRUSH" in 0|false|no|off) return 0 ;; esac
-    # 等 CE 存储解锁挂载：开机早期 /data/data/<pkg> 还不存在，此时起的看护挂不上 inotify，
-    # 进程活着却收不到任何事件（"mon 没活"的真身之一）。penring 现在会自己补挂，
-    # 但这里也等一等，省掉一轮无效工作 + 日志噪声。
-    _ce_ok=0
-    for _p in $BRUSH_APPS; do [ -d "/data/data/$_p" ] && _ce_ok=1; done
-    [ "$_ce_ok" = 1 ] || return 0
-    brushwatch_alive && return 0
-    # 陈旧锁（上次会话留下的 brush.lock/brush.pid）由 --brushwatch 自己清理
-    setsid /system/bin/sh "$0" --brushwatch >>"$BRUSH_LOG" 2>&1 </dev/null &
-    sleep 1
-    log "brushwatch started pid=$(cat "$MODDIR/brush.pid" 2>/dev/null)"
-}
-
-# ⑨ 休眠档：pen_rest_on 读状态文件（任何进程都能问"现在是不是休眠档"）
-pen_rest_on()      { [ "$(cat "$PEN_REST_FILE" 2>/dev/null)" = "1" ]; }
-pen_rest_mark()    { echo "$1" > "$PEN_REST_FILE" 2>/dev/null; }
-pen_rest_enabled() {
-    [ -e "$MODDIR/disable-rest" ] && return 1
-    cfg_on "$PEN_REST"
-}
-# 休眠档开着时不允许别的动作误判：显式提供"现在该不该静默"
-pen_quiet() { pen_rest_enabled && pen_rest_on; }
-
-# ⑤ 的三个子项。**判定统一走 cfg_on**（1/true/yes/on 才算开）。
-# 曾经 capsule_direct / capsule_fast 写成 `case in 0|false|no|off) return 1 ;; *) return 0`，
-# 也就是"只要不是显式关就是开" —— 于是 config 里把这两行删掉/留空会**静默打开**，
-# 而 capsule_gatt 又是相反的一套（只有显式 1 才算开）。三行同一个语义却两套写法，
-# 手改过 config 之后界面（--json 走的就是这几个函数）和实际行为会对不上。
-# 默认值本来就写在文件顶部（CAPSULE_DIRECT=1 / CAPSULE_GATT=1 / CAPSULE_FAST=0），
-# 所以统一成 cfg_on 之后行为不变，只是"缺键"不再等于"开"。
-capsule_direct() { cfg_on "$CAPSULE_DIRECT"; }
-capsule_gatt()   { cfg_on "$CAPSULE_GATT"; }
-capsule_fast()   { cfg_on "$CAPSULE_FAST"; }
-
-# 轮询间隔：把 POLL_MS 变成 sleep 的参数 + tick 折算（tick 仍按秒，供 REFRESH/日志轮转用）
-case "$POLL_MS" in
-    50)  SLEEP=0.05; PER_SEC=20 ;;
-    100) SLEEP=0.1;  PER_SEC=10 ;;
-    200) SLEEP=0.2;  PER_SEC=5 ;;
-    250) SLEEP=0.25; PER_SEC=4 ;;
-    500) SLEEP=0.5;  PER_SEC=2 ;;
-    *)   SLEEP=1;    PER_SEC=1 ;;
-esac
-
-# 读一个 sysfs 整数，非法时回落到默认值
-read_int() {
-    local v
-    v=$(cat "$1" 2>/dev/null)
-    case "$v" in ''|*[!0-9-]*) echo "$2" ;; *) echo "$v" ;; esac
-}
-
-read_att() {
-    local v=""
-    # 用 shell 内建 read，不起 cat 进程 —— 200ms 轮一次也几乎不花钱
-    # （注意别写成 `read ... || v=""`：sysfs 若没有结尾换行，read 会返回非零但值是有效的）
-    read -r v < "$ATT" 2>/dev/null
-    case "$v" in 0|1) echo "$v" ;; *) echo "$1" ;; esac
-}
-
-install_apk() {
-    local old new
-    old=$(sha256sum "$APK" 2>/dev/null | cut -c1-16)
-    new="$old"
-    if [ ! -f "$MODDIR/.apk.sha" ] || [ "$(cat "$MODDIR/.apk.sha" 2>/dev/null)" != "$old" ] \
-            || [ -z "$(pm path $PKG 2>/dev/null)" ]; then
-        if pm install --user 0 -r "$APK" >/dev/null 2>&1; then
-            echo "$new" > "$MODDIR/.apk.sha"
-            log "control apk installed ($new)"
-        else
-            log "ERROR apk install failed"
-        fi
-    fi
-    # 迁移：本模块的 App 从 dev.tb378fc.stylus（旧名"联想笔桥接"）改名为 dev.tb378fc.fix，
-    # 装了新包就把旧包卸掉，避免两个 App/两套 receiver 同时在（也会让 LSPosed 列表里留个旧名）。
-    if [ ! -e "$MODDIR/.oldpkg-removed" ] && [ -n "$(pm path dev.tb378fc.stylus 2>/dev/null)" ]; then
-        pm uninstall --user 0 dev.tb378fc.stylus >/dev/null 2>&1
-        : > "$MODDIR/.oldpkg-removed"
-        log "旧包 dev.tb378fc.stylus 已卸载（改名迁移）"
-    fi
-    pm grant --user 0 $PKG android.permission.BLUETOOTH_CONNECT >/dev/null 2>&1
-    pm grant --user 0 $PKG android.permission.BLUETOOTH_SCAN >/dev/null 2>&1
-}
-
-# APK 装没装（pm path 对不存在的包输出空）
-app_installed() { [ -n "$(pm path $PKG 2>/dev/null)" ]; }
-
-# 分组 B（需要 App 的功能）全关 → 把 APK 卸掉，不留残包。
-# WebUI 里关掉最后一个依赖项、或 --apksync 判定"不再需要"时会走到这里。
-# 注意：卸载后 LSPosed 作用域列表里会留一条失效条目，需要你在 LSPosed 里手动清掉。
-uninstall_apk() {
-    app_installed || return 0
-    if pm uninstall --user 0 $PKG >/dev/null 2>&1; then
-        rm -f "$MODDIR/.apk.sha" 2>/dev/null
-        log "TbFix.apk 已卸载（分组 B 七项全关，没有任何功能需要它）"
+    if bpfmon_running; then
+        log "WARN ③ 监视器仍在运行（init.svc.dynbpfloader=$(getprop init.svc.dynbpfloader)）"
     else
-        log "ERROR apk uninstall failed"
+        log "③ 监视器已停（init.svc.dynbpfloader=$(getprop init.svc.dynbpfloader)）"
     fi
 }
 
-# 按 need_app() 把 APK 状态对齐一次：需要就装、不需要就卸。
-# 开机（--monitor）与 WebUI 切开关（--apksync）都走这一条路径，行为一致。
-sync_apk() {
-    if need_app; then
-        install_apk
-    else
-        uninstall_apk
-    fi
-}
-
-send() {
-    if am broadcast --user 0 -n "$RCV" -a "$1" >/dev/null 2>&1; then
-        log "$2 sent"
-    else
-        log "ERROR $2 failed"
-    fi
-}
-
-# 带 extra 的广播（例如 --ei touchfilm 63）
-send_extra() {
-    local action="$1" what="$2" t0 t1; shift 2
-    t0=$(date +%s%3N)
-    if am broadcast --user 0 -n "$RCV" -a "$action" "$@" >/dev/null 2>&1; then
-        t1=$(date +%s%3N)
-        log "$what sent ($*) dispatch=$((t1-t0))ms"
-    else
-        log "ERROR $what failed ($*)"
-    fi
-}
-
-# ① 唤醒 与 ⑥ 手势位同步共用 App 的同一条广播（A_WAKE）。两者要分开控制：
-#   开了 ①            → wake=1，真的发 {5,5} 把笔叫起来
-#   只开 ⑥ 没开 ①     → wake=0，只把笔端触控膜功能位/轻捏力度写进去，不吵醒它
-#   两个都关          → 什么都不发
-# （App 侧对 wake extra 的处理与 --syncsettings 那条路径一致，见 WakeReceiver。）
-send_wake() {
-    local what="$1"
-    if pen_wake_enabled; then
-        send_extra "$A_WAKE" "$what" --ei wake 1 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
-    elif gesture_enabled; then
-        send_extra "$A_WAKE" "$what/no-wake" --ei wake 0 --ei touchfilm "$pen_mask" --ei squeeze "$pen_lvl"
-    fi
-}
-
-# ⑤ 前置：SecurityCoreAdd 的胶囊代码只在"不是首次连接"时才弹电量胶囊，否则走首次引导。
-# 这两个 key 是"首次连接引导已看过"的标记（未设置时 getIntForUser 取 0 → 判定为首次）。
-prepare_stylus_settings() {
-    local cur
-    cur=$(settings get secure stylus_first_connect 2>/dev/null)
-    if [ "$cur" != "1" ]; then
-        if settings put secure stylus_first_connect 1 >/dev/null 2>&1; then
-            log "stylus_first_connect 1 (was ${cur:-unset})"
-        else
-            log "ERROR stylus_first_connect write failed"
-        fi
-    fi
-    cur=$(settings get secure touch_film_stylus_first_connect 2>/dev/null)
-    if [ "$cur" != "1" ]; then
-        if settings put secure touch_film_stylus_first_connect 1 >/dev/null 2>&1; then
-            log "touch_film_stylus_first_connect 1 (was ${cur:-unset})"
-        fi
-    fi
-}
-
-# ⑤ 直发一条原生电量胶囊。
-#
-# 为什么要"先用缓存值弹"：笔放上去到线圈把 `attached` 置 1 要 **2 秒**（实测硬件握手），
-# 而线圈报出新的 `level` 还要再等 1~2 秒 —— 傻等真值的话胶囊要 4 秒才出来。
-# 所以边沿一到就用**上一次的 level** 先弹（线圈在取下时保留上一次的值），
-# 1~2 秒后拿到新值再补一条刷新（同样是原生胶囊，会替换掉旧的）。
-#
-#   1. CAPSULE_DIRECT=1（默认）：守护**自己**发原生 STYLUS_STATE_SOC —— 少一跳（不起 App 进程）
-#      否则只发 ATTACH 给 TbFix，由 App 组装并弹
-#   2. CAPSULE_GATT=1：再叫 TbFix 用系统 API / GATT 读真值，与已显示的值不同才补一条校正
-sensor_capsule() {
-    local batt="$1" fb
-    [ "$batt" -ge 1 ] && [ "$batt" -le 100 ] || return 1
-    if capsule_direct; then
-        if am broadcast --user 0 -a "$A_SOC" -n "$SOC_RCV" \
-                --ei battery "$batt" --ei state 4 --ei connect 5 >/dev/null 2>&1; then
-            shown="$batt"
-            log "capsule sent battery=$batt (coil_chg=$(read_int "$WLS_CHG" -1))"
-        else
-            log "ERROR capsule send failed battery=$batt"
-        fi
-    fi
-    # 休眠档：直发（本地广播，不碰笔）已经弹过了，就别再让 App 去连笔读电量（那会把笔吵醒）
-    if pen_rest_on; then
-        log "capsule: 休眠档跳过 GATT 校正 battery=$batt"
+# ---------------------------------------------------------------- ④ 停死电话栈
+do_telephony() {
+    if [ -e "$DISABLE_TELEPHONY" ]; then
+        log "④ 被标记文件 disable-telephony 关闭"
         return 0
     fi
-    # 交给 TbFix：
-    #   a) 直发成功 + 开了 GATT 校正 → battery=-1（"已弹过，别重复弹"）+ coil=已显示值
-    #   b) 直发没成功（或 CAPSULE_DIRECT=0）→ battery=本值，让 App 立刻弹
-    if capsule_gatt || [ "$shown" != "$batt" ]; then
-        if [ "$shown" = "$batt" ]; then fb=-1; else fb="$batt"; fi
-        if am broadcast --user 0 -n "$RCV" -a "$A_ATTACH" \
-                --ei battery "$fb" --ei coil "$batt" --ei state 4 >/dev/null 2>&1; then
-            log "attach forwarded (battery=$fb coil=$batt)"
-        fi
+    if ! fix_telephony_enabled; then
+        log "④ 已关闭（config FIX_TELEPHONY=0）"
+        return 0
     fi
-    return 0
-}
-
-# 读线圈电量（内建 read，不起进程）；非 0..100 一律返回 -1
-read_level() {
-    local v=""
-    read -r v < "$WLS_LEVEL" 2>/dev/null
-    case "$v" in ''|*[!0-9]*) echo -1 ;; *) echo "$v" ;; esac
-}
-
-# ④ 停死电话栈。原理见文件头 ④。
-# 幂等：已经是 disabled 的包不动，全部已停就不写日志刷屏。
-#
-# 为什么还要先探测"这个包在不在"：ROM 变体之间差别很大 —— 实测 HyperOS 3 的 TB378FC
-# 上 TELEPHONY_PKGS 里这三个包**一个都不存在**。对不存在的包 pm disable-user 会抛
-#     java.lang.IllegalArgumentException: Unknown package: com.qualcomm.qti.telephonyservice
-# 并以非 0 退出，于是每次开机刷 3 行 ERROR + 一段 Java 栈；而 ④ 真正要保证的东西
-# （没有空转的 persistent 进程）在这种机器上本来就天然达成。所以不存在的包直接跳过 ——
-# 既不算失败，也不打日志，只把统计写进最后那一行汇总里。
-fix_telephony() {
-    local noril p out already new absent fail exist disabled
 
     # 只在确实没有电话硬件时才动手 —— 有 modem 的变体上这几个包是正常功能，别误伤。
+    local noril p out already new absent fail exist disabled
     noril=$(getprop ro.radio.noril)
     case "$noril" in
         true|yes|1) ;;
@@ -979,18 +153,17 @@ fix_telephony() {
             ;;
     esac
 
-    # 包列表只查一次：pm 每次调用都要起一个 app_process（几百 ms），三个包各查两遍
-    # 就是 6 次 pm 调用，开机期没必要。
+    # 包列表只查一次：pm 每次调用都要起一个 app_process（几百 ms），
+    # 三个包各查两遍就是 6 次 pm 调用，开机期没必要。
     exist=$(pm list packages 2>/dev/null)
     disabled=$(pm list packages -d 2>/dev/null)
 
-    already=0
-    new=0
-    absent=0
-    fail=0
+    already=0; new=0; absent=0; fail=0
     for p in $TELEPHONY_PKGS; do
         printf '%s\n' "$disabled" | grep -qx "package:$p" && { already=$((already+1)); continue; }
-        # 包根本不在本机 → 跳过（见上面注释，这不算失败）
+        # 包根本不在本机 → 跳过（实测 HyperOS 3 的 TB378FC 上这三个包一个都不存在；
+        # 对不存在的包 pm disable-user 会抛 IllegalArgumentException 并以非 0 退出，
+        # 于是每次开机刷 3 行 ERROR + 一段 Java 栈，而 ④ 要保证的东西本来就天然达成）。
         printf '%s\n' "$exist"    | grep -qx "package:$p" || { absent=$((absent+1)); continue; }
         # 必须 root（本脚本由 KernelSU 以 root 启动）。以 shell UID 跑会被
         # shouldRestrictEnabledSettingsChange 拦下。
@@ -1003,7 +176,7 @@ fix_telephony() {
         fi
     done
 
-    # 汇总一行。注意别把"失败"说成"没事"：只有真的没有失败时才走 n/a / already 的措辞。
+    # 汇总一行。注意别把"失败"说成"没事"。
     if [ "$fail" -gt 0 ]; then
         log "telephony summary: $new disabled, $already already, $absent absent, $fail FAILED"
     elif [ "$new" -eq 0 ]; then
@@ -1016,679 +189,167 @@ fix_telephony() {
     return 0
 }
 
-# 判断记录的 pid 是不是**我们自己的** supervisor。
-# 只做 kill -0 是不够的：pid 会被复用。重启后新进程占住同一个号，setup 就会误判
-# "supervisor 还活着" 并提前 exit 0，而那句 exit 0 在 ③④① 启动之前 —— 整个模块静默不跑。
-# 实测 2914 被 vendor.qti.hardware.soter-service 占用即触发。
-# 所以再核对一次 /proc/<pid>/cmdline，确认确实是本脚本的 --supervise。
-supervisor_alive() {
-    local pid="$1" cl
-    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-    kill -0 "$pid" 2>/dev/null || return 1
-    cl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-    case "$cl" in
-        *service.sh*--supervise*) return 0 ;;
-    esac
-    return 1
-}
-
-# config 的"指纹"（内容哈希，拿不到就退回 mtime+大小）。
-# 用途：判断"还活着的 supervisor 是不是按**当前**配置起来的"。
-# 为什么需要它：supervisor / monitor 里的 BRUSH、GESTURE 这些变量是进程启动时读进内存的，
-# 之后 WebUI 改 config 它们**不会**跟着变。所以"supervisor 还活着"并不等于"配置已生效"——
-# 必须比一下指纹，不然 setup 会误以为没事、把这次配置变更整个丢掉。
-cfg_gen() {
-    local h
-    h=$(md5sum "$CFG" 2>/dev/null | awk '{print $1}')
-    [ -n "$h" ] || h=$(stat -c '%Y-%s' "$CFG" 2>/dev/null)
-    echo "$h"
-}
-
-case "$1" in
-
---brushsend)
-    # 手动发一个波形：sh service.sh --brushsend 33   （33 = 铅笔，见 ZuxPen 波形表）
-    brush_send "$2" "manual"
-    exit 0
-    ;;
-
---brushstop)
-    brush_send 0 "manual"
-    exit 0
-    ;;
-
---brushwatch)
-    # 单实例：已有活着的实例就直接退出（否则会有多个实例各发一份波形、还各按自己那份代码判定）
-    # 原子抢锁：mkdir 成功者才是实例。
-    # 不能用"先扫描全表、发现有别人就退出"——两个并发的 ensure（supervisor 和 monitor 都会拉）
-    # 会互相谦让，结果两个都退出，看护静默消失（实测：mon 一直不启动的真身）。
-    tries=0
-    while :; do
-        if mkdir "$BRUSH_LOCK" 2>/dev/null; then break; fi
-        other=$(brushwatch_pids | tr '\n' ' ')
-        tries=$((tries+1))
-        if [ -n "$other" ]; then
-            log "brushwatch already running pid=$other, exit"
-            exit 0
-        fi
-        if [ "$tries" -ge 5 ]; then
-            log "brushwatch lock busy but no live instance (stale?), give up"
-            exit 0
-        fi
-        rm -rf "$BRUSH_LOCK"          # 陈旧锁（持有者已死）：清掉重抢
-        sleep 0.3
-    done
-    trap 'rmdir "$BRUSH_LOCK" 2>/dev/null; rm -f "$MODDIR/brush.pid"' EXIT INT TERM
-    echo $$ > "$MODDIR/brush.pid"
-    # ⑦ 笔刷触感看护：两条子循环并跑
-    #   A) 轮询笔记/小米创作的 creation_shpref.xml 里 current_brush（笔刷切换）
-    #   B) 读笔触控节点，BTN_TOOL_RUBBER 按下=笔尾（橡皮端）靠近，抬起=回笔尖
-    #   状态写在 $BRUSH_STATE："<波形id> <包名>"；退出应用后由 A 负责停波形。
-    brush_enabled || exit 0
-    log "brushwatch up (apps=$BRUSH_APPS level=$BRUSH_LEVEL map=$BRUSH_MAP eraser=$BRUSH_ERASER)"
-    : > "$BRUSH_STATE"
-    : > "$BRUSH_BASE"
-    # 启动先清一次：上一轮守护可能被重启过，笔里还挂着 CON 波形
-    brush_send 0 "watch start"
-
-    brush_watch_loop
-    rmdir "$BRUSH_LOCK" 2>/dev/null
-    exit 0
-    ;;
-
---sepolicy)
-    # ⑭ 开发者选项修复：把 sepolicy.rule 重新应用一遍（免重启）：sh service.sh --sepolicy
-    # 用途：开机脚本被跳过、或刷了新策略之后 denial 又回来时，手动救一次。
-    # 原理：ksud sepolicy apply 把规则注入**运行时策略**并触发一次策略重载，会刷新内核 AVC 与
-    #       init 用户态 libselinux 里的陈旧拒绝缓存 —— 立即生效、无需重启；
-    #       代价是只在内存里，重启后由 post-fs-data.sh 与 setup 自动重放。
-    # 注意：它按传入文件重新推导、不跨调用累积，所以传的是**完整**的 sepolicy.rule。
-    KSUD=""
+# ---------------------------------------------------------------- ⑭ sepolicy
+do_sepolicy() {
+    # 规则已经写在 sepolicy.rule 里（KernelSU 开机会自动加载），但实测在 ReSukiSU 4.x
+    # late-load LKM 上**纯声明式加载并不可靠** —— 出现过"删掉模块重启后原始 denial 又回来了"。
+    # 所以用 ksud 的运行时通道显式再应用一遍：它会触发一次策略重载，顺带刷新内核 AVC 与
+    # init 用户态 libselinux 里的陈旧拒绝缓存。
+    # 注意：ksud sepolicy apply 是"按传入文件重新推导并应用"，**不会跨调用累积**，
+    # 所以必须传**完整**的 sepolicy.rule。本项没有开关：它是崩溃修复，不是可选功能。
+    local KSUD="" c
     for c in /data/adb/ksud /data/adb/ksu/bin/ksud; do
         if [ -x "$c" ]; then KSUD="$c"; break; fi
     done
-    if [ -z "$KSUD" ]; then
-        echo "找不到 ksud（试过 /data/adb/ksud 与 /data/adb/ksu/bin/ksud）" >&2
-        exit 1
+    if [ -n "$KSUD" ]; then
+        "$KSUD" sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1
+        log "⑭ sepolicy apply rc=$? ($KSUD)"
+    else
+        log "⑭ 找不到 ksud，跳过显式应用（规则仍由 KernelSU 声明式加载）"
     fi
-    echo "enforce=$(getenforce)  ksud=$KSUD"
-    "$KSUD" sepolicy apply "$MODDIR/sepolicy.rule"
-    rc=$?
-    echo "sepolicy apply rc=$rc"
-    # 顺带报一下这两个属性的当前值，便于确认写入路径是通的
-    echo "logd.logpersistd=[$(getprop logd.logpersistd)]  persist.logd.logpersistd.buffer=[$(getprop persist.logd.logpersistd.buffer)]"
-    exit $rc
-    ;;
+}
 
---appstat)
-    # WebUI 查 APK 状态（比 --json 轻）：sh service.sh --appstat
-    #   installed=1/0  那个 APK 在不在
-    #   needed=1/0     分组 B 里有没有功能需要它（= need_app()）
-    if app_installed; then echo "installed=1"; else echo "installed=0"; fi
-    if need_app; then echo "needed=1"; else echo "needed=0"; fi
-    exit 0
-    ;;
+# ---------------------------------------------------------------- 开机动作
+wait_boot_completed() {
+    local i=0
+    while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
+        sleep 2
+        i=$((i+1))
+    done
+    # 再等一会儿：dynbpfloader 由 `on property:sys.boot_completed=1` 触发启动，
+    # 属性置位与服务真正起来之间有一小段间隔。
+    sleep 15
+}
 
---apksync)
-    # 按 need_app() 把 APK 状态对齐一次。WebUI 切换分组 B 的开关后立刻调用，
-    # 不用等守护重启那 ~20 秒；开机路径走 --monitor 里的 sync_apk()，两者同一个判据。
-    sync_apk
-    if app_installed; then echo "installed=1"; else echo "installed=0"; fi
-    exit 0
-    ;;
+boot_actions() {
+    [ -e "$MODDIR/disable" ] && { log "模块已被 disable 标记停用，跳过"; return 0; }
+    wait_boot_completed
+    log "--- Lite 开机动作开始（v$VERSION）---"
+    do_bpfmon
+    do_telephony
+    do_sepolicy
+    log "--- Lite 开机动作结束，本脚本退出（无任何常驻进程）---"
+}
 
---json)
-    # WebUI 读"生效值"（含默认、config 覆盖与 disable-* 标记）：sh service.sh --json
-    # 布尔项一律走 *_enabled()，这样标记文件造成的"强制关"在界面上也看得见。
-    _b() { if "$1"; then echo 1; else echo 0; fi; }
+# ---------------------------------------------------------------- 改配置
+set_cfg() {
+    local _k="$1" _v="$2" _tmp _found _line
+    shift 2
+    [ -n "$_k" ] || return 1
+    # 键名白名单：避免键名里混进 shell 元字符去影响下面的 sed/case
+    case "$_k" in *[!A-Za-z0-9_]*) return 1 ;; esac
+    _tmp="$CFG.tmp.$$"
+    _found=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            "$_k="*) printf '%s=%s\n' "$_k" "$_v"; _found=1 ;;
+            *)       printf '%s\n' "$_line" ;;
+        esac
+    done < "$CFG" > "$_tmp"
+    [ "$_found" = 1 ] || printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
+    mv -f "$_tmp" "$CFG" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+    chmod 600 "$CFG" 2>/dev/null
+    chown 0:0 "$CFG" 2>/dev/null
+    log "config: $_k=$_v"
+    return 0
+}
+
+# ---------------------------------------------------------------- 状态输出
+markers_list() {
+    local m out=""
+    for m in disable disable-powerkeeper disable-bpfmon disable-telephony; do
+        [ -e "$MODDIR/$m" ] && out="$out $m"
+    done
+    printf '%s' "$out"
+}
+
+json_out() {
+    local mk ts td
+    mk=$(markers_list)
+    # telephony_summary 要跑两次 pm（每次几百 ms），所以只算一次，两处共用。
+    ts=$(telephony_summary)
+    if telephony_done_from "$ts"; then td=1; else td=0; fi
     printf '{"FIX_POWERKEEPER":%s,"FIX_BPFMON":%s,"FIX_TELEPHONY":%s,' \
         "$(_b fix_powerkeeper_enabled)" "$(_b fix_bpfmon_enabled)" "$(_b fix_telephony_enabled)"
-    printf '"GESTURE":%s,"PEN_WAKE":%s,"CAPSULE":%s,"BRUSH":%s,"AON":%s,' \
-        "$(_b gesture_enabled)" "$(_b pen_wake_enabled)" "$(_b capsule_enabled)" \
-        "$(_b brush_enabled)" "$(_b aon_enabled)"
-    printf '"PEN_REST":%s,"SETTINGS_SYNC":%s,"SCREEN_CMD":%s,"NEED_APP":%s,' \
-        "$(_b pen_rest_enabled)" "$(_b settings_sync_enabled)" "$(_b screen_enabled)" "$(_b need_app)"
-    printf '"BRUSH_ERASER":%s,"BRUSH_DEFAULT_WAVE":%s,"BRUSH_AI_WAVE":%s,"BRUSH_LASSO_WAVE":%s,' \
-        "${BRUSH_ERASER:-35}" "${BRUSH_DEFAULT_WAVE:-36}" "${BRUSH_AI_WAVE:-36}" "${BRUSH_LASSO_WAVE:-36}"
-    printf '"GESTURE_RING":%s,"GESTURE_DOUBLE":%s,"GESTURE_SLIDE_UP":%s,' \
-        "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
-    printf '"GESTURE_SLIDE_DOWN":%s,"GESTURE_TAIL":%s,' "${GESTURE_SLIDE_DOWN:-197}" "${GESTURE_TAIL:-92}"
-    printf '"SCREEN_SWAP":%s,"CAPSULE_DIRECT":%s,"CAPSULE_GATT":%s,"CAPSULE_FAST":%s,' \
-        "$(_b screen_swap_enabled)" "$(_b capsule_direct)" "$(_b capsule_gatt)" "$(_b capsule_fast)"
-    printf '"REFRESH_SECONDS":%s,"POLL_MS":%s,' "$(refresh_seconds)" "${POLL_MS:-200}"
-    # 存在哪些 disable-* 标记文件（有标记的功能会被强制关，界面上要能提示）
-    _mk=""
-    for _m in disable disable-powerkeeper disable-bpfmon disable-telephony disable-capsule \
-              disable-gesture disable-brush disable-aon disable-aonlib disable-rest \
-              disable-screen disable-rompen; do
-        [ -e "$MODDIR/$_m" ] && _mk="$_mk$_m "
-    done
-    printf '"MARKERS":"%s",' "${_mk% }"
-    printf '"BRUSH_MAP":"%s"}\n' "${BRUSH_MAP:-}"
-    exit 0
-    ;;
+    printf '"NEED_APP":0,"VERSION":"%s",' "$VERSION"
+    printf '"BPFMON_SVC":"%s","BPFMON_RUNNING":%s,' \
+        "$(getprop init.svc.dynbpfloader)" "$(_b bpfmon_running)"
+    printf '"POWERKEEPER_MOUNTED":%s,' "$(_b pk_mounted)"
+    printf '"POWERKEEPER_PAYLOAD":%s,' "$([ -f "$PAYLOAD" ] && printf 1 || printf 0)"
+    printf '"TELEPHONY_DONE":%s,"TELEPHONY_STATE":"%s",' "$td" "$ts"
+    printf '"MARKERS":"%s"}\n' "$mk"
+}
 
---set)
-    # WebUI 写配置：sh service.sh --set KEY VALUE [KEY VALUE ...]
-    # **支持一次写多项** —— WebUI 里每个分类的"总开关"要一次改好几项，
-    # 逐项调用会触发多次守护重启（每次 ~20 秒），必须合并成一次。
-    # 立即改 config 并返回（页面不能被卡住）；重启交给一个 detach 出去的小脚本去做。
-    # 注意：绝不能像以前那样"杀掉所有含模块路径的进程" —— 会把正在跑这条命令的 shell 也杀掉，
-    # ksu.exec 永远不返回，WebUI 就卡在那次调用上（实测）。
-    shift
-    _n=0
-    while [ $# -ge 2 ]; do
-        _k="$1"; _v="$2"; shift 2
-        case "$_k" in
-            ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
-        esac
-        # 按行重写，值**原样**输出，不经过 sed 的替换段。
-        # 为什么不继续用 sed：`sed "s|^K=.*|K=$v|"` 里 v 带 & 会被替换成"被匹配到的旧行"、
-        # 带 | 会撞分隔符直接报错、带 \ 会被吃掉 —— 而 GNU sed 的替换段并不认 `\|` 这个转义
-        # （实测报 "unknown option to `s'"）。现在 WebUI 只会写数字和 "1:32,2:32" 碰不到，
-        # 但 config 是给人手改的、值以后可能变复杂，这个口子必须堵上。
-        _tmp="$CFG.tmp.$$"
-        _found=0
-        while IFS= read -r _line || [ -n "$_line" ]; do
-            case "$_line" in
-                "$_k="*) printf '%s=%s\n' "$_k" "$_v"; _found=1 ;;
-                *)       printf '%s\n' "$_line" ;;
-            esac
-        done < "$CFG" > "$_tmp"
-        [ "$_found" = 1 ] || printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
-        mv -f "$_tmp" "$CFG"
-        log "config: $_k=$_v（守护稍后重启生效）"
-        _n=$((_n+1))
-    done
-    [ "$_n" -gt 0 ] || { echo "usage: --set KEY VALUE [KEY VALUE ...]" >&2; exit 2; }
-    # detach 出去重启（只杀本模块守护；脚本单独成文件，避免把自己也匹配进去）
-    MODDIR="$MODDIR" setsid /system/bin/sh "$MODDIR/restart.sh" >/dev/null 2>&1 </dev/null &
-    echo "ok $_n"
-    exit 0
-
-    ;;
-
---rest)
-    # 手工强制休眠档（排障/测试用）：sh service.sh --rest 1 | --rest 0
-    case "$2" in 1|on) pen_rest_mark 1 ;; *) pen_rest_mark 0 ;; esac
-    send_extra "$A_REST" "rest $2" --ei on "$([ "$2" = 1 ] && echo 1 || echo 0)"
-    log "rest 手工置为 $(cat "$PEN_REST_FILE" 2>/dev/null)"
-    exit 0
-    ;;
-
---restcheck)
-    # 用给定的 att/lvl 走一遍休眠判定（不改状态）：sh service.sh --restcheck 1 100
-    # 用法：--restcheck <att> <lvl> [chg] [距上次 chg=1 的秒数]
-    pen_rest_enabled || { echo "PEN_REST=0：休眠档关闭"; exit 0; }
-    _att="$2"; _lvl="$3"; _chg="${4:-0}"; _idle="${5:-0}"
-    if [ "$_att" = 0 ]; then
-        echo "→ 不休眠（已取下）"
-    elif [ "$_lvl" -ge "$REST_FULL" ]; then
-        echo "→ 进入休眠（兜底判据：电量 $_lvl ≥ $REST_FULL）"
-    elif [ "$_chg" = 1 ]; then
-        echo "→ 不休眠（正在充电 chg=1，电量 $_lvl）"
-    elif [ "$_idle" -ge "$REST_IDLE" ]; then
-        echo "→ 进入休眠（主判据：充电已停 ${_idle}s ≥ $REST_IDLE，电量 $_lvl）"
-    elif [ "$_att" = 0 ]; then
-        echo "→ 不休眠（已取下）"
-    else
-        echo "→ 保持现状（吸附，chg=0 但只停了 ${_idle}s < $REST_IDLE，电量 $_lvl）"
+status_out() {
+    echo "TB378FC HyperOS 修复 Lite  v$VERSION"
+    echo "模块目录: $MODDIR"
+    echo
+    echo "② PowerKeeper 补丁     : $(_b fix_powerkeeper_enabled)   已挂载: $(_b pk_mounted)"
+    echo "③ 停 BPF 监视器        : $(_b fix_bpfmon_enabled)   dynbpfloader=$(getprop init.svc.dynbpfloader)  监视器进程: $(_b bpfmon_running)"
+    echo "④ 停死电话栈           : $(_b fix_telephony_enabled)   $(telephony_summary)"
+    echo "⑭ 开发者选项 sepolicy  : 常开（无开关）"
+    echo
+    echo "标记文件:$(markers_list)"
+    echo
+    echo "常驻进程: 本模块不产生任何常驻进程（开机动作执行一次即退出）"
+    echo "日志: $LOG"
+    if [ -f "$LOG" ]; then
+        echo "--- 日志尾部 ---"
+        tail -12 "$LOG"
     fi
-    exit 0
-    ;;
+}
 
---syncsettings)
-    # ⑥ 手动跑一次"设置 → 笔"同步（排障用；monitor 每 2 秒自己也会跑）
-    pen_sync_read
-    sync_last_mask=""; sync_last_lvl=""
-    if sync_pen_settings; then
-        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl sent"
-    else
-        log "syncsettings: mask=$pen_mask squeeze=$pen_lvl（未下发：SETTINGS_SYNC=0 / penring 不在 / 正处于⑨休眠档）"
-    fi
-    exit 0
-    ;;
-
---stoprompen)
-    # ⑥ 移植 ROM 自带的笔桥（/system/etc/init/init.lwky.rc 里的 lwky_pen =
-    #    /system/lwky/penbridge_hyperos）是"老一套"：它造的是 type-1（0x1915/0xEAEA）虚拟笔，
-    #    并且在 boot_completed 时启动、按自己的映射往笔上灌 PAGEUP/PAGEDOWN(92/93)。
-    #    在 HyperOS 上 type-1 永远进不了 MIUI 的触控膜分支（只认 type 8），而 92/93 又会被
-    #    MiuiStylusShortcutManager 当成"截图键/速记键"乱触发 —— 和我们 penring 抢着注入。
-    #    这里把它停掉（init 的 oneshot 服务，ctl.stop 之后不会自己回来；真回来就再停）。
-    [ -e "$DISABLE_ROMPEN" ] && exit 0
-    gesture_enabled || exit 0
-    was=0
-    while [ ! -e "$DISABLE_ROMPEN" ]; do
-        # ⑥ 在 WebUI 里被关掉（config 改了 → 守护重启）时自己退出去，
-        # 把 ROM 原本的笔桥还回去（ctl.stop 只作用于本次开机，下次开机它就自己回来了）。
-        gesture_enabled || { log "⑥ 手势桥已关闭，停止看护 ROM 笔桥"; exit 0; }
-        if pidof penbridge_hyperos >/dev/null 2>&1; then
-            setprop ctl.stop lwky_pen 2>/dev/null
-            sleep 1
-            pkill -x penbridge_hyperos 2>/dev/null
-            sleep 1
-            if pidof penbridge_hyperos >/dev/null 2>&1; then
-                log "WARN ROM 笔桥 lwky_pen 停不掉（还在跑）"
-            elif [ "$was" = 0 ]; then
-                log "ROM 笔桥 lwky_pen 已停（老 type-1 桥不再注入 92/93）"
-                was=1
-            else
-                log "ROM 笔桥 lwky_pen 又被拉起来了，已再停"
-            fi
-        fi
-        sleep 30
-    done
-    exit 0
-    ;;
-
---stopbpfmon)
-    # 见文件头 ③。监视器由 init 在 boot_completed 后启动；ctl.stop 会让 init 不再自动拉起它，
-    # 但实测本机它会被别的东西重新拉起来（观察到一次：开机很久之后又出现一个
-    # hyper_bpfloader --monitor-mode），所以只停一次不够，要一直看护。
-    [ -e "$DISABLE_BPFMON" ] && exit 0
-    fix_bpfmon_enabled || exit 0
-    i=0
-    while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
-        sleep 2
-        i=$((i+1))
-    done
-    sleep 20
-    log "bpf monitor watchdog up (will keep dynbpfloader down)"
-    was=0
-    while [ ! -e "$DISABLE_BPFMON" ]; do
-        # ③ 在 WebUI 里被关掉时看护自己退出（它是个常驻循环，不会随守护重启一起消失）
-        fix_bpfmon_enabled || { log "③ BPF 监视器拆弹已关闭，看护退出"; exit 0; }
-        if pidof hyper_bpfloader >/dev/null 2>&1; then
-            setprop ctl.stop dynbpfloader 2>/dev/null
-            sleep 2
-            if pidof hyper_bpfloader >/dev/null 2>&1; then
-                log "WARN bpf monitor survived ctl.stop; rescue reboot remains possible"
-            elif [ "$was" = 0 ]; then
-                log "bpf monitor stopped (hyper_bpfloader rescue reboot defused)"
-                was=1
-            else
-                log "bpf monitor stopped again (something had restarted it)"
-            fi
-        fi
-        sleep 60
-    done
-    exit 0
-    ;;
-
---fixtelephony)
-    # 见文件头 ④。这是一次性动作，不需要常驻看护：停用状态本身写在 packages.xml 里
-    # 跨重启保持，这里只是每次开机复查一遍，防止 ROM 更新/包重装把状态冲掉。
-    [ -e "$DISABLE_TELEPHONY" ] && exit 0
-    fix_telephony_enabled || exit 0
-
-    i=0
-    while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
-        sleep 2
-        i=$((i+1))
-    done
-    sleep 10
-
-    fix_telephony
-    exit 0
-    ;;
-
---supervise)
-    echo $$ > "$LOCK/pid"
-    log "supervisor up pid=$$"
-    penring_ensure
-    brushwatch_ensure
-    while [ ! -e "$DISABLE" ]; do
-        /system/bin/sh "$0" --monitor
-        penring_ensure
-        brushwatch_ensure
-        [ -e "$DISABLE" ] && break
-        log "monitor exited; respawning in 5s"
-        sleep 5
-    done
-    log "supervisor exit"
-    rm -rf "$LOCK" 2>/dev/null
-    exit 0
-    ;;
-
---monitor)
-    [ -e "$DISABLE" ] && exit 0
-
-    i=0
-    while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 300 ]; do
-        sleep 1
-        i=$((i+1))
-    done
-    sleep 10
-
-    # 分组 B（需要 App 的功能）里任意一项开着 → 装 bin/TbFix.apk；七项全关 → 把它卸掉。
-    # 默认七项全是 0，所以**默认不会安装任何 APK**；只有你在 WebUI 里手动开一项才会装。
-    sync_apk
-
-    # ⑧ AON：mifaced（HAL）由 init 在 sys.boot_completed=1 时才起，而 com.xiaomi.aon 若在这之前
-    # 已经跑起来，会把 mIAlwaysOn 缓存成 null —— 之后恒返回"无人注视"（实测，必须清一次进程）。
-    # 这里用 kill 而不是 am force-stop：kill 掉后框架下次请求会自然重新 bind（force-stop 会置
-    # stopped 状态，语义更重）。每个开机只做一次（标记文件，post-fs-data 清）。
-    # ⑧c 设置页可见性由 TbFixHook 在设置进程里放行（见 hookAonSettingsBool），无需在这里做事。
-
-    if aon_enabled && [ ! -e "$MODDIR/aon.restarted" ] \
-            && [ -x /odm/bin/hw/mifaced ] && pidof com.xiaomi.aon >/dev/null 2>&1; then
-        kill -9 "$(pidof com.xiaomi.aon)" 2>/dev/null
-        : > "$MODDIR/aon.restarted"
-        log "⑧ AON app 进程已清一次（避免它缓存 null 的 mIAlwaysOn）"
-    fi
-
-    REFRESH=$(refresh_seconds)
-    last_att=$(read_att 1)
-    last_lvl=$(read_level)
-    last_good=-1
-    [ "$last_lvl" -ge 1 ] && [ "$last_lvl" -le 100 ] && last_good=$last_lvl
-    shown=""
-    tick=0
-    sub=0
-    now_sec=0
-    refresh_at=0
-    refresh_deadline=0
-    lvl_win=0          # "全速读线圈电量"的剩余秒数（吸附边沿后开窗）
-    last_screen=-1     # ⑬ 上一次读到的屏幕状态（1=灭 2=亮）
-    pen_rest=0         # ⑨ 休眠档当前状态（文件里也写一份，给别的进程看）
-    chg_seen=0         # ⑨ 本次吸附期间有没有见过 chg=1（见过才算"充过电"）
-    chg_last=0         # ⑨ 最后一次见到 chg=1 的时刻（now_sec）
-    pen_rest_enabled && [ "$REST_POLL" -ge 5 ] 2>/dev/null || REST_POLL=5
-    [ "$REST_IDLE" -ge 5 ] 2>/dev/null || REST_IDLE=5
-    pen_rest_mark 0
-    if capsule_enabled; then
-        prepare_stylus_settings
-        log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=on poll=${POLL_MS}ms direct=$CAPSULE_DIRECT gatt=$CAPSULE_GATT fast=$CAPSULE_FAST"
-    else
-        log "monitor start attached=$last_att level=$last_lvl refresh=${REFRESH}s capsule=off poll=${POLL_MS}ms"
-    fi
-
-    if [ "$last_att" = 0 ]; then
-        # 开机时笔不在线圈上：唤醒它（①），并同步一次 {8,6,mask} 手势位（⑥ 也需要这一步）。
-        # ① 关掉而 ⑥ 开着时 send_wake 会带 wake=0 —— 只写功能位，不叫醒笔。
-        pen_sync_read
-        send_wake "startup-wake"
-    fi
-
-    while [ ! -e "$DISABLE" ]; do
-        sleep "$SLEEP"
-        sub=$((sub+1))
-        if [ $((sub % PER_SEC)) -eq 0 ]; then
-            tick=$((tick+1))
-            now_sec=$((now_sec+1))
-            # ⑥ 每 2 秒看一次"设置→手写笔"有没有变（双击/轻捏开关、轻捏力度）
-            if [ $((tick % 2)) -eq 0 ]; then sync_pen_settings || true; fi
-            # 看护自愈：monitor 是唯一常驻不退出的循环，penring / brushwatch 若被杀掉/崩溃
-            # （历史事故：函数整段丢失导致开机后静默不启动）在这里两秒内重生一次。
-            if [ $((tick % 2)) -eq 1 ]; then penring_ensure; brushwatch_ensure; fi
-            [ "$lvl_win" -gt 0 ] && lvl_win=$((lvl_win-1))
-
-            # ⑬ 屏幕亮/灭 → 告诉笔（debug.tracing.screen_state：1=灭 2=亮）
-            if screen_enabled; then
-                sc=$(getprop debug.tracing.screen_state 2>/dev/null)
-                case "$sc" in 1|2) ;;
-                    *) sc="" ;;
-                esac
-                if [ -n "$sc" ] && [ "$sc" != "$last_screen" ]; then
-                    prev=$last_screen
-                    last_screen=$sc
-                    if [ "$prev" != "-1" ]; then
-                        if [ "$sc" = "2" ]; then frame=2; what=screen-on; else frame=1; what=screen-off; fi
-                        # 与 --json 共用同一个判定，避免"界面显示关了、这里还在互换"
-                        screen_swap_enabled && { [ "$frame" = 2 ] && frame=1 || frame=2; }
-                        send_extra "$A_SCREEN" "$what" --ei frame "$frame"
-                    else
-                        log "screen state 初始 = $sc（不发指令）"
-                    fi
-                fi
-            fi
-        fi
-        # attached 每轮都读（边沿检测靠它）。用内建 read 直接写变量：原来写成 $(read_att) 会让
-        # 每轮 fork 一个子 shell，而"读一次 wls_tx 属性"本身就会让内核 Qi 驱动重发属性。
-        att=""
-        read -r att < "$ATT" 2>/dev/null
-        case "$att" in 0|1) ;; *) att=$last_att ;; esac
-
-        # 线圈电量按需读：每次读 wls_tx/level 都会触发内核 Qi 属性重发 →
-        # MiuiChargeManager 再 notify 一次电池状态 → 电池图标闪（实测每 200ms 一读时每秒十几次）。
-        #   lvl_win>0（刚吸附/线圈启动后 8 秒）：每 ~1 秒一次，尽快拿到真值弹胶囊
-        #   吸附稳定：每 ~2 秒一次
-        #   未吸附：每 ~10 秒兜底一次（认线圈启动边沿）
-        lvl_read=0; chg=0
-        if [ "$pen_rest" = 1 ]; then
-            # 休眠档：降到 REST_POLL 秒一次（只是用来发现"该醒了"）
-            [ $((sub % $((REST_POLL * 5)))) -eq 0 ] && lvl_read=1
-        elif [ "$lvl_win" -gt 0 ]; then
-            [ $((sub % 5)) -eq 0 ] && lvl_read=1
-        elif [ "$att" = 1 ]; then
-            [ $((sub % 10)) -eq 0 ] && lvl_read=1
-        else
-            [ $((sub % 50)) -eq 0 ] && lvl_read=1
-        fi
-        if [ "$lvl_read" = 1 ]; then
-            lvl=$(read_level)
-            chg=$(read_int "$WLS_CHG" 0)     # 0/1：线圈报的"是否正在给笔充电"
-        else
-            lvl=$last_lvl
-        fi
-        if [ "$lvl_read" = 1 ] && [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then last_good=$lvl; fi
-
-        # ⑨ 休眠档状态机：吸附且"充完了" → 让笔休眠；取下、或线圈重新开始充电 → 恢复
-        #
-        # 判据用 **charge_state**（线圈驱动报的"是否正在给笔充电"）而不是拍一个电量阈值：
-        #   1) 本轮读到 chg=1 → 说明确实在充，记下时间（刚吸上那几秒 chg 也是 0 —— 握手还没起来，
-        #      所以不能只看 chg=0，否则一吸上就误判成"充满"）；
-        #   2) 之后读到 chg=0 且距上次 chg=1 已 ≥ REST_IDLE 秒 → 充完了（笔端 Qi 接收芯片终止取电
-        #      就是这么体现的），进休眠档；
-        #   3) 兜底：电量 ≥ REST_FULL（有的笔端在 100% 之前就停充、或 chg 读不到时用）。
-        if pen_rest_enabled; then
-            if [ "$att" = 0 ]; then
-                chg_seen=0; chg_last=0
-            elif [ "$lvl_read" = 1 ] && [ "$chg" = 1 ]; then
-                chg_seen=1; chg_last=$now_sec
-            fi
-            if [ "$pen_rest" != 1 ]; then
-                rested=0
-                if [ "$lvl_read" = 1 ] && [ "$att" = 1 ] && [ "$lvl" -ge "$REST_FULL" ]; then
-                    rested=1; rest_why="电量=$lvl ≥ $REST_FULL"
-                elif [ "$att" = 1 ] && [ "$chg_seen" = 1 ] && [ "$lvl_read" = 1 ] && [ "$chg" = 0 ] \
-                        && [ $((now_sec - chg_last)) -ge "$REST_IDLE" ]; then
-                    rested=1; rest_why="充完静默 $((now_sec - chg_last))s（chg 1→0，电量=$lvl）"
-                fi
-                if [ "$rested" = 1 ]; then
-                    pen_rest=1; pen_rest_mark 1; lvl_win=0
-                    log "pen rest ON: 吸附且 $rest_why → 停唤醒/停胶囊/断 BLE"
-                    /system/bin/sh "$0" --brushstop >/dev/null 2>&1   # 清掉可能 latch 住的 CON 波形
-                    send_extra "$A_REST" "rest-on" --ei on 1
-                fi
-            else
-                # 出档：取下，或线圈**重新开始充电**（说明笔又要用电了 → 恢复唤醒/胶囊）。
-                # 这里不能用"电量低于某个阈值"来出档：进档主判据是"停充"，两者会来回打架
-                # （90% 停充 → 进档 → 立刻因 <95 出档 → 再进档，实测会 20 秒一跳）。
-                if [ "$att" = 0 ]; then
-                    pen_rest=0; pen_rest_mark 0
-                    log "pen rest OFF: 已取下 → 恢复唤醒/胶囊"
-                    send_extra "$A_REST" "rest-off" --ei on 0
-                elif [ "$lvl_read" = 1 ] && [ "$chg" = 1 ] && [ "$lvl" -lt "$REST_FULL" ]; then
-                    # 注意要带 lvl < REST_FULL：本机实测**笔满 100% 时 chg 仍然是 1**
-                    # （线圈持续 ~300mA 送电），只按 chg=1 出档会和"电量兜底进档"60 秒一跳。
-                    pen_rest=0; pen_rest_mark 0
-                    log "pen rest OFF: 线圈重新给笔补电 (电量=$lvl < $REST_FULL) → 恢复唤醒/胶囊"
-                    send_extra "$A_REST" "rest-off" --ei on 0
-                fi
-            fi
-        fi
-
-        # 取下：发唤醒 + 同步笔端手势位/力度，并把胶囊调度清掉。
-        # **必须同时清空 shown** —— 否则下一次吸附时"新电量 == 上次显示过的值"（比如笔一直是 100%），
-        # 刷新逻辑会以为"这条已经弹过了"而整次都不弹（实测：连吸 3 次只有第 1 次出胶囊）。
-        if [ "$last_att" = 1 ] && [ "$att" = 0 ]; then
-            # touchfilm=63(0x3F)：顺便把笔端触控膜功能位全开（双击/三击/上滑/下滑/捏合/笔尾）。
-            # 笔重启或睡死会把这位清零 → 手势全部消失；联想原厂每次连接都重发，这里替他发。
-            # 只要唤醒不改位就传 --ei touchfilm -1。
-            pen_sync_read
-            send_wake "detach-wake"
-            tick=0
-            refresh_at=0
-            refresh_deadline=0
-            shown=""
-        fi
-
-        if capsule_enabled; then
-            # 边沿 A：线圈刚启动（level 1..100 -> 0）—— 实测比 attached 早约 2 秒
-            if [ "$last_att" = 0 ] && [ "$att" = 0 ] && [ "$lvl_read" = 1 ] \
-                    && [ "$last_lvl" -ge 1 ] && [ "$lvl" = 0 ] \
-                    && [ "$refresh_deadline" = 0 ]; then
-                log "coil-start edge (cached=$last_good)"
-                lvl_win=8                            # 线圈刚启动 → 开窗全速读电量
-                if capsule_fast && [ "$last_good" -ge 1 ]; then
-                    sensor_capsule "$last_good"      # 抢跑：先用上次的值弹一条
-                fi
-                refresh_at=$now_sec                  # 真值一到就补/刷新
-                refresh_deadline=$((now_sec + 8))    # 最多等 8 秒
-            fi
-            # 边沿 B：attached 0 -> 1（硬件握手完成）
-            if [ "$last_att" = 0 ] && [ "$att" = 1 ]; then
-                if [ "$refresh_deadline" = 0 ]; then
-                    if capsule_fast && [ "$last_good" -ge 1 ]; then
-                        sensor_capsule "$last_good"
-                    fi
-                    refresh_at=$now_sec
-                    refresh_deadline=$((now_sec + 8))
-                    lvl_win=8                        # 吸附成功 → 开窗全速读电量
-                fi
-                tick=0
-            fi
-            # 等线圈报出本次真值：每轮（POLL_MS）重试，拿到就发；超时放弃
-            if [ "$refresh_deadline" -gt 0 ] && [ "$att" = 1 ] && [ "$now_sec" -ge "$refresh_at" ]; then
-                if [ "$lvl" -ge 1 ] && [ "$lvl" -le 100 ]; then
-                    if [ "$lvl" != "$shown" ]; then
-                        sensor_capsule "$lvl"
-                    fi
-                    refresh_at=0
-                    refresh_deadline=0
-                elif [ "$now_sec" -ge "$refresh_deadline" ]; then
-                    log "capsule give up (level still '$lvl' after 8s)"
-                    refresh_at=0
-                    refresh_deadline=0
-                fi
-            fi
-            # 笔取下来了就别再等
-            if [ "$att" = 0 ] && [ "$refresh_deadline" -gt 0 ]; then
-                refresh_at=0
-                refresh_deadline=0
-            fi
-        fi
-
-        if [ "$att" = 0 ] && [ "$REFRESH" -gt 0 ] && [ "$tick" -ge "$REFRESH" ]; then
-            # ① 的"安全网"补唤醒：只有 ① 开着才有意义（这条不带 touchfilm，不负责同步手势位）
-            pen_wake_enabled && send "$A_WAKE" "refresh-wake"
-            tick=0
-        fi
-
-        last_att=$att
-        last_lvl=$lvl
-
-        if [ $((tick % 600)) -eq 0 ] && [ -f "$LOG" ] &&
-                [ "$(wc -c < "$LOG" 2>/dev/null)" -gt 262144 ]; then
-            mv -f "$LOG" "$LOG.1" 2>/dev/null
-        fi
-    done
-
-    log "monitor exit (disable file present)"
-    exit 0
-    ;;
-
-*)
-    # ---- setup（一次性）----
-    # 硬性递归保护：脱离出去的子进程绝不能再次进入这个分支。
-    if [ -n "$PENWAKE_CHILD" ]; then
-        log "refusing to re-enter setup stage (PENWAKE_CHILD set)"
+# ---------------------------------------------------------------- 入口
+case "${1:-}" in
+    "")
+        # KernelSU 在 late_start 阶段跑本脚本。用 setsid 放后台后立刻返回：
+        # KernelSU 通过 init 运行本脚本，普通的 "&" 子进程活不过脚本本身；
+        # 而且**必须立刻返回** —— 我们要等 boot_completed，而 boot_completed 是在
+        # late_start 之后才置位的，同步等待会把开机卡死。
+        setsid /system/bin/sh "$0" --boot >/dev/null 2>&1 </dev/null &
         exit 0
-    fi
+        ;;
 
-    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null)" -gt 262144 ]; then
-        mv -f "$LOG" "$LOG.1" 2>/dev/null
-    fi
+    --boot)
+        boot_actions
+        exit 0
+        ;;
 
-    # 只允许一个 supervisor：记录的 pid 必须确实是**我们自己的**活进程，否则可以接管。
-    # 见 supervisor_alive()：单靠 kill -0 会被 pid 复用骗到。
-    if [ -f "$LOCK/pid" ]; then
-        old=$(cat "$LOCK/pid" 2>/dev/null)
-        if supervisor_alive "$old"; then
-            # 旧 supervisor 还活着 —— 但**不能就此 exit 0**。
-            # 它的 config 变量是启动时读进内存的，之后 WebUI 改 config 它不会跟着变
-            # （monitor 里的 BRUSH/GESTURE/pen_rest 全是冻结值，只会照旧 penring_ensure /
-            #  brushwatch_ensure）。无脑退出等于把这次配置变更整个丢掉：开关写进 config 了、
-            #  WebUI 也显示改了，但守护照旧 —— 实测关掉 ⑥/⑦ 之后 penring 与 --brushwatch
-            #  仍在跑，正是这条路径造成的。
-            # 所以比一下配置指纹：没变才是真的没事；变了就接管（把旧一代杀掉，往下走正常重拉）。
-            if [ "$(cfg_gen)" = "$(cat "$LOCK/gen" 2>/dev/null)" ]; then
-                log "supervisor already alive pid=$old (config unchanged)"
-                exit 0
-            fi
-            log "supervisor pid=$old alive but config changed → takeover"
-            kill -9 "$old" 2>/dev/null
-            for p in $(svc_pids --supervise) $(svc_pids --monitor); do
-                kill -9 "$p" 2>/dev/null
-            done
-            sleep 1
-        fi
-    fi
+    --sepolicy)
+        do_sepolicy
+        exit 0
+        ;;
 
-    rm -rf "$LOCK" 2>/dev/null
-    mkdir -p "$LOCK" 2>/dev/null || exit 0
-    # 记下本代是按哪份 config 起来的，供下次 setup 判断"要不要接管"
-    cfg_gen > "$LOCK/gen" 2>/dev/null
+    --status)
+        status_out
+        exit 0
+        ;;
 
-    # 接管：上一轮会话（或旧版本模块）用 setsid 拉起的看护不会被 init 收走，
-    # supervisor 死后它们还活着 —— 必须清掉，否则新旧两份同时往笔里写波形。
-    for p in $(brushwatch_pids) $(penring_pids); do
-        kill -9 "$p" 2>/dev/null
-    done
-    rm -rf "$BRUSH_LOCK" 2>/dev/null
-    rm -f "$MODDIR/brush.pid" "$PENRING_PID" 2>/dev/null
+    --json)
+        json_out
+        exit 0
+        ;;
 
-    # ⑭ 开发者选项：开机补一次 sepolicy（post-fs-data 已经打过一次）。
-    # 为什么还要补：post-fs-data 之后到 framework 起完这段时间，Settings 可能已经触发过一次被拒的
-    # 属性写入，init 用户态 AVC 会把该拒绝缓存住 —— 再应用一次会触发策略重载，把缓存刷掉。
-    # 同步执行（不是 setsid &）：要在下面拉起看护之前确定生效。
-    # 本项没有 disable 标记：它是崩溃修复，不是可选功能。
-    /system/bin/sh "$0" --sepolicy >> "$LOG" 2>&1
+    --set)
+        shift
+        [ -n "${1:-}" ] || { echo "用法: service.sh --set KEY VALUE [KEY VALUE ...]" >&2; exit 2; }
+        rc=0
+        while [ -n "${1:-}" ]; do
+            k="$1"; v="${2:-}"
+            [ -n "${2:-}" ] || { echo "缺少 $k 的值" >&2; rc=2; break; }
+            set_cfg "$k" "$v" || { echo "写入失败: $k" >&2; rc=2; }
+            shift 2
+        done
+        exit "$rc"
+        ;;
 
-    # 接管：下面这三个守护是 setsid 拉起的常驻循环，restart.sh 有意不杀它们（它们只在
-    # "开关被关掉"时自退）。于是开关一直开着的时候，每按一次 WebUI 开关 → restart.sh →
-    # 回到这个分支就又拉一份，旧的那份没人收 —— 实测泄漏到 8 份 --stopbpfmon 同时在跑。
-    # 和上面的 brushwatch/penring 一样：启动前先把旧的一份清掉。
-    for p in $(svc_pids --stopbpfmon) $(svc_pids --fixtelephony) $(svc_pids --stoprompen); do
-        kill -9 "$p" 2>/dev/null
-    done
+    -h|--help)
+        sed -n '5,20p' "$0"
+        exit 0
+        ;;
 
-    # ③ BPF 监视器拆弹、④ 死电话栈、⑥ 停 ROM 笔桥三者各自独立，互不依赖。
-    # 判据走 *_enabled()：config 键（WebUI 可改）与 disable-* 标记文件都算。
-    if fix_bpfmon_enabled; then
-        setsid /system/bin/sh "$0" --stopbpfmon >/dev/null 2>&1 </dev/null &
-    else
-        log "③ BPF 监视器拆弹已关闭（FIX_BPFMON=0）"
-    fi
-
-    if fix_telephony_enabled; then
-        setsid /system/bin/sh "$0" --fixtelephony >/dev/null 2>&1 </dev/null &
-    else
-        log "④ 死电话栈修复已关闭（FIX_TELEPHONY=0）"
-    fi
-
-    # ⑥ 把移植 ROM 自带的旧笔桥（lwky_pen / penbridge_hyperos）停掉，避免和 penring 抢注入。
-    # 手势桥关掉时就不停它了 —— 等于把 ROM 原本的行为还回去。
-    if gesture_enabled && [ ! -e "$DISABLE_ROMPEN" ]; then
-        setsid /system/bin/sh "$0" --stoprompen >/dev/null 2>&1 </dev/null &
-    fi
-
-    # setsid：KernelSU 通过 init 运行本脚本，普通的 "&" 子进程活不过脚本本身。
-    PENWAKE_CHILD=1 setsid /system/bin/sh "$0" --supervise >/dev/null 2>&1 </dev/null &
-    sleep 2
-    log "setup done; supervisor pid=$(cat "$LOCK/pid" 2>/dev/null)"
-    exit 0
-    ;;
+    *)
+        echo "未知参数: $1（-h 看用法）" >&2
+        exit 2
+        ;;
 esac

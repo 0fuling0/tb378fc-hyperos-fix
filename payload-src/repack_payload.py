@@ -4,10 +4,10 @@
 流程（build.sh --payload 会自动串起来）：
 
     payload-src/PowerKeeper-stock.apk            <- 移植包原厂 APK（补丁输入）
-        |  module/tools/patch_powerkeeper.py     字节补丁：LocalUpdateUtils.startCloudSyncData
+        |  payload-src/patch_powerkeeper.py      字节补丁：LocalUpdateUtils.startCloudSyncData
         v                                         return v0(0x0f) -> return-void(0x0e)
     PowerKeeper-patched.apk + classes-patched.dex
-        |  module/tools/fix_static.py            结构性补丁：DisplayFrameSetting.isFeatureOn
+        |  payload-src/fix_static.py             结构性补丁：DisplayFrameSetting.isFeatureOn
         v                                         从 virtual_methods 移入 direct_methods、
     classes-patched2.dex                          补 ACC_STATIC、code_item.ins_size 1 -> 0
         |  repack_payload.py（本脚本）
