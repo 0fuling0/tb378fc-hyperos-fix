@@ -1,0 +1,132 @@
+name: 构建并发布模块
+
+# 触发方式
+#   1) 推一个 v* 的 tag —— 常规路径（例如 git push origin v3.6）
+#   2) 手动：Actions 页面 → 本 workflow → Run workflow（tag 留空就用 module.prop 里的 version）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v3.6）。留空则用 module/module.prop 里的 version。'
+        required: false
+        type: string
+
+# 创建 Release 需要 contents: write。
+# 注意：本仓库是 fork，GitHub 文档说派生仓库里「通常无法授予写入权限」。
+# 如果 Release 那一步报 403，见 README「自动发布」一节的两条处置。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 自检 + 打包 + 发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取 module.prop
+        id: mod
+        run: |
+          set -euo pipefail
+          mod_id=$(sed -n 's/^id=//p'      module/module.prop | head -1)
+          mod_ver=$(sed -n 's/^version=//p' module/module.prop | head -1)
+          [ -n "$mod_id" ]  || { echo "::error::module/module.prop 里读不到 id";      exit 1; }
+          [ -n "$mod_ver" ] || { echo "::error::module/module.prop 里读不到 version"; exit 1; }
+          echo "id=$mod_id"       >> "$GITHUB_OUTPUT"
+          echo "version=$mod_ver" >> "$GITHUB_OUTPUT"
+          echo "module.prop → id=$mod_id  version=$mod_ver"
+
+      # 值一律走 env 传入，不在 run: 里直接插 ${{ }} —— 避免 tag 里的特殊字符炸 shell，
+      # 也避免 GitHub 把它判成脚本注入。
+      - name: 决定本次发布的 tag
+        id: rel
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          MOD_VERSION: ${{ steps.mod.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          else
+            tag="$INPUT_TAG"
+            [ -n "$tag" ] || tag="$MOD_VERSION"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "本次发布 tag：$tag"
+
+      # 防「tag 是 v3.6、包里却是 v3.5」这种版本错位 —— 发出去就不好回收了。
+      - name: 校验 tag 与 module.prop 的 version 一致
+        env:
+          RELEASE_TAG: ${{ steps.rel.outputs.tag }}
+          MOD_VERSION: ${{ steps.mod.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_TAG" != "$MOD_VERSION" ]; then
+            echo "::error::tag 是 '$RELEASE_TAG'，但 module/module.prop 里是 '$MOD_VERSION'。先把 module.prop 的 version 改成 '$RELEASE_TAG' 再发 tag，否则 Release 里的包和 tag 对不上。"
+            exit 1
+          fi
+          echo "✓ tag 与 module.prop 一致：$RELEASE_TAG"
+
+      # module/bin/TbFix.apk 和 module/bin/penring 已经入库，所以 --pack 不需要 Android SDK/NDK。
+      # 顺带把三项自检跑一遍（sh -n、未定义函数、WebUI 渲染与交互）。
+      - name: 脚本自检 + 打包
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          ./build.sh --pack
+
+      - name: 上传 zip（artifact，不进 Release 也能下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.mod.outputs.id }}-${{ steps.mod.outputs.version }}
+          path: out/*.zip
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release 并附上 zip
+        env:
+          # 优先用 RELEASE_TOKEN（PAT）。fork 里的 GITHUB_TOKEN 常常没有写权限，
+          # 配了 RELEASE_TOKEN 就稳了；没配就退回 github.token 试试。
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          RELEASE_TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          zipfile=$(ls out/*.zip | head -1)
+          echo "准备发布：$RELEASE_TAG ← $zipfile"
+
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          KernelSU 模块包（zip 根目录即模块根目录）。
+
+          ## 安装
+          1. 把下面的 zip 丢给 KernelSU 管理器安装（或 `magisk --install-module`）。
+          2. 重启。
+          3. 在 KernelSU 管理器的模块页打开 WebUI，逐项开关功能（四类各有总开关）。
+
+          ## 默认状态
+          - **系统修复**（② PowerKeeper、③ 停 BPF 监视器、④ 停死电话栈、⑭ 开发者选项）：默认开，不需要 App。
+          - **手势与书写**（⑥ 手势桥等）：默认开。
+          - **手写笔连接 / 注视感知**（① ⑤ ⑦ ⑧ ⑨ ⑫ ⑬）：依赖 `dev.tb378fc.fix`，**默认关**，
+            所以默认不安装任何 APK；打开其中任意一项才会自动装 `bin/TbFix.apk`，全部关掉会自动卸载。
+
+          详细说明见仓库 README.md。
+          NOTES
+
+          # 幂等：Release 已存在就只补传/覆盖附件，避免重跑时报「already exists」。
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在，覆盖附件"
+            gh release upload "$RELEASE_TAG" "$zipfile" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$zipfile" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,url \
+            --template '✓ 已发布：{{.tagName}}  {{.url}}{{"\n"}}'

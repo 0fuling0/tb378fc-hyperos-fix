@@ -179,6 +179,7 @@ tb378fc-hyperos-fix/
 ```bash
 ./build.sh            # App + penring + 打包（用仓库里现成的 payload）
 ./build.sh --payload  # 额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
+./build.sh --pack     # 只自检 + 打包，不编 apk/penring（CI 走这条，不需要 SDK/NDK）
 ```
 
 需要 JDK 17、Android SDK（build-tools 37 + platform android-36）、`python3`、`zip`；
@@ -192,7 +193,43 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 单独跑 WebUI 自检：`node tools/webui-selftest.js`。它断言了四个场景：默认状态、
 全开+标记文件、单项开关、**分类总开关必须只触发一次 `--set`**。
 
-## 十、文档
+## 十、自动发布（GitHub Actions）
+
+`.github/workflows/release.yml`。推一个 `v*` 的 tag 就自动：自检 → 打包 → 建 Release 并把 zip 挂上去。
+
+```bash
+# 版本号改完、提交推上去之后：
+git tag v3.6 && git push origin v3.6
+```
+
+也可以手动跑：Actions 页面 →「构建并发布模块」→ Run workflow（tag 留空就用 `module.prop` 里的 `version`）。
+
+**为什么用 `--pack` 而不是完整构建**：`module/bin/TbFix.apk` 和 `module/bin/penring` 已经入库，
+所以 CI 不需要 Android SDK / NDK，几秒钟出包。要改 App 或 penring 的代码，仍然得本地 `./build.sh` 出包再提交。
+
+工作流会**校验 tag 和 `module/module.prop` 里的 `version` 是否一致**，不一致直接失败 ——
+否则会出现「tag 是 v3.6、包里却是 v3.5」这种发出去就不好回收的错位。
+
+### 这个仓库是 fork，两点必须注意
+
+1. **Actions 可能没开**：fork 出来的仓库，Actions 不一定跑。到仓库 **Actions** 页看有没有
+   「Workflows aren't being run on this forked repository」的横幅，有就点
+   **I understand my workflows, go ahead and enable them**。
+2. **`GITHUB_TOKEN` 可能没有写权限**：GitHub 文档写得很直白 ——「您可以使用 `permissions` 密钥
+   为派生仓库添加和删除读取权限，但**通常您无法授予写入权限**」。所以建 Release 那一步可能报 403。
+   两种解法任选其一：
+   - 仓库 **Settings → Actions → General → Workflow permissions** 选
+     **Read and write permissions**（最省事）；
+   - 或建一个 PAT（classic 勾 `repo`；fine-grained 给本仓库 `Contents: Read and write`），
+     存成仓库 secret **`RELEASE_TOKEN`**。workflow 里写的是
+     `secrets.RELEASE_TOKEN || github.token`，配了就优先用它。
+
+排障：Actions 里点开那次 run 看哪一步红；命令行用 `gh run list` /
+`gh run view <id> --log-failed`。
+另外记住 **workflow 文件必须先在默认分支上**，`workflow_dispatch` 才会出现在 Actions 页面；
+tag 触发用的则是「该 tag 指向的 commit」里的 workflow 文件 —— 所以顺序是：先推 master，再推 tag。
+
+## 十一、文档
 
 - `docs/stylus-gesture-bridge.md` — 手势桥：手势表、type-8/kl、映射、看护的启动/自愈、笔尾橡皮的结论
 - `docs/aon-attention.md` — 注视感知：四个卡点、SELinux 三条、验收命令、踩过的坑
@@ -200,7 +237,7 @@ SDK 路径默认 `/opt/android-sdk`，可用 `ANDROID_SDK_ROOT=` / `BT_DIR=` / `
 - `docs/zuxos-pen-protocol.md` — ZUX 笔协议帧表（`{5,5}`/`{5,3}`/`{5,2}`/`{5,1}`/`{8,6,..}`…）
 - `docs/devopts-selinux-fix.md` — ⑭ 开发者选项 SELinux 修复：根因、两条通道、防自欺验证、7 条坑
 
-## 十一、⑭ 开发者选项（SELinux）
+## 十二、⑭ 开发者选项（SELinux）
 
 移植包在 **SELinux Enforcing** 下「设置 → 开发者选项」**必现闪退**（`setenforce 0` 就正常）。
 根因是 `system_app` 域（`com.android.settings`，uid 1000）缺

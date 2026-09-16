@@ -4,6 +4,9 @@
 #   ./build.sh              构建 TbFix.apk + penring（手势桥），并用仓库里现成的 payload 打包
 #   ./build.sh --payload    额外从 payload-src/PowerKeeper-stock.apk 重建 PowerKeeper payload
 #   ./build.sh --all        --payload（LSPosed 部分已并入 TbFix，见 app/TbFix）
+#   ./build.sh --pack       只自检 + 打包，**不**编 apk/penring —— 直接用 module/bin/ 里已入库的
+#                           产物。CI（.github/workflows/release.yml）走的就是这条路：不需要
+#                           Android SDK / NDK，几秒就能出包。
 #   ./build.sh --clean      删掉 out/ 与各构建中间目录
 #
 # 产物
@@ -20,14 +23,16 @@ SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}}"
 export ANDROID_SDK_ROOT="$SDK"
 
 DO_PAYLOAD=0
+DO_PACK_ONLY=0
 for a in "$@"; do
   case "$a" in
     --payload) DO_PAYLOAD=1 ;;
     --all)     DO_PAYLOAD=1 ;;
+    --pack)    DO_PACK_ONLY=1 ;;
     --clean)
       rm -rf "$OUT" "$HERE/app/TbFix/build" "$HERE/app/TbFix/TbFix.apk"
       echo "cleaned"; exit 0 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "未知参数: $a（-h 看用法）" >&2; exit 2 ;;
   esac
 done
@@ -121,11 +126,19 @@ check_scripts() {
   fi
 }
 
-build_app
-build_penring
-check_scripts
-[ "$DO_PAYLOAD" = 1 ] && build_payload
-pack
+if [ "$DO_PACK_ONLY" = 1 ]; then
+  # CI 路径：完全不碰 Android 工具链，只自检 + 打包。
+  # 前提是 module/bin/ 里的 TbFix.apk 和 penring 已经入库（本仓库就是这样）。
+  echo "== --pack：跳过 apk/penring 构建，直接用 module/bin/ 里已入库的产物"
+  check_scripts
+  pack
+else
+  build_app
+  build_penring
+  check_scripts
+  [ "$DO_PAYLOAD" = 1 ] && build_payload
+  pack
+fi
 
 echo
 echo "完成：$OUT/${MOD_ID}-${MOD_VER}.zip"
