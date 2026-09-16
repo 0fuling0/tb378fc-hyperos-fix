@@ -93,6 +93,11 @@
 # 停用状态落在 /data/system/packages.xml，本身就跨重启保持。这里每次开机仍复查一次，
 # 以防 ROM 更新或包重装把状态冲掉；已是 disabled 的包不会重复处理。
 #
+# 注意：这三个包**不一定都在**。实测 HyperOS 3 的 TB378FC 上一个都没有，此时
+# pm disable-user 会抛 IllegalArgumentException: Unknown package 并刷 ERROR 日志，
+# 但 ④ 要保证的"没有空转 persistent 进程"本来就达成了。所以 fix_telephony() 会先查
+# 存在性，不存在的包直接跳过，不当作失败。
+#
 # 进程模型
 # --------
 #   service.sh                  一次性 setup，由 KernelSU 启动
@@ -941,8 +946,15 @@ read_level() {
 
 # ④ 停死电话栈。原理见文件头 ④。
 # 幂等：已经是 disabled 的包不动，全部已停就不写日志刷屏。
+#
+# 为什么还要先探测"这个包在不在"：ROM 变体之间差别很大 —— 实测 HyperOS 3 的 TB378FC
+# 上 TELEPHONY_PKGS 里这三个包**一个都不存在**。对不存在的包 pm disable-user 会抛
+#     java.lang.IllegalArgumentException: Unknown package: com.qualcomm.qti.telephonyservice
+# 并以非 0 退出，于是每次开机刷 3 行 ERROR + 一段 Java 栈；而 ④ 真正要保证的东西
+# （没有空转的 persistent 进程）在这种机器上本来就天然达成。所以不存在的包直接跳过 ——
+# 既不算失败，也不打日志，只把统计写进最后那一行汇总里。
 fix_telephony() {
-    local noril p out already new
+    local noril p out already new absent fail exist disabled
 
     # 只在确实没有电话硬件时才动手 —— 有 modem 的变体上这几个包是正常功能，别误伤。
     noril=$(getprop ro.radio.noril)
@@ -954,13 +966,19 @@ fix_telephony() {
             ;;
     esac
 
+    # 包列表只查一次：pm 每次调用都要起一个 app_process（几百 ms），三个包各查两遍
+    # 就是 6 次 pm 调用，开机期没必要。
+    exist=$(pm list packages 2>/dev/null)
+    disabled=$(pm list packages -d 2>/dev/null)
+
     already=0
     new=0
+    absent=0
+    fail=0
     for p in $TELEPHONY_PKGS; do
-        if pm list packages -d 2>/dev/null | grep -qx "package:$p"; then
-            already=$((already+1))
-            continue
-        fi
+        printf '%s\n' "$disabled" | grep -qx "package:$p" && { already=$((already+1)); continue; }
+        # 包根本不在本机 → 跳过（见上面注释，这不算失败）
+        printf '%s\n' "$exist"    | grep -qx "package:$p" || { absent=$((absent+1)); continue; }
         # 必须 root（本脚本由 KernelSU 以 root 启动）。以 shell UID 跑会被
         # shouldRestrictEnabledSettingsChange 拦下。
         if out=$(pm disable-user --user 0 "$p" 2>&1); then
@@ -968,10 +986,20 @@ fix_telephony() {
             new=$((new+1))
         else
             log "ERROR telephony disable failed: $p: $out"
+            fail=$((fail+1))
         fi
     done
 
-    [ "$new" -eq 0 ] && log "telephony stack already disabled ($already pkg)"
+    # 汇总一行。注意别把"失败"说成"没事"：只有真的没有失败时才走 n/a / already 的措辞。
+    if [ "$fail" -gt 0 ]; then
+        log "telephony summary: $new disabled, $already already, $absent absent, $fail FAILED"
+    elif [ "$new" -eq 0 ]; then
+        if [ "$already" -eq 0 ] && [ "$absent" -gt 0 ]; then
+            log "telephony stack n/a ($absent pkg absent on this ROM, nothing to do)"
+        else
+            log "telephony stack already disabled ($already pkg, $absent absent)"
+        fi
+    fi
     return 0
 }
 

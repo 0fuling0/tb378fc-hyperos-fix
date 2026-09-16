@@ -38,11 +38,21 @@ echo "               「需要 App」那一组里任意一项开着就会自动�
 echo ' '
 
 # ---- 一、系统修复 ----
-n_tele=$(pm list packages -d 2>/dev/null | grep -cxE 'package:(com\.qti\.phone|com\.qualcomm\.qcrilmsgtunnel|com\.qualcomm\.qti\.telephonyservice)')
+# ④ 只统计**本机真实存在**的包。实测 HyperOS 3 的 TB378FC 上这三个包一个都没有，
+# 此时 ④ 的目标（无空转 persistent 进程）天然达成，若照旧显示「0/3 个包已停用」
+# 会读成"修复失败"。所以分两种写法：包不在就明说不需要处理。
+_tele_re='package:(com\.qti\.phone|com\.qualcomm\.qcrilmsgtunnel|com\.qualcomm\.qti\.telephonyservice)'
+tele_all=$(pm list packages    2>/dev/null | grep -cxE "$_tele_re")
+tele_off=$(pm list packages -d 2>/dev/null | grep -cxE "$_tele_re")
+if [ "$tele_all" -eq 0 ]; then
+    tele_txt='本机不存在这三个包（无需处理）'
+else
+    tele_txt="$tele_off/$tele_all 个包已停用"
+fi
 echo "一、系统修复（不需要 App）"
 echo "  ② PowerKeeper : $(eff FIX_POWERKEEPER disable-powerkeeper 1)   已挂载 $(mount 2>/dev/null | grep -c 'PowerKeeper/PowerKeeper.apk') 处，进程 $(pidof com.miui.powerkeeper || echo '未运行')"
 echo "  ③ BPF 监视器  : $(eff FIX_BPFMON disable-bpfmon 1)   $(pidof hyper_bpfloader >/dev/null 2>&1 && echo 'hyper_bpfloader 仍在运行(异常)' || echo 'hyper_bpfloader 未运行')"
-echo "  ④ 死电话栈    : $(eff FIX_TELEPHONY disable-telephony 1)   $n_tele/3 个包已停用$(pidof com.qti.phone >/dev/null 2>&1 && echo "，残留空转进程 $(pidof com.qti.phone)" || echo '，无残留进程')"
+echo "  ④ 死电话栈    : $(eff FIX_TELEPHONY disable-telephony 1)   $tele_txt$(pidof com.qti.phone >/dev/null 2>&1 && echo "，残留空转进程 $(pidof com.qti.phone)" || echo '，无残留进程')"
 # ⑭ 开发者选项：判据是"开机以来有没有 logpersistd 相关的 AVC 拒绝"（0 = 正常）
 #    有拒绝说明规则没生效，跑 `sh service.sh --sepolicy` 即可免重启救回来。
 n_lp=$(dmesg 2>/dev/null | grep -c 'logpersistd_logging_prop')
