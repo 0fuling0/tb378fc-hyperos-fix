@@ -92,8 +92,17 @@ def check(path: str) -> int:
     for raw in strip_case(src.splitlines()):
         line = strip_arith(strip_quotes(raw)).split("#")[0]
         line = re.sub(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", "X", line)
+        # 把 "; then / ; do / ; else" 折成 "; "。
+        # 为什么：扫名字的前缀分支里 [;&|(]\s* 会先吃掉分号后面的 then/do/else 本身，
+        # 扫描位置随之跳过它们，于是 "if x; then foo; fi" 这种**单行**写法的 foo 永远扫不到
+        # （多行写法因为 foo 独占一行、由 ^\s* 分支兜住，所以一直没暴露）。折一下就能扫到。
+        line = re.sub(r";\s*(?:then|do|else)\b\s*", "; ", line)
+        # 末尾的 (?!-) 很重要：紧跟着连字符的名字是"连字符 token"（disable-gesture 这类
+        # 文件名/参数），不是函数调用。少了它，for 列表里用反斜杠续行写的一串
+        # disable-xxx 会被逐行当成命令，误报 "调用了未定义的函数: disable"。
         for m in re.finditer(
-            r"(?:^\s*|[;&|(]\s*|\bthen\s+|\bdo\s+|\belse\s+|\bif\s+|\bwhile\s+|!\s*)([a-z][a-z0-9_]*)\b(?!\s*[=()])",
+            r"(?:^\s*|[;&|(]\s*|\bthen\s+|\bdo\s+|\belse\s+|\bif\s+|\bwhile\s+|!\s*)"
+            r"([a-z][a-z0-9_]*)\b(?!\s*[=()])(?!-)",
             line,
         ):
             calls.add(m.group(1))

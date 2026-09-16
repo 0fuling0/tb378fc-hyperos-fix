@@ -77,9 +77,24 @@ pack() {
   mkdir -p "$OUT"
   local zip="$OUT/${MOD_ID}-${MOD_VER}.zip"
   rm -f "$zip"
-  ( cd "$MODULE" && zip -q -r -X "$zip" . \
+
+  # 在**暂存副本**上打包，并把文本文件的行尾统一成 LF。
+  # 为什么必须做：Android 的 sh（mksh）不能执行 CRLF 脚本 —— 会报
+  #   "syntax error: unexpected 'newline'" 或 "xxx: inaccessible or not found"，
+  # 而本仓库在 Windows 上 checkout 时是 CRLF（core.autocrlf=true），直接 zip 就会把 CR
+  # 打进包里，装到设备上整个模块静默不工作（现象上极难定位）。
+  # 对本来就是 LF 的文件，这一步是空操作。
+  local stage
+  stage="$(mktemp -d)"
+  cp -a "$MODULE"/. "$stage"/
+  find "$stage" -type f \( -name '*.sh' -o -name '*.prop' -o -name '*.rule' \
+      -o -name '*.html' -o -name '*.xml' -o -name 'config' \) \
+      -exec sed -i 's/\r$//' {} +
+
+  ( cd "$stage" && zip -q -r -X "$zip" . \
       -x '.apk.sha' -x 'wake.log*' -x '.monitor.lock/*' \
       -x 'disable' -x 'disable-*' -x '*.pyc' -x '__pycache__/*' )
+  rm -rf "$stage"
   echo "-> $zip"
   unzip -l "$zip"
 }
@@ -91,7 +106,19 @@ check_scripts() {
   echo "== 脚本自检（未定义函数 / 语法）"
   sh -n "$MODULE/service.sh"
   sh -n "$MODULE/post-fs-data.sh"
-  python3 "$HERE/tools/check-helpers.py" "$MODULE/service.sh" "$MODULE/post-fs-data.sh"
+  sh -n "$MODULE/action.sh"
+  python3 "$HERE/tools/check-helpers.py" "$MODULE/service.sh" "$MODULE/post-fs-data.sh" "$MODULE/action.sh"
+  # WebUI 自检：用极简 DOM 桩把 webroot/index.html 的渲染与交互真跑一遍
+  # （分类总开关必须只触发一次 --set 这类约束就在里面断言）。没装 node 就跳过。
+  if command -v node >/dev/null 2>&1; then
+    node "$HERE/tools/webui-selftest.js" >/dev/null || {
+      echo "WebUI 自检失败，重跑看细节：node tools/webui-selftest.js" >&2
+      exit 1
+    }
+    echo "webroot/index.html 自检通过"
+  else
+    echo "跳过 WebUI 自检（没找到 node）"
+  fi
 }
 
 build_app
