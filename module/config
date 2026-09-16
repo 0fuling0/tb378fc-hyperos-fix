@@ -11,13 +11,16 @@
 # 布尔键的写法：1/true/yes/on = 开，其它（0/false/no/off）= 关。
 # 改完本文件后重启设备（或重启模块）生效 —— 没有守护进程需要重启，因为动作本身只在开机跑一次。
 #
-# 注意：本文件由 service.sh 按行解析（**不是 source**），所以值里可以安全地出现
-# 空格、引号、& | \ 等字符，不会被当成 shell 代码执行。
+# 注意：本文件由 post-fs-data.sh / service.sh 按行解析（**不是 source**），所以值里可以安全地
+# 出现空格、引号、& | \ 等字符，不会被当成 shell 代码执行。
 
 
 # ② 修补移植包改坏的 PowerKeeper 字节码（两处），恢复 MIUI 省电管理。
-#    post-fs-data.sh 消费本键：把 payload/app/ 用 bind mount 盖到
-#    /system_ext/app/PowerKeeper（挂父目录，不是挂文件 —— 见 README 第五节）。
+#    两个脚本都消费本键：post-fs-data.sh 挂一次（让 PMS 在包扫描阶段就看到补丁版），
+#    service.sh 在 boot_completed 之后再 umount + mount 一次 —— **只有这一次对 App 生效**
+#    （KernelSU 会把模块挂载从 App 进程的 namespace 里卸掉；时机问题详见 README 第一节的
+#    「让补丁真正生效要绕开三个坑」）。挂的是**父目录** /system_ext/app/PowerKeeper，
+#    不是那个 APK 文件：父目录一挂，ROM 预编译的 oat/ 也一起被盖掉。
 #    关掉后 com.miui.powerkeeper 开机即崩。
 FIX_POWERKEEPER=1
 
