@@ -515,6 +515,16 @@ function anyAppOn() {
   }
   return false;
 }
+/* "到底需不需要那个 APK"：**优先用 service.sh 算好的 NEED_APP**。
+   它才是权威 —— 它还看得见 disable-* 标记文件（标记会把功能强制关掉），
+   而本地 anyAppOn() 只看 config 键。两个来源并存时界面会撒谎：
+   例如有 disable 标记 → 模块认为七项全关（不装 APK），本地算法却还认为"有功能需要它"，
+   于是卡片上写着「有功能需要它」但 APK 被卸了。读不到 NEED_APP 才退回本地算。 */
+function needApp() {
+  const v = CFG.NEED_APP;
+  if (v === undefined || v === null || v === "") return anyAppOn();
+  return isOn(v);
+}
 /* 分类总开关的状态：on / off / ind（混合） */
 function catState(cat) {
   const keys = cat.items.filter(i => i.k);
@@ -559,7 +569,7 @@ async function syncApk(silent) {
   const r = await run("sh " + M + "/service.sh --apksync");
   const m = /installed=([01])/.exec(r.out || "");
   APPST.installed = m ? Number(m[1]) : APPST.installed;
-  APPST.needed = anyAppOn() ? 1 : 0;
+  APPST.needed = needApp() ? 1 : 0;
   if (!silent) {
     log("APK 对齐完成：installed=" + APPST.installed, "good");
     snack(APPST.installed ? "APK 已安装" : "APK 未安装（当前没有功能需要它）");
@@ -613,6 +623,27 @@ function waveOptions() {
   return WAVES.map(w => ({v: w, t: WNAME[w] || String(w)}));
 }
 
+/* 一个功能项"连带"要写的键：自己 + 自己的三级子项。
+   为什么必须连带：三级子项只在父项开着时才有意义。原来拨父项只写父项自己，
+   于是把 ⑤ 打开后三个子项**还是灭的**（它们自己的值就是 0）—— 用户看到的就是
+   "三级开关不跟随"。现在父项一拨，整组跟着拨。
+   手势映射的值是键码、不是 1/0，所以规则不同：打开时把"关掉(-1)"的那些补成默认键码；
+   **关掉时不动映射** —— 那存的是"用户选了哪个键"，清掉就丢了他的选择。
+   （显示上仍然跟随：父项关着时子行整行置灰、开关显示为关，见 itemRow。） */
+function itemPairs(it, turnOn) {
+  const pairs = [[it.k, turnOn ? it.on : it.off]];
+  if (it.subs) {
+    it.subs.forEach(sb => pairs.push([sb.k, turnOn ? sb.on : sb.off]));
+  }
+  if (it.gestures && turnOn) {
+    GESTURES.forEach(g => {
+      const cur = Number(cfgOf(g.k));
+      if (cur === -1 || isNaN(cur)) pairs.push([g.k, g.def]);
+    });
+  }
+  return pairs;
+}
+
 function itemRow(it, parentOn) {
   const row = el("div", "row");
   const lab = el("div", "lab");
@@ -631,9 +662,9 @@ function itemRow(it, parentOn) {
     ctl.appendChild(el("span", "chip ok", "✓"));
   } else {
     const on = isOn(cfgOf(it.k));
+    /* 拨父项 = 拨整组（自己 + 三级子项），见 itemPairs */
     ctl.appendChild(switchNode(on ? "on" : "off", () => {
-      const next = on ? it.off : it.on;
-      writePairs([[it.k, next]]);
+      writePairs(itemPairs(it, !on));
     }));
   }
   row.appendChild(ctl);
@@ -682,10 +713,12 @@ function itemRow(it, parentOn) {
       sr.appendChild(sl);
 
       const sc = el("div", "ctl");
+      /* 下拉只在**父项关着**时才禁用。父项开着、这一条是"关闭"时也要能直接选键码 ——
+         选了就等于把这一条打开（原来这种情况下拉是灰的，必须先用开关打开再改，两步）。 */
       sc.appendChild(selectNode(g.opts, shown ? cur : -1, v => {
         if (!parentOn) { snack("请先打开上一级开关"); return; }
         writePairs([[g.k, v]]);
-      }, !parentOn || !enabled));
+      }, !parentOn));
       sc.appendChild(switchNode(shown ? "on" : "off", () => {
         if (!parentOn) { snack("请先打开上一级开关"); return; }
         writePairs([[g.k, enabled ? -1 : g.def]]);
@@ -752,10 +785,14 @@ function categoryCard(cat) {
   grow.appendChild(el("div", "cnote", cat.note));
   head.appendChild(grow);
   head.appendChild(switchNode(st, () => {
-    const members = cat.items.filter(i => i.k);
-    const target = (st === "on") ? "off" : "on";        // 混合状态点一下 = 全部打开
-    writePairs(members.map(i => [i.k, target === "on" ? i.on : i.off]),
-               cat.name + " 总开关 → " + (target === "on" ? "全开" : "全关"));
+    /* 一级总开关也要一路拨到三级 —— 只写二级成员的话，用户把「手写笔连接」全开后
+       ⑤ 的三个子项还是灭的，同样看着"没跟随"。 */
+    const turnOn = (st !== "on");          // 全开 → 全关；混合/全关 → 全开
+    const pairs = [];
+    cat.items.filter(i => i.k).forEach(i => {
+      itemPairs(i, turnOn).forEach(p => pairs.push(p));
+    });
+    writePairs(pairs, cat.name + " 总开关 → " + (turnOn ? "全开" : "全关"));
   }));
   card.appendChild(head);
 
@@ -773,7 +810,7 @@ function appCard() {
   title.appendChild(el("span", "", "App / APK"));
   title.appendChild(el("span", "chip " + (APPST.installed ? "ok" : "mute"),
       APPST.installed ? "已安装" : "未安装"));
-  const need = anyAppOn();
+  const need = needApp();
   title.appendChild(el("span", "chip " + (need ? "warn" : "mute"),
       need ? "有功能需要它" : "当前没有功能需要它"));
   grow.appendChild(title);
@@ -866,7 +903,7 @@ async function load() {
   const a = await run("sh " + M + "/service.sh --appstat");
   const mi = /installed=([01])/.exec(a.out || "");
   if (mi) APPST.installed = Number(mi[1]);
-  APPST.needed = anyAppOn() ? 1 : 0;
+  APPST.needed = needApp() ? 1 : 0;
 
   render();
   setBusy(false);

@@ -199,9 +199,18 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 # 为什么不用逐个读 /proc/<pid>/cmdline：300+ 进程时每次调用要 600+ 次 fork，几秒一轮就把 pid 耗尽。
 # 只认"shell 直接跑本脚本 --brushwatch"的进程：排除 timeout/setsid 这类包装进程
 # （它们的 cmdline 里也含同样的字符串，曾因此把自己人误判成"已有实例"）
+# 注意：下面这个 awk 程序**写成一行**是刻意的 —— tools/check-helpers.py 按行去掉引号内容，
+# 跨行写的 awk 程序（引号从上一行开、下一行才闭）会被当成 shell 代码，把里面的 p / par
+# 误报成"调用了未定义的函数"。改成多行请同时改检查器（它现在是逐行处理的）。
 brushwatch_pids() {
-    ps -A -o PID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh --brushwatch" '
-        NR>1 && $1+0 != me+0 && $2 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { print $1 }'
+    # 只认真实例：自己是 sh，且**父进程不是另一个 --brushwatch**。
+    # 为什么要排除"父进程是 brushwatch"的那个：brush_watch_loop 里有一句
+    #     penring --watch | while :; do ... done
+    # 这个管道的右半边在 mksh 里是 fork 出来的子 shell，它**没有 exec** —— 于是
+    # /proc/<pid>/cmdline 与父进程逐字相同，ps 上看起来就是"两个 --brushwatch"。
+    # 以前只按 cmdline 匹配会把它也算成实例：真实例被 kill 掉之后它还会残留一两秒，
+    # 这期间 brushwatch_alive 返回"活着"，ensure 就不去重建看护。
+    ps -A -o PID,PPID,ARGS 2>/dev/null | awk -v me="$$" -v pat="$MODDIR/service[.]sh --brushwatch" 'NR>1 && $2+0 != me+0 && $3 ~ /(^|\/)(sh|mksh|bash)$/ && $0 ~ pat { pid[$1]=1; par[$1]=$2 } END { for (k in pid) if (!(par[k] in pid)) print k }'
 }
 
 penring_pids() {
@@ -319,6 +328,11 @@ brush_enabled()           { [ -e "$DISABLE_BRUSH" ]       && return 1; cfg_on "$
 aon_enabled()             { [ -e "$DISABLE_AON" ]         && return 1; cfg_on "$AON"; }
 screen_enabled()          { [ -e "$DISABLE_SCREEN" ]      && return 1; cfg_on "$SCREEN_CMD"; }
 settings_sync_enabled()   { cfg_on "$SETTINGS_SYNC"; }
+# ⑬ 的"亮灭互换"子项。**必须走判定函数**，不能在 --json 里直接吐变量值 ——
+# 原来它写的是 "${SCREEN_SWAP:-0}"，于是 config 里手写成 true 时：
+# 模块认（下面 case 里有 true|yes|on）→ 真的互换，但 WebUI 的 isOn 只认 1/"1"
+# → 开关显示为**关**。界面与实际不符，和 capsule_* 那处是同一类问题。
+screen_swap_enabled()     { cfg_on "$SCREEN_SWAP"; }
 
 # 分组 B（需要 App）里只要有一项开着，就需要那个 APK —— 装；七项全关 —— 卸。
 # 这就是"取消默认自动安装 APK"的唯一判据：默认七项全是 0，所以默认不装。
@@ -756,17 +770,16 @@ pen_rest_enabled() {
 # 休眠档开着时不允许别的动作误判：显式提供"现在该不该静默"
 pen_quiet() { pen_rest_enabled && pen_rest_on; }
 
-capsule_direct() {
-    case "$CAPSULE_DIRECT" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
-}
-
-capsule_gatt() {
-    case "$CAPSULE_GATT" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
-}
-
-capsule_fast() {
-    case "$CAPSULE_FAST" in 0|false|no|off) return 1 ;; *) return 0 ;; esac
-}
+# ⑤ 的三个子项。**判定统一走 cfg_on**（1/true/yes/on 才算开）。
+# 曾经 capsule_direct / capsule_fast 写成 `case in 0|false|no|off) return 1 ;; *) return 0`，
+# 也就是"只要不是显式关就是开" —— 于是 config 里把这两行删掉/留空会**静默打开**，
+# 而 capsule_gatt 又是相反的一套（只有显式 1 才算开）。三行同一个语义却两套写法，
+# 手改过 config 之后界面（--json 走的就是这几个函数）和实际行为会对不上。
+# 默认值本来就写在文件顶部（CAPSULE_DIRECT=1 / CAPSULE_GATT=1 / CAPSULE_FAST=0），
+# 所以统一成 cfg_on 之后行为不变，只是"缺键"不再等于"开"。
+capsule_direct() { cfg_on "$CAPSULE_DIRECT"; }
+capsule_gatt()   { cfg_on "$CAPSULE_GATT"; }
+capsule_fast()   { cfg_on "$CAPSULE_FAST"; }
 
 # 轮询间隔：把 POLL_MS 变成 sleep 的参数 + tick 折算（tick 仍按秒，供 REFRESH/日志轮转用）
 case "$POLL_MS" in
@@ -1019,6 +1032,18 @@ supervisor_alive() {
     return 1
 }
 
+# config 的"指纹"（内容哈希，拿不到就退回 mtime+大小）。
+# 用途：判断"还活着的 supervisor 是不是按**当前**配置起来的"。
+# 为什么需要它：supervisor / monitor 里的 BRUSH、GESTURE 这些变量是进程启动时读进内存的，
+# 之后 WebUI 改 config 它们**不会**跟着变。所以"supervisor 还活着"并不等于"配置已生效"——
+# 必须比一下指纹，不然 setup 会误以为没事、把这次配置变更整个丢掉。
+cfg_gen() {
+    local h
+    h=$(md5sum "$CFG" 2>/dev/null | awk '{print $1}')
+    [ -n "$h" ] || h=$(stat -c '%Y-%s' "$CFG" 2>/dev/null)
+    echo "$h"
+}
+
 case "$1" in
 
 --brushsend)
@@ -1129,7 +1154,7 @@ case "$1" in
         "${GESTURE_RING:-194}" "${GESTURE_DOUBLE:-195}" "${GESTURE_SLIDE_UP:-196}"
     printf '"GESTURE_SLIDE_DOWN":%s,"GESTURE_TAIL":%s,' "${GESTURE_SLIDE_DOWN:-197}" "${GESTURE_TAIL:-92}"
     printf '"SCREEN_SWAP":%s,"CAPSULE_DIRECT":%s,"CAPSULE_GATT":%s,"CAPSULE_FAST":%s,' \
-        "${SCREEN_SWAP:-0}" "$(_b capsule_direct)" "$(_b capsule_gatt)" "$(_b capsule_fast)"
+        "$(_b screen_swap_enabled)" "$(_b capsule_direct)" "$(_b capsule_gatt)" "$(_b capsule_fast)"
     printf '"REFRESH_SECONDS":%s,"POLL_MS":%s,' "$(refresh_seconds)" "${POLL_MS:-200}"
     # 存在哪些 disable-* 标记文件（有标记的功能会被强制关，界面上要能提示）
     _mk=""
@@ -1157,12 +1182,21 @@ case "$1" in
         case "$_k" in
             ''|*[!A-Z0-9_]*) echo "bad key: $_k" >&2; exit 2 ;;
         esac
-        if grep -q "^$_k=" "$CFG" 2>/dev/null; then
-            _tmp="$CFG.tmp.$$"
-            sed "s|^$_k=.*|$_k=$_v|" "$CFG" > "$_tmp" && mv -f "$_tmp" "$CFG"
-        else
-            echo "$_k=$_v" >> "$CFG"
-        fi
+        # 按行重写，值**原样**输出，不经过 sed 的替换段。
+        # 为什么不继续用 sed：`sed "s|^K=.*|K=$v|"` 里 v 带 & 会被替换成"被匹配到的旧行"、
+        # 带 | 会撞分隔符直接报错、带 \ 会被吃掉 —— 而 GNU sed 的替换段并不认 `\|` 这个转义
+        # （实测报 "unknown option to `s'"）。现在 WebUI 只会写数字和 "1:32,2:32" 碰不到，
+        # 但 config 是给人手改的、值以后可能变复杂，这个口子必须堵上。
+        _tmp="$CFG.tmp.$$"
+        _found=0
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            case "$_line" in
+                "$_k="*) printf '%s=%s\n' "$_k" "$_v"; _found=1 ;;
+                *)       printf '%s\n' "$_line" ;;
+            esac
+        done < "$CFG" > "$_tmp"
+        [ "$_found" = 1 ] || printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
+        mv -f "$_tmp" "$CFG"
         log "config: $_k=$_v（守护稍后重启生效）"
         _n=$((_n+1))
     done
@@ -1401,7 +1435,8 @@ case "$1" in
                     last_screen=$sc
                     if [ "$prev" != "-1" ]; then
                         if [ "$sc" = "2" ]; then frame=2; what=screen-on; else frame=1; what=screen-off; fi
-                        case "$SCREEN_SWAP" in 1|true|yes|on) [ "$frame" = 2 ] && frame=1 || frame=2 ;; esac
+                        # 与 --json 共用同一个判定，避免"界面显示关了、这里还在互换"
+                        screen_swap_enabled && { [ "$frame" = 2 ] && frame=1 || frame=2; }
                         send_extra "$A_SCREEN" "$what" --ei frame "$frame"
                     else
                         log "screen state 初始 = $sc（不发指令）"
@@ -1582,13 +1617,30 @@ case "$1" in
     if [ -f "$LOCK/pid" ]; then
         old=$(cat "$LOCK/pid" 2>/dev/null)
         if supervisor_alive "$old"; then
-            log "supervisor already alive pid=$old"
-            exit 0
+            # 旧 supervisor 还活着 —— 但**不能就此 exit 0**。
+            # 它的 config 变量是启动时读进内存的，之后 WebUI 改 config 它不会跟着变
+            # （monitor 里的 BRUSH/GESTURE/pen_rest 全是冻结值，只会照旧 penring_ensure /
+            #  brushwatch_ensure）。无脑退出等于把这次配置变更整个丢掉：开关写进 config 了、
+            #  WebUI 也显示改了，但守护照旧 —— 实测关掉 ⑥/⑦ 之后 penring 与 --brushwatch
+            #  仍在跑，正是这条路径造成的。
+            # 所以比一下配置指纹：没变才是真的没事；变了就接管（把旧一代杀掉，往下走正常重拉）。
+            if [ "$(cfg_gen)" = "$(cat "$LOCK/gen" 2>/dev/null)" ]; then
+                log "supervisor already alive pid=$old (config unchanged)"
+                exit 0
+            fi
+            log "supervisor pid=$old alive but config changed → takeover"
+            kill -9 "$old" 2>/dev/null
+            for p in $(svc_pids --supervise) $(svc_pids --monitor); do
+                kill -9 "$p" 2>/dev/null
+            done
+            sleep 1
         fi
     fi
 
     rm -rf "$LOCK" 2>/dev/null
     mkdir -p "$LOCK" 2>/dev/null || exit 0
+    # 记下本代是按哪份 config 起来的，供下次 setup 判断"要不要接管"
+    cfg_gen > "$LOCK/gen" 2>/dev/null
 
     # 接管：上一轮会话（或旧版本模块）用 setsid 拉起的看护不会被 init 收走，
     # supervisor 死后它们还活着 —— 必须清掉，否则新旧两份同时往笔里写波形。

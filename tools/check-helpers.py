@@ -25,6 +25,14 @@ applypatch reboot svc tar gzip unzip which mktemp flock truncate fallocate strin
 sha256sum md5sum base64 uuidgen uptime watchprops nandread ionice nice renice
 """.split())
 
+# 安装器（KernelSU / Magisk）在 customize.sh 运行时**注入**的函数。
+# 它们不在本仓库里定义，所以不能算"未定义"——否则 customize.sh 永远报一行假失败，
+# 检查结果有噪音之后大家就不看了，真正的问题反而会被忽略。
+INSTALLER_API = set("""
+ui_print abort set_perm set_perm_recursive set_metadata set_metadata_recursive
+mount_image umount_image is_mounted grep_prop get_top_volume
+""".split())
+
 
 def strip_quotes(line: str) -> str:
     """去掉单/双引号内容（含 heredoc 文本），避免日志里的词被当成命令。"""
@@ -85,7 +93,13 @@ def strip_case(lines):
 
 
 def check(path: str) -> int:
-    src = open(path, encoding="utf-8").read()
+    try:
+        src = open(path, encoding="utf-8").read()
+    except OSError as e:
+        # 路径写错时不要抛栈 —— 抛栈看起来像"检查器自己坏了"，
+        # 容易被当成工具问题忽略掉，其实只是文件没找到。
+        print(f"[check-helpers] {path}: 无法读取: {e}")
+        return 1
     defined = set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", src, re.M))
 
     calls = set()
@@ -107,7 +121,8 @@ def check(path: str) -> int:
         ):
             calls.add(m.group(1))
 
-    missing = sorted(c for c in calls if c not in defined and c not in BUILTINS)
+    missing = sorted(c for c in calls
+                     if c not in defined and c not in BUILTINS and c not in INSTALLER_API)
     if missing:
         print(f"[check-helpers] {path}: 调用了未定义的函数: {' '.join(missing)}")
         return 1
