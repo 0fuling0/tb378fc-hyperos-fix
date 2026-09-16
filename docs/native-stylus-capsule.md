@@ -178,7 +178,7 @@ wls_tx 状态机（service.sh --monitor，POLL_MS=200 轮询，内建 read 不�
 
 ### 相关 config 开关
 
-> v3.7 起 ⑤ 属于"需要 App"那一组，**默认关闭**（`CAPSULE=0`）：打开它才会自动安装
+> v3.6 起 ⑤ 属于"需要 App"那一组，**默认关闭**（`CAPSULE=0`）：打开它才会自动安装
 > `bin/TbFix.apk`（守护直发那条路不需要 App，但 GATT 校正与部分取值要走 App，所以整项归到该组）。
 > 关掉全部该类功能后模块会自动卸载那个 APK。
 

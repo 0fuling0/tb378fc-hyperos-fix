@@ -1,6 +1,6 @@
 id=tb378fc_hyperos_fix
 name=TB378FC HyperOS 修复
-version=v3.7
-versionCode=37000
+version=v3.6
+versionCode=36000
 author=ACLaniakea, fuling
 description=联想小新 Pad Pro GT 13 (TB378FC) 刷 HyperOS 移植包的适配修复，全部功能都可在 KernelSU 管理器的 WebUI 里逐项开关。【系统修复·默认开，不需要 App】②PowerKeeper 修复——修补移植包改坏的两处字节码，恢复 MIUI 省电管理；③停 BPF 监视器——避免 hyper_bpfloader 写 recovery 引导块重启进 recovery；④停死电话栈——本机 ro.baseband=apq 无 modem，停掉每秒崩数百次的三个包；⑭开发者选项——补 system_app 读/写 logpersistd_logging_prop 两条最小权限，否则 Enforcing 下打开「设置→开发者选项」必现闪退，开机用 ksud sepolicy apply 显式应用，手动重应用：sh service.sh --sepolicy。【手势与书写】⑥手势桥（默认开）——penring 把联想笔的捏/双击/上滑/下滑/笔尾桥成小米焦点触控笔（type-8 虚拟笔 + 自定义 keylayout，并停掉移植包自带的旧 type-1 笔桥 lwky_pen）。【需要 App·默认关】①手写笔休眠唤醒（按磁吸状态经 BLE 发 FE41 {05,05} 叫醒睡死的笔）、⑤手写笔吸附胶囊（读反向无线充电线圈电量并弹 HyperOS 原生胶囊，GATT 读到真值再校正）、⑦笔刷触感（笔记/小米创作切笔刷时给笔发对应 CON 波形）、⑧注视感知 AON（真实前摄 + 人脸检测）、⑨笔休眠档（吸在平板上且充满则停掉一切主动动作）、⑫设置→笔即时下发、⑬屏幕亮/灭告诉笔。这一组依赖 dev.tb378fc.fix（它同时是 LSPosed 钩子）：**默认全部关闭，因此默认不安装任何 APK**；只有你手动打开其中任意一项才会自动安装 bin/TbFix.apk，全部关闭后自动卸载。手动对齐：sh service.sh --apksync。

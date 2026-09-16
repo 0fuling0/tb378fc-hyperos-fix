@@ -26,7 +26,7 @@ HyperOS 的客户特性解析器写死读 `/mi_ext/product/etc/cust_features/dev
 移植包把那份配置放在 `/product/etc/cust_features/`，而联想机型没有 `mi_ext` 分区。
 → `module/post-fs-data.sh` 把配置目录用 tmpfs + bind mount 盖到 `/mi_ext/...`，
 并把 `config_supported_aon_devices=true` 注入两个 xml。关掉：`disable-aon`，
-或把 `config` 里的 `AON` 设为 `0`（**v3.7 起默认就是 0** —— ⑧ 属于"需要 App"那一组，
+或把 `config` 里的 `AON` 设为 `0`（**v3.6 起默认就是 0** —— ⑧ 属于"需要 App"那一组，
 打开它才会自动安装 `bin/TbFix.apk`）。
 
 ### ② binder 服务 `HyperOSCustFeatureResolve` 没注册
