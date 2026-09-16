@@ -24,9 +24,16 @@
   * **APK Signing Block 原样保留** ← 关键
   * 只需回填 `classes.dex` 的 CRC-32（local header +14、central directory +16 两处）
 
-注：dex 内容变了，v2 签名的 digest 自然对不上。本机能跑通是因为移植包是 user 构建
-却标了 `ro.debuggable=1`，PMS 在 debuggable 构建上跳过校验 —— 但**前提是签名块得在**，
-签名块缺失会在"找签名"这一步就失败，根本走不到 debuggable 那条路。
+注：dex 内容变了，v2/v3 签名块里的**内容摘要**自然对不上 —— 这是没法绕的，重签需要平台密钥
+（所以也别想着改用 `pm install` 装成系统应用更新，实测直接报
+`INSTALL_PARSE_FAILED_NO_CERTIFICATES: ... SHA-256 digest of contents did not verify`）。
+
+开机扫描之所以还接受它，是因为两条叠加：
+  1. 签名块在、证书没变 → PMS 取到的证书与 packages.xml 里记录的一致；
+  2. 包尺寸与原厂**完全等长** → PMS 认为这个包没变过，走**缓存校验**路径，不做完整内容校验。
+所以「等长 + 保签名块」是**功能必需**，不是为了好看。
+（顺带纠正一个曾经的错误结论：这跟 `ro.debuggable` 无关 —— 实测 `ro.debuggable=1` 的设备
+上，缺 v2 签名的包照样被拒。）
 """
 import struct
 import zlib
