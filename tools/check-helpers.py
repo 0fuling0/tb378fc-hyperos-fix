@@ -96,6 +96,42 @@ def strip_case(lines):
     return out
 
 
+def strip_awk(lines):
+    """去掉内嵌的 awk 程序文本 —— 那是 awk 语法，不是 shell。
+
+    为什么需要：脚本里常见 `dumpsys xxx | awk '...多行...'`。awk 的 `next;`、
+    `if (dev != "" && ff) print ...` 这些会被本检查器当成 shell 命令，
+    报出一堆"调用了未定义的函数: dev ff next root"的假失败。
+    实测就是这么被误报的（bridge.sh 里的 dumpsys 解析块）。
+
+    处理两种写法：
+      * 单行：`awk 'NR==1{print $2}' "$f"`  —— 把引号里的内容挖掉
+      * 跨行：`awk '` 开引号、后面某行单独一个 `'` 收尾 —— 整段丢掉
+    """
+    out = []
+    in_awk = False
+    for line in lines:
+        if in_awk:
+            out.append("")
+            # 单引号数为奇数 = 本行把 awk 块收尾了
+            if line.count("'") % 2 == 1:
+                in_awk = False
+            continue
+        m = re.search(r"\bawk\b", line)
+        if m:
+            tail = line[m.end():]
+            if tail.count("'") % 2 == 1:
+                # 开了跨行块
+                in_awk = True
+                out.append(line[:m.end()])
+                continue
+            # 单行 awk：挖掉所有引号内容（可能顺带挖掉本行其它引号串，对本检查无害）
+            out.append(re.sub(r"'[^']*'", "''", line))
+            continue
+        out.append(line)
+    return out
+
+
 def check(path: str) -> int:
     try:
         src = open(path, encoding="utf-8").read()
@@ -107,7 +143,7 @@ def check(path: str) -> int:
     defined = set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", src, re.M))
 
     calls = set()
-    for raw in strip_case(src.splitlines()):
+    for raw in strip_awk(strip_case(src.splitlines())):
         line = strip_arith(strip_quotes(raw)).split("#")[0]
         line = re.sub(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", "X", line)
         # 把 "; then / ; do / ; else" 折成 "; "。

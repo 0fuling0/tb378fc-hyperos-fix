@@ -144,7 +144,19 @@ def main(argv) -> int:
             info.external_attr = (0o100000 | _mode_for(rel, git_modes)) << 16
             z.writestr(info, data)
 
-    src_note = "git index" if git_modes else "按扩展名推断（读不到 git）"
+    # 提示要如实反映权限位到底从哪来的。
+    # ⚠️ 别用"结果是否等于扩展名猜测"来判断 —— 当文件的真实模式恰好和猜测一致时
+    # （模块里 *.sh=755、其它=644 正是常态）会误报成"没入库"。直接看文件在不在 index 里。
+    rels = [rel for rel, _ in _iter_files(src)]
+    n_idx = sum(1 for r in rels if r in git_modes)
+    if not git_modes:
+        src_note = "按扩展名推断（git 不可用）"
+    elif n_idx == 0:
+        src_note = "按扩展名推断（这些文件还没 git add，index 里查不到）"
+    elif n_idx < len(rels):
+        src_note = f"git index（{n_idx}/{len(rels)} 个在库，其余按扩展名推断）"
+    else:
+        src_note = "git index"
     print(f"wrote {out_zip} ({out_zip.stat().st_size} bytes, 行尾归一化 {n_lf} 个文件, 权限位来自{src_note})")
     return 0
 
